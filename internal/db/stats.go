@@ -89,7 +89,7 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 	go func() {
 		defer wg.Done()
 		var size *int64
-		db.QueryRow(ctx, "SELECT SUM(LENGTH(content)) FROM pgit_blobs WHERE content IS NOT NULL").Scan(&size)
+		_ = db.QueryRow(ctx, "SELECT SUM(LENGTH(content)) FROM pgit_blobs WHERE content IS NOT NULL").Scan(&size)
 		if size != nil {
 			stats.TotalContentSize = *size
 		}
@@ -99,9 +99,9 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		db.QueryRow(ctx, "SELECT pg_relation_size('pgit_commits')").Scan(&stats.CommitsTableSize)
-		db.QueryRow(ctx, "SELECT pg_relation_size('pgit_blobs')").Scan(&stats.BlobsTableSize)
-		db.QueryRow(ctx, `
+		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_commits')").Scan(&stats.CommitsTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_blobs')").Scan(&stats.BlobsTableSize)
+		_ = db.QueryRow(ctx, `
 			SELECT COALESCE(SUM(pg_relation_size(indexrelid)), 0)
 			FROM pg_index
 			WHERE indrelid IN (
@@ -117,7 +117,7 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		db.QueryRow(ctx, "SELECT MIN(id), MAX(id) FROM pgit_commits").Scan(
+		_ = db.QueryRow(ctx, "SELECT MIN(id), MAX(id) FROM pgit_commits").Scan(
 			&stats.FirstCommitID, &stats.LastCommitID)
 	}()
 
@@ -193,7 +193,7 @@ func (db *DB) GetBlobStats(ctx context.Context) (map[string]interface{}, error) 
 	stats["unique_paths"] = uniquePaths
 
 	var totalSize *int64
-	db.QueryRow(ctx, "SELECT SUM(LENGTH(content)) FROM pgit_blobs WHERE content IS NOT NULL").Scan(&totalSize)
+	_ = db.QueryRow(ctx, "SELECT SUM(LENGTH(content)) FROM pgit_blobs WHERE content IS NOT NULL").Scan(&totalSize)
 	if totalSize != nil {
 		stats["total_content_size"] = *totalSize
 	} else {

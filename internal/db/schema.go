@@ -61,10 +61,8 @@ func (db *DB) createCommitsTable(ctx context.Context) error {
 		compress_depth => 50
 	)`
 
-	if err := db.Exec(ctx, configSQL); err != nil {
-		// Ignore if already configured
-		// return fmt.Errorf("failed to configure pgit_commits: %w", err)
-	}
+	// Ignore error if already configured
+	_ = db.Exec(ctx, configSQL)
 
 	// Create indexes
 	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_parent ON pgit_commits(parent_id)")
@@ -105,10 +103,8 @@ func (db *DB) createBlobsTable(ctx context.Context) error {
 		compress_depth => 50
 	)`
 
-	if err := db.Exec(ctx, configSQL); err != nil {
-		// Ignore if already configured
-		// return fmt.Errorf("failed to configure pgit_blobs: %w", err)
-	}
+	// Ignore error if already configured
+	_ = db.Exec(ctx, configSQL)
 
 	// Create indexes
 	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_blobs_commit ON pgit_blobs(commit_id)")
