@@ -1,0 +1,226 @@
+package repo
+
+import (
+	"context"
+	"os"
+	"time"
+
+	"github.com/imgajeed76/pgit/internal/config"
+	"github.com/imgajeed76/pgit/internal/db"
+	"github.com/imgajeed76/pgit/internal/util"
+	"github.com/jackc/pgx/v5"
+)
+
+// CommitOptions contains options for creating a commit
+type CommitOptions struct {
+	Message     string
+	AuthorName  string
+	AuthorEmail string
+	Time        time.Time // If zero, use current time
+}
+
+// Commit creates a new commit from staged changes
+func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit, error) {
+	// Load index
+	idx, err := r.LoadIndex()
+	if err != nil {
+		return nil, err
+	}
+
+	if idx.IsEmpty() {
+		return nil, util.ErrNothingStaged
+	}
+
+	// Get author info
+	authorName := opts.AuthorName
+	if authorName == "" {
+		authorName = r.Config.GetUserName()
+	}
+	if authorName == "" {
+		return nil, &MissingConfigError{Field: "user.name"}
+	}
+
+	authorEmail := opts.AuthorEmail
+	if authorEmail == "" {
+		authorEmail = r.Config.GetUserEmail()
+	}
+	if authorEmail == "" {
+		return nil, &MissingConfigError{Field: "user.email"}
+	}
+
+	// Get timestamp
+	commitTime := opts.Time
+	if commitTime.IsZero() {
+		commitTime = time.Now()
+	}
+
+	// Generate commit ID
+	commitID := util.NewULIDWithTime(commitTime)
+
+	// Get parent commit
+	var parentID *string
+	headCommit, err := r.DB.GetHeadCommit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if headCommit != nil {
+		parentID = &headCommit.ID
+	}
+
+	// Create blobs for staged files
+	var blobs []*db.Blob
+	var treeEntries []util.TreeEntry
+
+	// First, get the current tree to carry forward unchanged files
+	var currentTree []*db.Blob
+	if headCommit != nil {
+		currentTree, err = r.DB.GetTreeAtCommit(ctx, headCommit.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Build map of current tree
+	currentTreeMap := make(map[string]*db.Blob)
+	for _, blob := range currentTree {
+		currentTreeMap[blob.Path] = blob
+	}
+
+	// Track which files are being modified
+	stagedPaths := make(map[string]bool)
+	for _, entry := range idx.List() {
+		stagedPaths[entry.Path] = true
+	}
+
+	// Process staged files
+	for _, entry := range idx.List() {
+		blob := &db.Blob{
+			Path:     entry.Path,
+			CommitID: commitID,
+		}
+
+		switch entry.Status {
+		case config.StatusAdded, config.StatusModified:
+			// Read file content
+			absPath := r.AbsPath(entry.Path)
+			info, err := os.Lstat(absPath)
+			if err != nil {
+				return nil, err
+			}
+
+			blob.Mode = int(info.Mode().Perm())
+			blob.IsSymlink = info.Mode()&os.ModeSymlink != 0
+
+			if blob.IsSymlink {
+				target, err := os.Readlink(absPath)
+				if err != nil {
+					return nil, err
+				}
+				blob.SymlinkTarget = &target
+				blob.Content = []byte(target)
+				hash := util.HashBytes(blob.Content)
+				blob.ContentHash = &hash
+			} else {
+				content, err := os.ReadFile(absPath)
+				if err != nil {
+					return nil, err
+				}
+				blob.Content = content
+				hash := util.HashBytes(content)
+				blob.ContentHash = &hash
+			}
+
+			// Add to tree entries
+			treeEntries = append(treeEntries, util.TreeEntry{
+				Mode:        blob.Mode,
+				Path:        blob.Path,
+				ContentHash: *blob.ContentHash,
+			})
+
+		case config.StatusDeleted:
+			// Mark as deleted (content = nil)
+			blob.Content = nil
+			blob.ContentHash = nil
+			blob.Mode = 0
+		}
+
+		blobs = append(blobs, blob)
+	}
+
+	// Add unchanged files from current tree to tree entries
+	for path, blob := range currentTreeMap {
+		if !stagedPaths[path] && blob.ContentHash != nil {
+			treeEntries = append(treeEntries, util.TreeEntry{
+				Mode:        blob.Mode,
+				Path:        blob.Path,
+				ContentHash: *blob.ContentHash,
+			})
+		}
+	}
+
+	// Compute tree hash
+	treeHash := util.ComputeTreeHash(treeEntries)
+
+	// Create commit
+	commit := &db.Commit{
+		ID:          commitID,
+		ParentID:    parentID,
+		TreeHash:    treeHash,
+		Message:     opts.Message,
+		AuthorName:  authorName,
+		AuthorEmail: authorEmail,
+		CreatedAt:   commitTime,
+	}
+
+	// Create everything in a single transaction
+	err = r.DB.WithTx(ctx, func(tx pgx.Tx) error {
+		// Create commit first
+		_, err := tx.Exec(ctx, `
+			INSERT INTO pgit_commits (id, parent_id, tree_hash, message, author_name, author_email, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			commit.ID, commit.ParentID, commit.TreeHash, commit.Message,
+			commit.AuthorName, commit.AuthorEmail, commit.CreatedAt)
+		if err != nil {
+			return err
+		}
+
+		// Create blobs
+		for _, b := range blobs {
+			_, err := tx.Exec(ctx, `
+				INSERT INTO pgit_blobs (path, commit_id, content, content_hash, mode, is_symlink, symlink_target)
+				VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+				b.Path, b.CommitID, b.Content, b.ContentHash, b.Mode, b.IsSymlink, b.SymlinkTarget)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Update HEAD
+		_, err = tx.Exec(ctx, `
+			INSERT INTO pgit_refs (name, commit_id) VALUES ('HEAD', $1)
+			ON CONFLICT (name) DO UPDATE SET commit_id = EXCLUDED.commit_id`,
+			commitID)
+		return err
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Clear index
+	idx.Clear()
+	if err := idx.Save(r.Root); err != nil {
+		return nil, err
+	}
+
+	return commit, nil
+}
+
+// MissingConfigError indicates a missing configuration value
+type MissingConfigError struct {
+	Field string
+}
+
+func (e *MissingConfigError) Error() string {
+	return "missing configuration: " + e.Field + "\n\nPlease set it with:\n  pgit config " + e.Field + " \"Your Value\""
+}

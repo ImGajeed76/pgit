@@ -1,0 +1,66 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pgit
+    main: ./cmd/pgit
+    binary: pgit
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/imgajeed76/pgit/internal/cli.Version={{.Version}}
+      - -X github.com/imgajeed76/pgit/internal/cli.CommitSHA={{.ShortCommit}}
+      - -X github.com/imgajeed76/pgit/internal/cli.BuildDate={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - Merge pull request
+      - Merge branch
+
+nfpms:
+  - id: packages
+    package_name: pgit
+    vendor: imgajeed76
+    homepage: "https://github.com/imgajeed76/pgit"
+    maintainer: "Oliver Seifert <github.staging362@passmail.net>"
+    description: "Git-like version control backed by PostgreSQL with pg-xpatch delta compression"
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
