@@ -113,7 +113,7 @@ func runResolve(cmd *cobra.Command, args []string) error {
 	if len(mergeState.ConflictedFiles) == 0 {
 		// All conflicts resolved - clear merge state
 		mergeState.InProgress = false
-		mergeState.Save(r.Root)
+		_ = mergeState.Save(r.Root)
 
 		fmt.Println(styles.Successf("All conflicts resolved!"))
 		fmt.Println()

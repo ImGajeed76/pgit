@@ -67,16 +67,6 @@ type gitCommit struct {
 	Message     string
 }
 
-// gitBlob represents a file at a specific commit
-type gitBlob struct {
-	Path      string
-	CommitID  string
-	Content   []byte
-	Mode      int
-	IsSymlink bool
-	Target    string // symlink target
-}
-
 func runImport(cmd *cobra.Command, args []string) error {
 	// Open pgit repository
 	r, err := repo.Open()
@@ -130,7 +120,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 
 	// Check if database already has commits
 	var commitCount int
-	r.DB.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_commits").Scan(&commitCount)
+	_ = r.DB.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_commits").Scan(&commitCount)
 	if commitCount > 0 && !importForce {
 		return util.NewError("Database not empty").
 			WithMessage(fmt.Sprintf("Database already contains %d commits", commitCount)).
@@ -741,7 +731,6 @@ func getFileAtCommit(gitPath, commitHash, filePath string) (content []byte, mode
 
 	// Check if symlink (mode 120000)
 	if modeStr == "120000" {
-		isSymlink = true
 		// For symlinks, git show returns the target path
 		cmd = exec.Command("git", "show", fmt.Sprintf("%s:%s", commitHash, filePath))
 		cmd.Dir = gitPath

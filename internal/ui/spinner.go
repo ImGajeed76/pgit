@@ -5,8 +5,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/imgajeed76/pgit/internal/ui/styles"
 	"golang.org/x/term"
@@ -16,7 +14,6 @@ import (
 type Spinner struct {
 	message string
 	done    chan struct{}
-	err     error
 }
 
 // NewSpinner creates a new spinner with the given message
@@ -149,46 +146,4 @@ func repeatStr(s string, n int) string {
 		result += s
 	}
 	return result
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// Alternative: Full-screen spinner model for tea.Program
-// ══════════════════════════════════════════════════════════════════════════
-
-type spinnerModel struct {
-	spinner spinner.Model
-	message string
-	done    bool
-}
-
-func newSpinnerModel(message string) spinnerModel {
-	s := spinner.New()
-	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(styles.Accent)
-	return spinnerModel{
-		spinner: s,
-		message: message,
-	}
-}
-
-func (m spinnerModel) Init() tea.Cmd {
-	return m.spinner.Tick
-}
-
-func (m spinnerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		if msg.String() == "q" || msg.String() == "ctrl+c" {
-			return m, tea.Quit
-		}
-	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		return m, cmd
-	}
-	return m, nil
-}
-
-func (m spinnerModel) View() string {
-	return fmt.Sprintf("%s %s", m.spinner.View(), m.message)
 }

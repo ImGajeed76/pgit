@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/imgajeed76/pgit/internal/config"
 	"github.com/imgajeed76/pgit/internal/db"
@@ -99,7 +100,7 @@ func (r *Repository) GetWorkingTreeChanges(ctx context.Context) ([]FileChange, e
 		}
 
 		// Skip .pgit directory
-		if relPath == util.PgitDir || filepath.HasPrefix(relPath, util.PgitDir+"/") {
+		if relPath == util.PgitDir || strings.HasPrefix(relPath, util.PgitDir+"/") {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}

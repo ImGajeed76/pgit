@@ -274,9 +274,9 @@ func runClone(cmd *cobra.Command, args []string) error {
 			}
 
 			if blob.IsSymlink && blob.SymlinkTarget != nil {
-				os.Symlink(*blob.SymlinkTarget, absPath)
+				_ = os.Symlink(*blob.SymlinkTarget, absPath)
 			} else {
-				os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+				_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
 			}
 		}
 	}

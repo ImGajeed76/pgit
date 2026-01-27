@@ -67,8 +67,8 @@ func (db *DB) createCommitsTable(ctx context.Context) error {
 	}
 
 	// Create indexes
-	db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_parent ON pgit_commits(parent_id)")
-	db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_created ON pgit_commits(created_at DESC)")
+	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_parent ON pgit_commits(parent_id)")
+	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_created ON pgit_commits(created_at DESC)")
 
 	return nil
 }
@@ -111,8 +111,8 @@ func (db *DB) createBlobsTable(ctx context.Context) error {
 	}
 
 	// Create indexes
-	db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_blobs_commit ON pgit_blobs(commit_id)")
-	db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_blobs_path ON pgit_blobs(path)")
+	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_blobs_commit ON pgit_blobs(commit_id)")
+	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_blobs_path ON pgit_blobs(path)")
 
 	return nil
 }

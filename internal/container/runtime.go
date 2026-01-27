@@ -127,7 +127,7 @@ func GetContainerPort(runtime Runtime) (int, error) {
 	}
 
 	var port int
-	fmt.Sscanf(parts[len(parts)-1], "%d", &port)
+	_, _ = fmt.Sscanf(parts[len(parts)-1], "%d", &port)
 	return port, nil
 }
 
@@ -229,7 +229,7 @@ func WaitForPostgres(runtime Runtime, maxAttempts int) error {
 			return nil
 		}
 		// Wait a bit before retrying
-		exec.Command("sleep", "1").Run()
+		_ = exec.Command("sleep", "1").Run()
 	}
 	return fmt.Errorf("PostgreSQL not ready after %d attempts", maxAttempts)
 }

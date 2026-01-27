@@ -265,13 +265,13 @@ func (m logModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keys.PrevMatch):
 			m.jumpToPrevMatch()
 		case key.Matches(msg, keys.Up):
-			m.viewport.LineUp(1)
+			m.viewport.ScrollUp(1)
 		case key.Matches(msg, keys.Down):
-			m.viewport.LineDown(1)
+			m.viewport.ScrollDown(1)
 		case key.Matches(msg, keys.PageUp):
-			m.viewport.HalfViewUp()
+			m.viewport.HalfPageUp()
 		case key.Matches(msg, keys.PageDown):
-			m.viewport.HalfViewDown()
+			m.viewport.HalfPageDown()
 		case key.Matches(msg, keys.Home):
 			m.viewport.GotoTop()
 		case key.Matches(msg, keys.End):

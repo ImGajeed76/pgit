@@ -227,10 +227,10 @@ func pullFastForward(ctx context.Context, r *repo.Repository, remoteDB *db.DB, c
 			continue
 		}
 		if blob.IsSymlink && blob.SymlinkTarget != nil {
-			os.Remove(absPath)
-			os.Symlink(*blob.SymlinkTarget, absPath)
+			_ = os.Remove(absPath)
+			_ = os.Symlink(*blob.SymlinkTarget, absPath)
 		} else if blob.Content != nil {
-			os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+			_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
 		}
 	}
 
@@ -441,10 +441,10 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 				continue
 			}
 			if blob.IsSymlink && blob.SymlinkTarget != nil {
-				os.Remove(absPath)
-				os.Symlink(*blob.SymlinkTarget, absPath)
+				_ = os.Remove(absPath)
+				_ = os.Symlink(*blob.SymlinkTarget, absPath)
 			} else if blob.Content != nil {
-				os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+				_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
 			}
 		}
 	}
@@ -453,8 +453,8 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 	for _, path := range localOnlyChanges {
 		if blob, ok := localFiles[path]; ok && blob.Content != nil {
 			absPath := r.AbsPath(path)
-			os.MkdirAll(filepath.Dir(absPath), 0755)
-			os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+			_ = os.MkdirAll(filepath.Dir(absPath), 0755)
+			_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
 		}
 	}
 
@@ -632,10 +632,10 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 				continue
 			}
 			if blob.IsSymlink && blob.SymlinkTarget != nil {
-				os.Remove(absPath)
-				os.Symlink(*blob.SymlinkTarget, absPath)
+				_ = os.Remove(absPath)
+				_ = os.Symlink(*blob.SymlinkTarget, absPath)
 			} else if blob.Content != nil {
-				os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+				_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
 			}
 		}
 	}

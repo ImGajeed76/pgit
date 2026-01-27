@@ -141,17 +141,17 @@ func CreateConflictedFile(path string, localContent, remoteContent []byte, remot
 	w := bufio.NewWriter(f)
 
 	// Write conflict markers
-	w.WriteString(ConflictMarkerStart + "\n")
-	w.Write(localContent)
+	_, _ = w.WriteString(ConflictMarkerStart + "\n")
+	_, _ = w.Write(localContent)
 	if len(localContent) > 0 && localContent[len(localContent)-1] != '\n' {
-		w.WriteString("\n")
+		_, _ = w.WriteString("\n")
 	}
-	w.WriteString(ConflictMarkerMiddle + "\n")
-	w.Write(remoteContent)
+	_, _ = w.WriteString(ConflictMarkerMiddle + "\n")
+	_, _ = w.Write(remoteContent)
 	if len(remoteContent) > 0 && remoteContent[len(remoteContent)-1] != '\n' {
-		w.WriteString("\n")
+		_, _ = w.WriteString("\n")
 	}
-	w.WriteString(ConflictMarkerEnd + " (" + remoteName + ")\n")
+	_, _ = w.WriteString(ConflictMarkerEnd + " (" + remoteName + ")\n")
 
 	return w.Flush()
 }
