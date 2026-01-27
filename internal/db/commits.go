@@ -74,7 +74,7 @@ func (db *DB) GetHeadCommit(ctx context.Context) (*Commit, error) {
 func (db *DB) GetCommitLog(ctx context.Context, limit int) ([]*Commit, error) {
 	sql := `
 	WITH RECURSIVE ancestors AS (
-		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.created_at, 0 as depth
+		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.created_at, 1 as depth
 		FROM pgit_commits c
 		JOIN pgit_refs r ON r.commit_id = c.id
 		WHERE r.name = 'HEAD'
@@ -115,7 +115,7 @@ func (db *DB) GetCommitLog(ctx context.Context, limit int) ([]*Commit, error) {
 func (db *DB) GetCommitLogFrom(ctx context.Context, commitID string, limit int) ([]*Commit, error) {
 	sql := `
 	WITH RECURSIVE ancestors AS (
-		SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at, 0 as depth
+		SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at, 1 as depth
 		FROM pgit_commits
 		WHERE id = $1
 		
