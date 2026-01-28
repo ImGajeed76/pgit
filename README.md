@@ -2,9 +2,19 @@
 
 A Git-like version control CLI backed by PostgreSQL with [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression.
 
+> **Note:** pgit is primarily a demo for [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression. It's not intended to replace git—but it *is* genuinely useful for importing a repo and running SQL analytics on your commit history.
+
 ## Why pgit?
 
-**Your entire repo history is a queryable database.**
+**Import any git repo. Query it with SQL.**
+
+```bash
+pgit init
+pgit import /path/to/your/repo --branch main
+pgit sql "SELECT ..."
+```
+
+No scripts, no parsing `git log` output. Just SQL.
 
 ```sql
 -- Which files are always changed together?
@@ -13,15 +23,7 @@ FROM pgit_blobs a
 JOIN pgit_blobs b ON a.commit_id = b.commit_id AND a.path < b.path
 GROUP BY a.path, b.path
 ORDER BY times_together DESC;
-
--- Who are the top contributors?
-SELECT author_name, COUNT(*) as commits
-FROM pgit_commits
-GROUP BY author_name
-ORDER BY commits DESC;
 ```
-
-No scripts, no parsing `git log` output. Just SQL.
 
 ## Compression: pgit vs git
 
