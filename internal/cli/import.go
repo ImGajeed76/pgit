@@ -239,9 +239,9 @@ func runImport(cmd *cobra.Command, args []string) error {
 			ID:          ulid,
 			ParentID:    parentID,
 			TreeHash:    gc.Hash[:8], // Use git hash prefix as tree hash
-			Message:     gc.Message,
-			AuthorName:  gc.AuthorName,
-			AuthorEmail: gc.AuthorEmail,
+			Message:     util.ToValidUTF8(gc.Message),
+			AuthorName:  util.ToValidUTF8(gc.AuthorName),
+			AuthorEmail: util.ToValidUTF8(gc.AuthorEmail),
 			CreatedAt:   commitTime,
 		}
 	}
