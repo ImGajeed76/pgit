@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/imgajeed76/pgit/internal/repo"
-	"github.com/imgajeed76/pgit/internal/ui/styles"
 	"github.com/spf13/cobra"
 )
 
@@ -110,55 +109,6 @@ func runAdd(cmd *cobra.Command, args []string) error {
 			if verbose {
 				fmt.Printf("add '%s'\n", relPath)
 			}
-		}
-	}
-
-	return nil
-}
-
-func newResetCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "reset [path]...",
-		Short: "Unstage files from the staging area",
-		Long: `Remove files from the staging area.
-
-This does not modify the working directory, only the staging area.
-Without arguments, unstages all files.`,
-		RunE: runReset,
-	}
-}
-
-func runReset(cmd *cobra.Command, args []string) error {
-	r, err := repo.Open()
-	if err != nil {
-		return err
-	}
-
-	if len(args) == 0 {
-		// Unstage all
-		if err := r.UnstageAll(); err != nil {
-			return err
-		}
-		fmt.Println("Unstaged all files")
-		return nil
-	}
-
-	// Unstage specific files
-	for _, path := range args {
-		// Resolve path
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			return err
-		}
-		relPath, err := r.RelPath(absPath)
-		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-
-		if err := r.UnstageFile(relPath); err != nil {
-			fmt.Printf("%s: %s\n", path, styles.Warningf("not staged"))
-		} else {
-			fmt.Printf("Unstaged '%s'\n", relPath)
 		}
 	}
 
