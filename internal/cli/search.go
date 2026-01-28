@@ -95,15 +95,30 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	spinner.Start()
 
 	type searchResult struct {
-		Path     string
-		CommitID string
-		LineNum  int
-		Line     string
-		MatchPos []int
+		Path       string
+		CommitID   string
+		CommitTime time.Time
+		LineNum    int
+		Line       string
+		MatchPos   []int
 	}
 
 	var results []searchResult
 	resultCount := 0
+
+	// Cache for commit timestamps
+	commitTimes := make(map[string]time.Time)
+	getCommitTime := func(commitID string) time.Time {
+		if t, ok := commitTimes[commitID]; ok {
+			return t
+		}
+		commit, err := r.DB.GetCommit(ctx, commitID)
+		if err == nil && commit != nil {
+			commitTimes[commitID] = commit.CreatedAt
+			return commit.CreatedAt
+		}
+		return time.Time{}
+	}
 
 	if searchAll {
 		// Search all blobs
@@ -122,11 +137,12 @@ func runSearch(cmd *cobra.Command, args []string) error {
 			for lineNum, line := range lines {
 				if matches := re.FindStringIndex(line); matches != nil {
 					results = append(results, searchResult{
-						Path:     blob.Path,
-						CommitID: blob.CommitID,
-						LineNum:  lineNum + 1,
-						Line:     line,
-						MatchPos: matches,
+						Path:       blob.Path,
+						CommitID:   blob.CommitID,
+						CommitTime: getCommitTime(blob.CommitID),
+						LineNum:    lineNum + 1,
+						Line:       line,
+						MatchPos:   matches,
 					})
 					resultCount++
 					if resultCount >= limit {
@@ -163,11 +179,12 @@ func runSearch(cmd *cobra.Command, args []string) error {
 			for lineNum, line := range lines {
 				if matches := re.FindStringIndex(line); matches != nil {
 					results = append(results, searchResult{
-						Path:     blob.Path,
-						CommitID: commitID,
-						LineNum:  lineNum + 1,
-						Line:     line,
-						MatchPos: matches,
+						Path:       blob.Path,
+						CommitID:   commitID,
+						CommitTime: getCommitTime(commitID),
+						LineNum:    lineNum + 1,
+						Line:       line,
+						MatchPos:   matches,
 					})
 					resultCount++
 					if resultCount >= limit {
@@ -186,21 +203,22 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Print results
-	currentPath := ""
+	// Print results grouped by path + commit
+	currentKey := ""
 	for _, res := range results {
-		if res.Path != currentPath {
-			if currentPath != "" {
+		key := res.Path + ":" + res.CommitID
+		if key != currentKey {
+			if currentKey != "" {
 				fmt.Println()
 			}
 			if searchAll {
 				fmt.Printf("%s %s\n",
 					styles.Cyan(res.Path),
-					styles.Mute("("+util.ShortID(res.CommitID)+")"))
+					styles.Mute("("+util.ShortID(res.CommitID)+", "+util.RelativeTime(res.CommitTime)+")"))
 			} else {
 				fmt.Println(styles.Cyan(res.Path))
 			}
-			currentPath = res.Path
+			currentKey = key
 		}
 
 		// Highlight the match in the line

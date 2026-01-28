@@ -486,7 +486,7 @@ func (m logModel) renderCommits() string {
 			symbolStyle.Render(symbol),
 			hash,
 			refs,
-			styles.MutedMsg(relativeTimeShort(commit.CreatedAt))))
+			styles.MutedMsg(util.RelativeTimeShort(commit.CreatedAt))))
 
 		// Second line: author and message
 		author := styles.Author(commit.AuthorName)
@@ -562,24 +562,4 @@ func splitLines(s string) []string {
 		return []string{""}
 	}
 	return strings.Split(s, "\n")
-}
-
-func relativeTimeShort(t time.Time) string {
-	now := time.Now()
-	diff := now.Sub(t)
-
-	switch {
-	case diff < time.Minute:
-		return "now"
-	case diff < time.Hour:
-		return fmt.Sprintf("%dm ago", int(diff.Minutes()))
-	case diff < 24*time.Hour:
-		return fmt.Sprintf("%dh ago", int(diff.Hours()))
-	case diff < 7*24*time.Hour:
-		return fmt.Sprintf("%dd ago", int(diff.Hours()/24))
-	case diff < 30*24*time.Hour:
-		return fmt.Sprintf("%dw ago", int(diff.Hours()/24/7))
-	default:
-		return t.Format("Jan 2")
-	}
 }

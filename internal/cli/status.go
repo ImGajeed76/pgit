@@ -228,7 +228,7 @@ func printLongStatus(staged, unstaged []repo.FileChange, head *db.Commit) error 
 
 	// Show HEAD info if exists
 	if head != nil {
-		fmt.Printf("HEAD: %s %s\n", styles.Hash(head.ID, true), styles.MutedMsg(relativeTime(head.CreatedAt)))
+		fmt.Printf("HEAD: %s %s\n", styles.Hash(head.ID, true), styles.MutedMsg(util.RelativeTime(head.CreatedAt)))
 	} else {
 		fmt.Println()
 		fmt.Println("No commits yet")
@@ -326,43 +326,6 @@ func printLongStatus(staged, unstaged []repo.FileChange, head *db.Commit) error 
 	}
 
 	return nil
-}
-
-// relativeTime formats a time as relative (e.g., "2 hours ago")
-func relativeTime(t time.Time) string {
-	now := time.Now()
-	diff := now.Sub(t)
-
-	switch {
-	case diff < time.Minute:
-		return "just now"
-	case diff < time.Hour:
-		m := int(diff.Minutes())
-		if m == 1 {
-			return "1 minute ago"
-		}
-		return fmt.Sprintf("%d minutes ago", m)
-	case diff < 24*time.Hour:
-		h := int(diff.Hours())
-		if h == 1 {
-			return "1 hour ago"
-		}
-		return fmt.Sprintf("%d hours ago", h)
-	case diff < 7*24*time.Hour:
-		d := int(diff.Hours() / 24)
-		if d == 1 {
-			return "1 day ago"
-		}
-		return fmt.Sprintf("%d days ago", d)
-	case diff < 30*24*time.Hour:
-		w := int(diff.Hours() / 24 / 7)
-		if w == 1 {
-			return "1 week ago"
-		}
-		return fmt.Sprintf("%d weeks ago", w)
-	default:
-		return t.Format("Jan 2, 2006")
-	}
 }
 
 // Helper for util
