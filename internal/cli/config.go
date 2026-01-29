@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/imgajeed76/pgit/internal/config"
+	"github.com/imgajeed76/pgit/internal/ui/styles"
 	"github.com/imgajeed76/pgit/internal/util"
 	"github.com/spf13/cobra"
 )
@@ -15,22 +16,101 @@ func newConfigCmd() *cobra.Command {
 		Short: "Get and set repository options",
 		Long: `Get and set repository configuration options.
 
+Use --global for system-wide settings that affect the container and defaults.
+Without --global, settings are stored per-repository.
+
 Examples:
-  pgit config user.name              # Get value
-  pgit config user.name "John Doe"   # Set value
-  pgit config user.email "j@x.com"   # Set value
-  pgit config --list                 # List all config`,
+  pgit config user.name              # Get repo value
+  pgit config user.name "John Doe"   # Set repo value
+  pgit config --list                 # List repo config
+
+  pgit config --global --list              # List global config
+  pgit config --global container.shm_size  # Get global value
+  pgit config --global container.shm_size 512m  # Set global value
+
+Global settings:
+  container.shm_size   Shared memory for PostgreSQL (default: 256m)
+  container.port       Default port (default: 5433)
+  container.image      Custom pg-xpatch image (empty = default)
+  import.workers       Default import workers (default: CPU count, max 3)`,
 		RunE: runConfig,
 	}
 
 	cmd.Flags().BoolP("list", "l", false, "List all configuration")
+	cmd.Flags().BoolP("global", "g", false, "Use global (system-wide) config instead of repository config")
 
 	return cmd
 }
 
 func runConfig(cmd *cobra.Command, args []string) error {
 	listAll, _ := cmd.Flags().GetBool("list")
+	global, _ := cmd.Flags().GetBool("global")
 
+	if global {
+		return runGlobalConfig(cmd, args, listAll)
+	}
+
+	return runRepoConfig(cmd, args, listAll)
+}
+
+func runGlobalConfig(cmd *cobra.Command, args []string, listAll bool) error {
+	// Load global config
+	cfg, err := config.LoadGlobal()
+	if err != nil {
+		return fmt.Errorf("failed to load global config: %w", err)
+	}
+
+	if listAll {
+		// List all global config
+		for _, key := range config.ListGlobalKeys() {
+			if value, ok := cfg.GetValue(key); ok && value != "" {
+				fmt.Printf("%s=%s\n", key, value)
+			}
+		}
+		return nil
+	}
+
+	if len(args) == 0 {
+		return fmt.Errorf("usage: pgit config --global <key> [value]")
+	}
+
+	key := strings.ToLower(args[0])
+
+	// Get or set?
+	if len(args) == 1 {
+		// Get value
+		value, ok := cfg.GetValue(key)
+		if !ok {
+			return fmt.Errorf("unknown global config key: %s\nValid keys: %s",
+				key, strings.Join(config.ListGlobalKeys(), ", "))
+		}
+		fmt.Println(value)
+		return nil
+	}
+
+	// Set value
+	value := args[1]
+	if err := cfg.SetValue(key, value); err != nil {
+		return fmt.Errorf("invalid value for %s: %w", key, err)
+	}
+
+	// Save config
+	if err := cfg.Save(); err != nil {
+		return fmt.Errorf("failed to save global config: %w", err)
+	}
+
+	fmt.Printf("%s %s=%s\n", styles.Green("Set"), key, value)
+
+	// Special hint for container settings
+	if strings.HasPrefix(key, "container.") {
+		fmt.Println(styles.Mute("Note: Restart container for changes to take effect:"))
+		fmt.Println(styles.Mute("  pgit local destroy && pgit local start"))
+	}
+
+	return nil
+}
+
+func runRepoConfig(cmd *cobra.Command, args []string, listAll bool) error {
 	// Find repo root
 	root, err := util.FindRepoRoot()
 	if err != nil {

@@ -4,18 +4,20 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/imgajeed76/pgit/internal/config"
 	"github.com/imgajeed76/pgit/internal/db"
 	"github.com/imgajeed76/pgit/internal/repo"
 	"github.com/imgajeed76/pgit/internal/ui"
@@ -23,12 +25,6 @@ import (
 	"github.com/imgajeed76/pgit/internal/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
-)
-
-var (
-	importWorkers int
-	importDryRun  bool
-	importForce   bool
 )
 
 func newImportCmd() *cobra.Command {
@@ -43,22 +39,28 @@ repository and stores them in the pgit database with delta compression.
 By default, imports the current branch. Use --branch to specify a different
 branch, or an interactive picker will be shown if multiple branches exist.
 
-File histories are extracted in parallel for better performance.
+The import uses a streaming architecture with progress visualization
+showing git extraction and pgit import rates separately.
+
 The current directory must be a pgit repository (run 'pgit init' first).`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: runImport,
 	}
 
-	cmd.Flags().IntVarP(&importWorkers, "workers", "w", 0, "Number of parallel workers (default: number of CPUs)")
-	cmd.Flags().BoolVarP(&importDryRun, "dry-run", "n", false, "Show what would be imported without actually importing")
-	cmd.Flags().BoolVarP(&importForce, "force", "f", false, "Overwrite existing data in database")
+	cmd.Flags().IntP("workers", "w", 0, "Number of parallel workers (default: number of CPUs, max 3)")
+	cmd.Flags().BoolP("dry-run", "n", false, "Show what would be imported without actually importing")
+	cmd.Flags().BoolP("force", "f", false, "Overwrite existing data in database")
 	cmd.Flags().StringP("branch", "b", "", "Branch to import (default: current branch, or interactive picker)")
 
 	return cmd
 }
 
-// gitCommit represents a git commit
-type gitCommit struct {
+// ═══════════════════════════════════════════════════════════════════════════
+// Data structures
+// ═══════════════════════════════════════════════════════════════════════════
+
+// gitCommitInfo contains commit metadata from git log --raw
+type gitCommitInfo struct {
 	Hash        string
 	ParentHash  string
 	AuthorName  string
@@ -66,6 +68,28 @@ type gitCommit struct {
 	AuthorDate  time.Time
 	Message     string
 }
+
+// gitFileChange represents a file change in a commit
+type gitFileChange struct {
+	CommitHash string
+	Path       string
+	BlobHash   string
+	Mode       int
+	ChangeType byte // 'A'dd, 'M'odify, 'D'elete
+}
+
+// blobWork represents work for the blob importer
+type blobWork struct {
+	Path      string
+	CommitID  string // pgit ULID
+	BlobHash  string
+	Mode      int
+	IsSymlink bool
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Main import function
+// ═══════════════════════════════════════════════════════════════════════════
 
 func runImport(cmd *cobra.Command, args []string) error {
 	// Open pgit repository
@@ -80,7 +104,6 @@ func runImport(cmd *cobra.Command, args []string) error {
 		gitPath = args[0]
 	}
 
-	// Make absolute
 	gitPath, err = filepath.Abs(gitPath)
 	if err != nil {
 		return err
@@ -91,15 +114,28 @@ func runImport(cmd *cobra.Command, args []string) error {
 	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
 		return util.NewError("Not a git repository").
 			WithContext(fmt.Sprintf("No .git directory found in '%s'", gitPath)).
-			WithSuggestion("pgit import /path/to/git/repo  # Specify correct path")
+			WithSuggestion("pgit import /path/to/git/repo")
 	}
 
-	// Set worker count
-	if importWorkers <= 0 {
-		importWorkers = runtime.NumCPU()
+	// Get flags
+	workers, _ := cmd.Flags().GetInt("workers")
+	if workers <= 0 {
+		// Use global config default, or fall back to 4
+		if globalCfg, err := config.LoadGlobal(); err == nil && globalCfg.Import.Workers > 0 {
+			workers = globalCfg.Import.Workers
+		} else {
+			workers = 4
+		}
+	}
+	// Cap at 16 (pg-xpatch insert cache slot limit)
+	if workers > 16 {
+		workers = 16
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	force, _ := cmd.Flags().GetBool("force")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
 	defer cancel()
 
 	// Connect to database
@@ -112,93 +148,59 @@ func runImport(cmd *cobra.Command, args []string) error {
 	defer r.Close()
 
 	fmt.Printf("Importing from: %s\n", styles.Cyan(gitPath))
-	fmt.Printf("Workers: %d\n", importWorkers)
+	fmt.Printf("Workers: %d\n", workers)
 
-	if importDryRun {
+	if dryRun {
 		fmt.Println(styles.Yellow("Dry run mode - no changes will be made"))
 	}
 
 	// Check if database already has commits
-	var commitCount int
-	_ = r.DB.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_commits").Scan(&commitCount)
-	if commitCount > 0 && !importForce {
+	var existingCommits int
+	_ = r.DB.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_commits").Scan(&existingCommits)
+	if existingCommits > 0 && !force {
 		return util.NewError("Database not empty").
-			WithMessage(fmt.Sprintf("Database already contains %d commits", commitCount)).
+			WithMessage(fmt.Sprintf("Database already contains %d commits", existingCommits)).
 			WithSuggestion("pgit import --force  # Overwrite existing data")
 	}
 
-	// Determine which branch to import
+	// Determine branch
 	branchFlag, _ := cmd.Flags().GetString("branch")
-	selectedBranch := branchFlag
-
-	if selectedBranch == "" {
-		// Check if we're in a TTY and have multiple branches
-		branches, err := getGitBranches(gitPath)
-		if err != nil {
-			return fmt.Errorf("failed to list branches: %w", err)
-		}
-
-		if len(branches) == 0 {
-			return fmt.Errorf("no branches found in git repository")
-		}
-
-		if len(branches) == 1 {
-			// Only one branch, use it
-			selectedBranch = branches[0].Name
-		} else if term.IsTerminal(int(os.Stdout.Fd())) && !styles.IsAccessible() {
-			// Multiple branches and TTY (non-accessible) - show picker
-			fmt.Println()
-			picked, err := runBranchPicker(branches)
-			if err != nil {
-				return err
-			}
-			selectedBranch = picked
-			fmt.Printf("\033[2K\r") // Clear line
-		} else {
-			// Non-interactive or accessible mode, use current branch
-			selectedBranch = getCurrentBranch(gitPath)
-			if styles.IsAccessible() {
-				fmt.Printf("Using current branch (accessible mode): %s\n", selectedBranch)
-				fmt.Println("Tip: Use --branch to specify a different branch")
-			}
-		}
+	selectedBranch, err := selectBranch(gitPath, branchFlag)
+	if err != nil {
+		return err
 	}
-
 	fmt.Printf("Branch: %s\n", styles.Branch(selectedBranch))
 
-	// Step 1: Get all commits in topological order (oldest first)
-	fmt.Println("\nExtracting commit history...")
-	commits, err := getGitCommits(gitPath, selectedBranch)
+	// ═══════════════════════════════════════════════════════════════════════
+	// Step 1: Parse git history with single command
+	// ═══════════════════════════════════════════════════════════════════════
+
+	spinner := ui.NewSpinner("Parsing git history")
+	spinner.Start()
+
+	commits, fileChanges, err := parseGitHistory(gitPath, selectedBranch)
+	spinner.Stop()
+
 	if err != nil {
-		return fmt.Errorf("failed to get commits: %w", err)
+		return fmt.Errorf("failed to parse git history: %w", err)
 	}
-	fmt.Printf("Found %d commits\n", len(commits))
+
+	fmt.Printf("Found %s commits, %s file changes\n",
+		ui.FormatCount(len(commits)),
+		ui.FormatCount(len(fileChanges)))
 
 	if len(commits) == 0 {
 		fmt.Println("No commits to import")
 		return nil
 	}
 
-	// Step 2: Get all file paths that ever existed
-	fmt.Println("\nFinding all files...")
-	allPaths, err := getAllFilePaths(gitPath)
-	if err != nil {
-		return fmt.Errorf("failed to get file paths: %w", err)
-	}
-	fmt.Printf("Found %d unique file paths\n", len(allPaths))
-
-	if importDryRun {
-		fmt.Println("\nDry run complete. Would import:")
-		fmt.Printf("  - %d commits\n", len(commits))
-		fmt.Printf("  - %d file paths\n", len(allPaths))
-		if commitCount > 0 && importForce {
-			fmt.Printf("  - Would clear existing %d commits (--force)\n", commitCount)
-		}
+	if dryRun {
+		fmt.Println("\nDry run complete.")
 		return nil
 	}
 
-	// Clear existing data if --force was specified
-	if commitCount > 0 && importForce {
+	// Clear existing data if --force
+	if existingCommits > 0 && force {
 		fmt.Println("\nClearing existing data...")
 		if err := r.DB.DropSchema(ctx); err != nil {
 			return fmt.Errorf("failed to clear database: %w", err)
@@ -208,18 +210,18 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 3: Create commit ID mapping (git hash -> ULID)
-	fmt.Println("\nGenerating commit IDs...")
-	commitMap := make(map[string]string) // git hash -> ULID
+	// ═══════════════════════════════════════════════════════════════════════
+	// Step 2: Create commit mapping and prepare pgit commits
+	// ═══════════════════════════════════════════════════════════════════════
+
+	fmt.Println("\nPreparing commits...")
+
+	commitMap := make(map[string]string) // git hash -> pgit ULID
 	pgitCommits := make([]*db.Commit, len(commits))
 
-	// Track last timestamp to ensure strictly increasing order
-	// (git has 1-second resolution, xpatch needs unique timestamps)
 	var lastTime time.Time
-
 	for i, gc := range commits {
 		commitTime := gc.AuthorDate
-		// Ensure strictly increasing timestamps
 		if !commitTime.After(lastTime) {
 			commitTime = lastTime.Add(time.Millisecond)
 		}
@@ -238,7 +240,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		pgitCommits[i] = &db.Commit{
 			ID:          ulid,
 			ParentID:    parentID,
-			TreeHash:    gc.Hash[:8], // Use git hash prefix as tree hash
+			TreeHash:    gc.Hash[:8],
 			Message:     util.ToValidUTF8(gc.Message),
 			AuthorName:  util.ToValidUTF8(gc.AuthorName),
 			AuthorEmail: util.ToValidUTF8(gc.AuthorEmail),
@@ -246,256 +248,435 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 4: Insert commits
+	// ═══════════════════════════════════════════════════════════════════════
+	// Step 3: Insert commits (batch for speed)
+	// ═══════════════════════════════════════════════════════════════════════
+
 	fmt.Println("\nImporting commits...")
-	commitProgress := ui.NewProgress("  Commits", len(pgitCommits))
-	for i, commit := range pgitCommits {
-		if err := r.DB.CreateCommit(ctx, commit); err != nil {
-			fmt.Println()
-			return fmt.Errorf("failed to create commit %s: %w", util.ShortID(commit.ID), err)
+
+	// Use batch insert with COPY for speed
+	batchSize := 1000
+	commitProgress := ui.NewProgress("Commits", len(pgitCommits))
+
+	for i := 0; i < len(pgitCommits); i += batchSize {
+		end := i + batchSize
+		if end > len(pgitCommits) {
+			end = len(pgitCommits)
 		}
-		commitProgress.Update(i + 1)
+		batch := pgitCommits[i:end]
+
+		if err := r.DB.CreateCommitsBatch(ctx, batch); err != nil {
+			fmt.Println()
+			return fmt.Errorf("failed to insert commits batch: %w", err)
+		}
+		commitProgress.Update(end)
 	}
 	commitProgress.Done()
 
-	// Step 5: Extract and import file contents in parallel
-	fmt.Println("\nImporting file contents...")
+	// ═══════════════════════════════════════════════════════════════════════
+	// Step 4: Import blobs with dual progress
+	// ═══════════════════════════════════════════════════════════════════════
 
-	// Create work channel
-	type workItem struct {
-		path    string
-		commits []gitCommit
-	}
-	workChan := make(chan workItem, len(allPaths))
-	resultChan := make(chan error, len(allPaths))
-
-	// Start workers
-	var wg sync.WaitGroup
-	for i := 0; i < importWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for work := range workChan {
-				err := importFileHistory(ctx, r.DB, gitPath, work.path, work.commits, commitMap)
-				resultChan <- err
-			}
-		}()
-	}
-
-	// Send work
-	for _, path := range allPaths {
-		workChan <- workItem{path: path, commits: commits}
-	}
-	close(workChan)
-
-	// Wait for completion and collect errors
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	fileProgress := ui.NewProgress("  Files  ", len(allPaths))
-	var errCount int
-	var completed int
-	for err := range resultChan {
-		completed++
-		if err != nil {
-			errCount++
+	// Filter to only additions and modifications (skip deletes)
+	var blobsToImport []blobWork
+	for _, fc := range fileChanges {
+		if fc.ChangeType == 'D' || fc.BlobHash == "" || fc.BlobHash == "0000000000000000000000000000000000000000" {
+			continue
 		}
-		fileProgress.Update(completed)
+		pgitCommitID, ok := commitMap[fc.CommitHash]
+		if !ok {
+			continue
+		}
+		blobsToImport = append(blobsToImport, blobWork{
+			Path:      fc.Path,
+			CommitID:  pgitCommitID,
+			BlobHash:  fc.BlobHash,
+			Mode:      fc.Mode,
+			IsSymlink: fc.Mode == 0120000,
+		})
 	}
-	fileProgress.Done()
 
-	if errCount > 0 {
-		fmt.Printf(styles.Red("\n%d errors occurred during import\n"), errCount)
+	fmt.Printf("\nImporting %s file versions...\n", ui.FormatCount(len(blobsToImport)))
+
+	if len(blobsToImport) > 0 {
+		err = importBlobsOptimized(ctx, r.DB, gitPath, blobsToImport, workers)
+		if err != nil {
+			return err
+		}
 	}
 
-	// Step 6: Set HEAD to latest commit
+	// ═══════════════════════════════════════════════════════════════════════
+	// Step 5: Set HEAD
+	// ═══════════════════════════════════════════════════════════════════════
+
 	latestCommit := pgitCommits[len(pgitCommits)-1]
 	if err := r.DB.SetHead(ctx, latestCommit.ID); err != nil {
 		return fmt.Errorf("failed to set HEAD: %w", err)
 	}
 
-	fmt.Printf("\n%s Imported %d commits from git repository\n",
-		styles.Green("Success!"), len(commits))
+	fmt.Printf("\n%s Imported %s commits from git repository\n",
+		styles.Green("Success!"),
+		ui.FormatCount(len(commits)))
 	fmt.Printf("HEAD is now at %s %s\n",
-		styles.Yellow(util.ShortID(latestCommit.ID)),
+		styles.Hash(latestCommit.ID, true),
 		firstLine(latestCommit.Message))
 
 	return nil
 }
 
-// getGitCommits returns all commits in topological order (oldest first)
-// If branch is empty, uses the current branch
-func getGitCommits(gitPath, branch string) ([]gitCommit, error) {
-	// Format: hash|parent|author name|author email|author date|subject
-	args := []string{"log", "--reverse", "--format=%H|%P|%an|%ae|%aI|%s"}
-	if branch != "" {
-		args = append(args, branch)
-	}
-	cmd := exec.Command("git", args...)
+// ═══════════════════════════════════════════════════════════════════════════
+// Git history parsing (single command)
+// ═══════════════════════════════════════════════════════════════════════════
+
+func parseGitHistory(gitPath, branch string) ([]gitCommitInfo, []gitFileChange, error) {
+	// git log --raw --reverse gives us commits with their file changes
+	// Format: hash|parent|author|email|date|subject
+	// Then raw diff lines: :oldmode newmode oldhash newhash status\tpath
+	cmd := exec.Command("git", "log", "--raw", "--reverse",
+		"--format=%H|%P|%an|%ae|%aI|%s", branch)
 	cmd.Dir = gitPath
 
-	output, err := cmd.Output()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var commits []gitCommit
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	if err := cmd.Start(); err != nil {
+		return nil, nil, err
+	}
+
+	var commits []gitCommitInfo
+	var fileChanges []gitFileChange
+
+	scanner := bufio.NewScanner(stdout)
+	// Increase buffer size for long lines
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	var currentCommit *gitCommitInfo
+
 	for scanner.Scan() {
 		line := scanner.Text()
-		parts := strings.SplitN(line, "|", 6)
-		if len(parts) < 6 {
+
+		if line == "" {
 			continue
 		}
 
-		// Parse parent (may be empty or have multiple for merges - take first)
-		parentHash := ""
-		if parts[1] != "" {
-			parents := strings.Fields(parts[1])
-			if len(parents) > 0 {
-				parentHash = parents[0]
+		// Check if it's a commit line (starts with hash)
+		if len(line) >= 40 && !strings.HasPrefix(line, ":") {
+			parts := strings.SplitN(line, "|", 6)
+			if len(parts) >= 6 && len(parts[0]) == 40 {
+				// Parse commit
+				parentHash := ""
+				if parts[1] != "" {
+					parents := strings.Fields(parts[1])
+					if len(parents) > 0 {
+						parentHash = parents[0]
+					}
+				}
+
+				authorDate, _ := time.Parse(time.RFC3339, parts[4])
+
+				commit := gitCommitInfo{
+					Hash:        parts[0],
+					ParentHash:  parentHash,
+					AuthorName:  parts[2],
+					AuthorEmail: parts[3],
+					AuthorDate:  authorDate,
+					Message:     parts[5],
+				}
+				commits = append(commits, commit)
+				currentCommit = &commits[len(commits)-1]
+				continue
 			}
 		}
 
-		// Parse date
-		authorDate, err := time.Parse(time.RFC3339, parts[4])
-		if err != nil {
-			authorDate = time.Now()
-		}
+		// Check if it's a raw diff line
+		if strings.HasPrefix(line, ":") && currentCommit != nil {
+			// Format: :oldmode newmode oldhash newhash status\tpath
+			// Example: :100644 100644 abc123 def456 M	path/to/file
+			tabIdx := strings.Index(line, "\t")
+			if tabIdx == -1 {
+				continue
+			}
 
-		commits = append(commits, gitCommit{
-			Hash:        parts[0],
-			ParentHash:  parentHash,
-			AuthorName:  parts[2],
-			AuthorEmail: parts[3],
-			AuthorDate:  authorDate,
-			Message:     parts[5],
+			path := line[tabIdx+1:]
+			fields := strings.Fields(line[1:tabIdx])
+			if len(fields) < 5 {
+				continue
+			}
+
+			newMode, _ := strconv.ParseInt(fields[1], 8, 32)
+			newHash := fields[3]
+			status := fields[4][0] // First char: A, M, D, R, C, etc.
+
+			// For renames (R) and copies (C), the path might have two parts
+			if status == 'R' || status == 'C' {
+				pathParts := strings.Split(path, "\t")
+				if len(pathParts) == 2 {
+					path = pathParts[1] // Use destination path
+				}
+			}
+
+			fc := gitFileChange{
+				CommitHash: currentCommit.Hash,
+				Path:       path,
+				BlobHash:   newHash,
+				Mode:       int(newMode),
+				ChangeType: status,
+			}
+			fileChanges = append(fileChanges, fc)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("error reading git output: %w", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return nil, nil, fmt.Errorf("git log failed: %w", err)
+	}
+
+	return commits, fileChanges, nil
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Blob import - optimized for pg-xpatch delta compression
+// ═══════════════════════════════════════════════════════════════════════════
+
+// importBlobsOptimized imports blobs grouped by path for optimal delta compression.
+// pg-xpatch compresses blobs within the same path, so we:
+// 1. Group all blobs by path
+// 2. Sort each path's blobs by commit_id (chronological order)
+// 3. Process paths in parallel (different paths are independent)
+// 4. Insert all versions of a path together in order
+//
+// Each worker gets its own `git cat-file --batch` process for true parallelism.
+func importBlobsOptimized(
+	ctx context.Context,
+	database *db.DB,
+	gitPath string,
+	blobs []blobWork,
+	workers int,
+) error {
+	// ───────────────────────────────────────────────────────────────────────
+	// Step 1: Group blobs by path and sort by commit_id
+	// ───────────────────────────────────────────────────────────────────────
+
+	pathGroups := make(map[string][]blobWork)
+	for _, b := range blobs {
+		pathGroups[b.Path] = append(pathGroups[b.Path], b)
+	}
+
+	// Sort each group by commit_id (ULID = chronological)
+	for path := range pathGroups {
+		group := pathGroups[path]
+		sort.Slice(group, func(i, j int) bool {
+			return group[i].CommitID < group[j].CommitID
 		})
 	}
 
-	return commits, nil
-}
-
-// getAllFilePaths returns all file paths that ever existed in the repo
-func getAllFilePaths(gitPath string) ([]string, error) {
-	cmd := exec.Command("git", "log", "--all", "--pretty=format:", "--name-only", "--diff-filter=ACMRT")
-	cmd.Dir = gitPath
-
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-
-	// Deduplicate paths
-	pathSet := make(map[string]bool)
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	for scanner.Scan() {
-		path := strings.TrimSpace(scanner.Text())
-		if path != "" {
-			pathSet[path] = true
-		}
-	}
-
-	paths := make([]string, 0, len(pathSet))
-	for path := range pathSet {
+	// Create list of paths to process
+	paths := make([]string, 0, len(pathGroups))
+	for path := range pathGroups {
 		paths = append(paths, path)
 	}
 
-	return paths, nil
+	// ───────────────────────────────────────────────────────────────────────
+	// Step 2: Process paths with worker pool (each worker has own git process)
+	// ───────────────────────────────────────────────────────────────────────
+
+	totalBlobs := len(blobs)
+	progress := ui.NewProgress("Blobs", totalBlobs)
+	var imported atomic.Int64
+
+	// Path work channel
+	pathChan := make(chan string, len(paths))
+	for _, p := range paths {
+		pathChan <- p
+	}
+	close(pathChan)
+
+	// Error handling
+	var firstErr atomic.Value
+	var wg sync.WaitGroup
+
+	// Start workers - each with its own git cat-file process
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Start this worker's git cat-file --batch process
+			catFile := exec.CommandContext(ctx, "git", "cat-file", "--batch")
+			catFile.Dir = gitPath
+
+			catStdin, err := catFile.StdinPipe()
+			if err != nil {
+				firstErr.CompareAndSwap(nil, fmt.Errorf("failed to create cat-file stdin: %w", err))
+				return
+			}
+
+			catStdout, err := catFile.StdoutPipe()
+			if err != nil {
+				firstErr.CompareAndSwap(nil, fmt.Errorf("failed to create cat-file stdout: %w", err))
+				return
+			}
+
+			if err := catFile.Start(); err != nil {
+				firstErr.CompareAndSwap(nil, fmt.Errorf("failed to start cat-file: %w", err))
+				return
+			}
+			defer catFile.Wait()
+			defer catStdin.Close()
+
+			catReader := bufio.NewReaderSize(catStdout, 1024*1024)
+
+			// fetchBlobContent fetches content for a single blob from this worker's git process
+			fetchBlobContent := func(blobHash string) ([]byte, error) {
+				// Request blob
+				if _, err := fmt.Fprintf(catStdin, "%s\n", blobHash); err != nil {
+					return nil, err
+				}
+
+				// Read header
+				header, err := catReader.ReadString('\n')
+				if err != nil {
+					return nil, err
+				}
+
+				parts := strings.Fields(header)
+				if len(parts) < 3 || parts[1] == "missing" {
+					return nil, fmt.Errorf("blob not found: %s", blobHash)
+				}
+
+				size, err := strconv.Atoi(parts[2])
+				if err != nil {
+					return nil, err
+				}
+
+				// Read content
+				content := make([]byte, size)
+				if _, err := io.ReadFull(catReader, content); err != nil {
+					return nil, err
+				}
+
+				// Read trailing newline
+				catReader.ReadByte()
+
+				return content, nil
+			}
+
+			// Process paths assigned to this worker
+			for path := range pathChan {
+				// Check for previous errors
+				if firstErr.Load() != nil {
+					return
+				}
+
+				group := pathGroups[path]
+				dbBlobs := make([]*db.Blob, 0, len(group))
+
+				// Fetch content for all blobs in this path (in order)
+				for _, bw := range group {
+					content, err := fetchBlobContent(bw.BlobHash)
+					if err != nil {
+						// Skip missing blobs (may have been garbage collected)
+						continue
+					}
+
+					var contentHash *string
+					if len(content) > 0 {
+						h := util.HashBytes(content)
+						contentHash = &h
+					}
+
+					blob := &db.Blob{
+						Path:        bw.Path,
+						CommitID:    bw.CommitID,
+						Content:     content,
+						ContentHash: contentHash,
+						Mode:        bw.Mode,
+						IsSymlink:   bw.IsSymlink,
+					}
+
+					if bw.IsSymlink {
+						target := string(content)
+						blob.SymlinkTarget = &target
+						blob.Content = nil
+					}
+
+					dbBlobs = append(dbBlobs, blob)
+				}
+
+				// Insert all blobs for this path (in chronological order)
+				if len(dbBlobs) > 0 {
+					if err := database.CreateBlobs(ctx, dbBlobs); err != nil {
+						firstErr.CompareAndSwap(nil, err)
+						return
+					}
+				}
+
+				// Update progress
+				count := imported.Add(int64(len(dbBlobs)))
+				progress.Update(int(count))
+			}
+		}()
+	}
+
+	wg.Wait()
+	progress.Done()
+
+	if err := firstErr.Load(); err != nil {
+		return err.(error)
+	}
+
+	return nil
 }
 
-// importFileHistory imports the history of a single file
-func importFileHistory(ctx context.Context, database *db.DB, gitPath, filePath string, commits []gitCommit, commitMap map[string]string) error {
-	// Get all commits that touched this file
-	cmd := exec.Command("git", "log", "--follow", "--format=%H", "--", filePath)
-	cmd.Dir = gitPath
+// ═══════════════════════════════════════════════════════════════════════════
+// Branch selection
+// ═══════════════════════════════════════════════════════════════════════════
 
-	output, err := cmd.Output()
+func selectBranch(gitPath, branchFlag string) (string, error) {
+	if branchFlag != "" {
+		return branchFlag, nil
+	}
+
+	branches, err := getGitBranches(gitPath)
 	if err != nil {
-		// File might not exist in some branches
-		return nil
+		return "", fmt.Errorf("failed to list branches: %w", err)
 	}
 
-	// Parse commit hashes
-	fileCommits := make(map[string]bool)
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	for scanner.Scan() {
-		hash := strings.TrimSpace(scanner.Text())
-		if hash != "" {
-			fileCommits[hash] = true
-		}
+	if len(branches) == 0 {
+		return "", fmt.Errorf("no branches found")
 	}
 
-	if len(fileCommits) == 0 {
-		return nil
+	if len(branches) == 1 {
+		return branches[0].Name, nil
 	}
 
-	// For each commit that touched this file, get the content
-	var blobs []*db.Blob
-	var lastContent []byte
-
-	for _, gc := range commits {
-		if !fileCommits[gc.Hash] {
-			continue
-		}
-
-		pgitCommitID := commitMap[gc.Hash]
-
-		// Get file content at this commit
-		content, mode, isSymlink, target, err := getFileAtCommit(gitPath, gc.Hash, filePath)
-		if err != nil {
-			// File might be deleted at this commit
-			continue
-		}
-
-		// Skip if content is same as last (shouldn't happen but be safe)
-		if string(content) == string(lastContent) {
-			continue
-		}
-		lastContent = content
-
-		contentHash := util.HashBytes(content)
-
-		blob := &db.Blob{
-			Path:        filePath,
-			CommitID:    pgitCommitID,
-			Content:     content,
-			ContentHash: &contentHash,
-			Mode:        mode,
-			IsSymlink:   isSymlink,
-		}
-		if isSymlink {
-			blob.SymlinkTarget = &target
-		}
-
-		blobs = append(blobs, blob)
+	// Multiple branches - show picker if TTY
+	if term.IsTerminal(int(os.Stdout.Fd())) && !styles.IsAccessible() {
+		fmt.Println()
+		return runBranchPicker(branches)
 	}
 
-	if len(blobs) == 0 {
-		return nil
-	}
-
-	// Insert blobs
-	return database.CreateBlobs(ctx, blobs)
+	// Non-interactive: use current branch
+	return getCurrentBranch(gitPath), nil
 }
 
-// gitBranch represents a git branch with metadata
 type gitBranch struct {
 	Name        string
 	CommitCount int
 	IsCurrent   bool
 }
 
-// getGitBranches returns all branches in a git repo with commit counts
 func getGitBranches(gitPath string) ([]gitBranch, error) {
-	// Get all branches
 	cmd := exec.Command("git", "branch", "-a", "--format=%(refname:short)%(if)%(HEAD)%(then)*%(end)")
 	cmd.Dir = gitPath
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list branches: %w", err)
+		return nil, err
 	}
 
 	var branches []gitBranch
@@ -511,14 +692,10 @@ func getGitBranches(gitPath string) ([]gitBranch, error) {
 		isCurrent := strings.HasSuffix(line, "*")
 		name := strings.TrimSuffix(line, "*")
 
-		// Skip remote tracking branches that duplicate local ones
+		// Skip remote duplicates
 		if strings.HasPrefix(name, "origin/") {
 			localName := strings.TrimPrefix(name, "origin/")
-			if seen[localName] {
-				continue
-			}
-			// Also skip origin/HEAD
-			if localName == "HEAD" {
+			if seen[localName] || localName == "HEAD" {
 				continue
 			}
 		}
@@ -528,14 +705,11 @@ func getGitBranches(gitPath string) ([]gitBranch, error) {
 		}
 		seen[name] = true
 
-		// Get commit count for this branch
+		// Get commit count
 		countCmd := exec.Command("git", "rev-list", "--count", name)
 		countCmd.Dir = gitPath
-		countOutput, err := countCmd.Output()
-		count := 0
-		if err == nil {
-			count, _ = strconv.Atoi(strings.TrimSpace(string(countOutput)))
-		}
+		countOutput, _ := countCmd.Output()
+		count, _ := strconv.Atoi(strings.TrimSpace(string(countOutput)))
 
 		branches = append(branches, gitBranch{
 			Name:        name,
@@ -544,7 +718,6 @@ func getGitBranches(gitPath string) ([]gitBranch, error) {
 		})
 	}
 
-	// Sort: current branch first, then by name
 	sort.Slice(branches, func(i, j int) bool {
 		if branches[i].IsCurrent != branches[j].IsCurrent {
 			return branches[i].IsCurrent
@@ -555,45 +728,28 @@ func getGitBranches(gitPath string) ([]gitBranch, error) {
 	return branches, nil
 }
 
-// getCurrentBranch returns the current git branch name
 func getCurrentBranch(gitPath string) string {
 	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Dir = gitPath
 	output, err := cmd.Output()
 	if err != nil {
-		return "main" // fallback
+		return "main"
 	}
 	return strings.TrimSpace(string(output))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Branch Picker TUI (single-select)
+// Branch Picker TUI
 // ═══════════════════════════════════════════════════════════════════════════
 
 type branchPickerModel struct {
 	branches []gitBranch
 	cursor   int
 	selected string
-	width    int
-	height   int
 	quit     bool
-}
-
-func newBranchPicker(branches []gitBranch) branchPickerModel {
-	width, height, _ := term.GetSize(int(os.Stdout.Fd()))
-	if width == 0 {
-		width = 80
-	}
-	if height == 0 {
-		height = 24
-	}
-
-	return branchPickerModel{
-		branches: branches,
-		cursor:   0, // Start at first (current branch if sorted)
-		width:    width,
-		height:   height,
-	}
+	height   int // terminal height
+	offset   int // scroll offset
+	ready    bool
 }
 
 func (m branchPickerModel) Init() tea.Cmd {
@@ -602,57 +758,84 @@ func (m branchPickerModel) Init() tea.Cmd {
 
 func (m branchPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
+		m.ready = true
+		return m, nil
+
 	case tea.KeyMsg:
 		switch {
-		case key.Matches(msg, branchPickerKeys.Up):
+		case key.Matches(msg, key.NewBinding(key.WithKeys("up", "k"))):
 			if m.cursor > 0 {
 				m.cursor--
+				// Scroll up if cursor goes above visible area
+				if m.cursor < m.offset {
+					m.offset = m.cursor
+				}
 			}
-		case key.Matches(msg, branchPickerKeys.Down):
+		case key.Matches(msg, key.NewBinding(key.WithKeys("down", "j"))):
 			if m.cursor < len(m.branches)-1 {
 				m.cursor++
+				// Scroll down if cursor goes below visible area
+				_, end := m.visibleRange()
+				if m.cursor >= end {
+					m.offset++
+				}
 			}
-		case key.Matches(msg, branchPickerKeys.Select):
+		case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
 			m.selected = m.branches[m.cursor].Name
 			return m, tea.Quit
-		case key.Matches(msg, branchPickerKeys.Quit):
+		case key.Matches(msg, key.NewBinding(key.WithKeys("q", "esc", "ctrl+c"))):
 			m.quit = true
 			return m, tea.Quit
 		}
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
 	}
 	return m, nil
 }
 
-func (m branchPickerModel) View() string {
-	var b strings.Builder
-
-	b.WriteString(styles.Boldf("Select branch to import:"))
-	b.WriteString("\n\n")
-
-	// Show branches
-	maxVisible := m.height - 6 // Leave room for header and help
-	if maxVisible < 3 {
-		maxVisible = 3
+// maxVisibleLines returns the maximum branch lines that can fit
+// accounting for header (2 lines), footer (2 lines), and scroll indicators (2 lines)
+func (m branchPickerModel) maxVisibleLines() int {
+	if m.height <= 7 {
+		return 1
 	}
+	return m.height - 7 // header(2) + footer(2) + top indicator(1) + bottom indicator(1) + buffer(1)
+}
 
-	start := 0
-	if m.cursor >= maxVisible {
-		start = m.cursor - maxVisible + 1
-	}
-	end := start + maxVisible
+// visibleRange returns the start/end indices of visible branches
+func (m branchPickerModel) visibleRange() (start, end int) {
+	start = m.offset
+	end = start + m.maxVisibleLines()
 	if end > len(m.branches) {
 		end = len(m.branches)
 	}
+	return start, end
+}
+
+func (m branchPickerModel) View() string {
+	if !m.ready {
+		return "Loading..."
+	}
+
+	var b strings.Builder
+	b.WriteString(styles.Boldf("Select branch to import:"))
+	b.WriteString("\n\n")
+
+	start, end := m.visibleRange()
+
+	// Always show scroll indicator areas (reserved space)
+	if start > 0 {
+		b.WriteString(styles.Mute(fmt.Sprintf("  ↑ %d more above", start)))
+	}
+	b.WriteString("\n")
 
 	for i := start; i < end; i++ {
 		branch := m.branches[i]
-
-		cursor := "  "
+		var cursor string
 		if i == m.cursor {
-			cursor = styles.Cyan("> ")
+			cursor = styles.Cyan(">") + " "
+		} else {
+			cursor = "  "
 		}
 
 		name := branch.Name
@@ -662,39 +845,27 @@ func (m branchPickerModel) View() string {
 			name = styles.Cyan(name)
 		}
 
-		commits := styles.Mutef("(%d commits)", branch.CommitCount)
-
-		b.WriteString(fmt.Sprintf("%s%s %s\n", cursor, name, commits))
+		b.WriteString(cursor)
+		b.WriteString(name)
+		b.WriteString(" ")
+		b.WriteString(styles.Mutef("(%d commits)", branch.CommitCount))
+		b.WriteString("\n")
 	}
 
-	// Scroll indicator
-	if len(m.branches) > maxVisible {
-		b.WriteString(styles.Mutef("\n  ... %d branches total", len(m.branches)))
+	// Always show scroll indicator area (reserved space)
+	if end < len(m.branches) {
+		b.WriteString(styles.Mute(fmt.Sprintf("  ↓ %d more below", len(m.branches)-end)))
 	}
+	b.WriteString("\n")
 
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 	b.WriteString(styles.Mute("  ↑/↓ navigate  enter select  q cancel"))
-
 	return b.String()
 }
 
-// Key bindings for branch picker
-var branchPickerKeys = struct {
-	Up     key.Binding
-	Down   key.Binding
-	Select key.Binding
-	Quit   key.Binding
-}{
-	Up:     key.NewBinding(key.WithKeys("up", "k")),
-	Down:   key.NewBinding(key.WithKeys("down", "j")),
-	Select: key.NewBinding(key.WithKeys("enter")),
-	Quit:   key.NewBinding(key.WithKeys("q", "esc", "ctrl+c")),
-}
-
-// runBranchPicker shows the TUI and returns the selected branch
 func runBranchPicker(branches []gitBranch) (string, error) {
-	m := newBranchPicker(branches)
-	p := tea.NewProgram(m)
+	m := branchPickerModel{branches: branches}
+	p := tea.NewProgram(m, tea.WithAltScreen())
 
 	finalModel, err := p.Run()
 	if err != nil {
@@ -707,47 +878,4 @@ func runBranchPicker(branches []gitBranch) (string, error) {
 	}
 
 	return result.selected, nil
-}
-
-// getFileAtCommit returns the content of a file at a specific commit
-func getFileAtCommit(gitPath, commitHash, filePath string) (content []byte, mode int, isSymlink bool, target string, err error) {
-	// First check the file mode
-	cmd := exec.Command("git", "ls-tree", commitHash, "--", filePath)
-	cmd.Dir = gitPath
-	output, err := cmd.Output()
-	if err != nil || len(output) == 0 {
-		return nil, 0, false, "", fmt.Errorf("file not found")
-	}
-
-	// Parse mode from ls-tree output: "mode type hash\tpath"
-	parts := strings.Fields(string(output))
-	if len(parts) < 3 {
-		return nil, 0, false, "", fmt.Errorf("invalid ls-tree output")
-	}
-
-	modeStr := parts[0]
-	modeInt, _ := strconv.ParseInt(modeStr, 8, 32)
-	mode = int(modeInt)
-
-	// Check if symlink (mode 120000)
-	if modeStr == "120000" {
-		// For symlinks, git show returns the target path
-		cmd = exec.Command("git", "show", fmt.Sprintf("%s:%s", commitHash, filePath))
-		cmd.Dir = gitPath
-		output, err = cmd.Output()
-		if err != nil {
-			return nil, 0, false, "", err
-		}
-		return nil, mode, true, string(output), nil
-	}
-
-	// Get file content
-	cmd = exec.Command("git", "show", fmt.Sprintf("%s:%s", commitHash, filePath))
-	cmd.Dir = gitPath
-	content, err = cmd.Output()
-	if err != nil {
-		return nil, 0, false, "", err
-	}
-
-	return content, mode, false, "", nil
 }

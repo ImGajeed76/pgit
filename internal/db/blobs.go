@@ -27,24 +27,27 @@ func (db *DB) CreateBlob(ctx context.Context, b *Blob) error {
 	return db.Exec(ctx, sql, b.Path, b.CommitID, b.Content, b.ContentHash, b.Mode, b.IsSymlink, b.SymlinkTarget)
 }
 
-// CreateBlobs inserts multiple blobs in a single transaction
+// CreateBlobs inserts multiple blobs using COPY for speed
 func (db *DB) CreateBlobs(ctx context.Context, blobs []*Blob) error {
 	if len(blobs) == 0 {
 		return nil
 	}
 
-	return db.WithTx(ctx, func(tx pgx.Tx) error {
-		for _, b := range blobs {
-			_, err := tx.Exec(ctx, `
-				INSERT INTO pgit_blobs (path, commit_id, content, content_hash, mode, is_symlink, symlink_target)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-				b.Path, b.CommitID, b.Content, b.ContentHash, b.Mode, b.IsSymlink, b.SymlinkTarget)
-			if err != nil {
-				return err
-			}
+	rows := make([][]interface{}, len(blobs))
+	for i, b := range blobs {
+		rows[i] = []interface{}{
+			b.Path, b.CommitID, b.Content, b.ContentHash,
+			b.Mode, b.IsSymlink, b.SymlinkTarget,
 		}
-		return nil
-	})
+	}
+
+	_, err := db.pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"pgit_blobs"},
+		[]string{"path", "commit_id", "content", "content_hash", "mode", "is_symlink", "symlink_target"},
+		pgx.CopyFromRows(rows),
+	)
+	return err
 }
 
 // GetBlob retrieves a specific blob

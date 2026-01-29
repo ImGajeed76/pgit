@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/imgajeed76/pgit/internal/config"
 )
 
 // Runtime represents a container runtime (Docker or Podman)
@@ -174,6 +176,20 @@ func StartContainer(runtime Runtime, port int) error {
 		return cmd.Run()
 	}
 
+	// Load global config for container settings
+	globalCfg, _ := config.LoadGlobal()
+
+	shmSize := "256m"
+	image := DefaultImage
+	if globalCfg != nil {
+		if globalCfg.Container.ShmSize != "" {
+			shmSize = globalCfg.Container.ShmSize
+		}
+		if globalCfg.Container.Image != "" {
+			image = globalCfg.Container.Image
+		}
+	}
+
 	// Create and start new container with named volume for data persistence
 	// Named volumes are cross-platform compatible (Linux, macOS, Windows)
 	// and avoid UID/GID permission issues that plague bind mounts
@@ -182,10 +198,11 @@ func StartContainer(runtime Runtime, port int) error {
 		"--name", ContainerName,
 		"-p", fmt.Sprintf("%d:5432", port),
 		"-v", fmt.Sprintf("%s:/var/lib/postgresql/data", VolumeName),
+		"--shm-size", shmSize,
 		"-e", "POSTGRES_PASSWORD=" + DefaultPassword,
 		"-e", "POSTGRES_HOST_AUTH_METHOD=trust", // Allow local connections without password
 		"--restart", "unless-stopped",
-		DefaultImage,
+		image,
 	}
 
 	cmd := exec.Command(string(runtime), args...)

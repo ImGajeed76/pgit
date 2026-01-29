@@ -27,6 +27,30 @@ func (db *DB) CreateCommit(ctx context.Context, c *Commit) error {
 	return db.Exec(ctx, sql, c.ID, c.ParentID, c.TreeHash, c.Message, c.AuthorName, c.AuthorEmail, c.CreatedAt)
 }
 
+// CreateCommitsBatch inserts multiple commits using pgx.CopyFrom for speed
+// Commits must be in order (parents before children)
+func (db *DB) CreateCommitsBatch(ctx context.Context, commits []*Commit) error {
+	if len(commits) == 0 {
+		return nil
+	}
+
+	rows := make([][]interface{}, len(commits))
+	for i, c := range commits {
+		rows[i] = []interface{}{
+			c.ID, c.ParentID, c.TreeHash, c.Message,
+			c.AuthorName, c.AuthorEmail, c.CreatedAt,
+		}
+	}
+
+	_, err := db.pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"pgit_commits"},
+		[]string{"id", "parent_id", "tree_hash", "message", "author_name", "author_email", "created_at"},
+		pgx.CopyFromRows(rows),
+	)
+	return err
+}
+
 // GetCommit retrieves a commit by ID
 func (db *DB) GetCommit(ctx context.Context, id string) (*Commit, error) {
 	sql := `
