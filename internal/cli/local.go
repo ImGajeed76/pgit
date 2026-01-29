@@ -27,6 +27,7 @@ database within the container.`,
 		newLocalLogsCmd(),
 		newLocalDestroyCmd(),
 		newLocalMigrateCmd(),
+		newLocalUpdateCmd(),
 	)
 
 	return cmd
@@ -100,6 +101,19 @@ Your data is preserved throughout the process.`,
 	}
 }
 
+func newLocalUpdateCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "update",
+		Short: "Update pg-xpatch to the latest version",
+		Long: `Pull the latest pg-xpatch image and recreate the container.
+
+Your data is preserved in the named volume throughout the update.`,
+		RunE: runLocalUpdate,
+	}
+	cmd.Flags().Bool("check", false, "Only check for updates, don't install")
+	return cmd
+}
+
 func runLocalStatus(cmd *cobra.Command, args []string) error {
 	runtime := container.DetectRuntime()
 	if runtime == container.RuntimeNone {
@@ -139,6 +153,16 @@ func runLocalStatus(cmd *cobra.Command, args []string) error {
 		fmt.Println(styles.Mute("Data will be lost if container is removed."))
 		fmt.Println()
 		fmt.Println("Run 'pgit local migrate' to migrate to persistent storage.")
+	}
+
+	// Check for updates (non-blocking, best effort)
+	if container.ContainerExists(runtime) {
+		updateAvailable, _, _ := container.CheckForUpdate(runtime)
+		if updateAvailable {
+			fmt.Println()
+			fmt.Println(styles.Cyan("Update available!"))
+			fmt.Println("Run 'pgit local update' to get the latest pg-xpatch version.")
+		}
 	}
 
 	return nil
@@ -314,4 +338,70 @@ func runLocalMigrate(cmd *cobra.Command, args []string) error {
 	fmt.Println("It will survive container removal and recreation.")
 
 	return nil
+}
+
+func runLocalUpdate(cmd *cobra.Command, args []string) error {
+	runtime := container.DetectRuntime()
+	if runtime == container.RuntimeNone {
+		return util.ErrNoContainerRuntime
+	}
+
+	checkOnly, _ := cmd.Flags().GetBool("check")
+
+	// Check for updates
+	fmt.Print("Checking for updates...")
+	updateAvailable, localDigest, remoteDigest := container.CheckForUpdate(runtime)
+
+	if remoteDigest == "" {
+		fmt.Println(styles.Warningf(" unable to reach registry"))
+		return nil
+	}
+
+	if !updateAvailable {
+		fmt.Println(styles.Successf(" up to date"))
+		return nil
+	}
+
+	fmt.Println(styles.Cyan(" update available"))
+	fmt.Println()
+
+	if checkOnly {
+		fmt.Printf("Current: %s\n", styles.Mute(truncateDigest(localDigest)))
+		fmt.Printf("Latest:  %s\n", styles.Cyan(truncateDigest(remoteDigest)))
+		fmt.Println()
+		fmt.Println("Run 'pgit local update' to install the update.")
+		return nil
+	}
+
+	// Check if using named volume (required for safe update)
+	if container.ContainerExists(runtime) && !container.ContainerHasNamedVolume(runtime) {
+		fmt.Println(styles.Warningf("Cannot update: container uses legacy anonymous volume"))
+		fmt.Println("Run 'pgit local migrate' first to migrate to persistent storage.")
+		return nil
+	}
+
+	fmt.Println("Updating pg-xpatch...")
+	fmt.Println()
+
+	err := container.UpdateContainer(runtime, func(stage string) {
+		fmt.Printf("  %s...\n", stage)
+	})
+
+	if err != nil {
+		return fmt.Errorf("update failed: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Println(styles.Successf("Update complete!"))
+	fmt.Println("pg-xpatch is now running the latest version.")
+
+	return nil
+}
+
+// truncateDigest shortens a digest for display
+func truncateDigest(digest string) string {
+	if len(digest) > 19 {
+		return digest[:19] + "..."
+	}
+	return digest
 }

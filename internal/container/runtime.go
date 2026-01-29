@@ -1,10 +1,13 @@
 package container
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Runtime represents a container runtime (Docker or Podman)
@@ -497,6 +500,200 @@ func MigrateToNamedVolume(runtime Runtime, progressFn func(stage string)) error 
 	cleanupCmd := exec.Command(string(runtime), "volume", "rm", anonVolume)
 	// Don't fail if cleanup fails - data is already migrated
 	_ = cleanupCmd.Run()
+
+	return nil
+}
+
+// GetContainerImageDigest returns the image digest (sha256) of the running container
+func GetContainerImageDigest(runtime Runtime) string {
+	if runtime == RuntimeNone {
+		return ""
+	}
+
+	cmd := exec.Command(string(runtime), "inspect", ContainerName,
+		"--format", "{{.Image}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// GetLocalImageDigest returns the repo digest of the locally cached image
+// This is the manifest digest that can be compared with the registry
+func GetLocalImageDigest(runtime Runtime) string {
+	if runtime == RuntimeNone {
+		return ""
+	}
+
+	// Get RepoDigests which contains the manifest digest from the registry
+	// Format: [ghcr.io/imgajeed76/pg-xpatch@sha256:xxx]
+	cmd := exec.Command(string(runtime), "inspect", DefaultImage,
+		"--format", "{{range .RepoDigests}}{{.}}{{end}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	repoDigest := strings.TrimSpace(string(output))
+	// Extract just the digest part after @
+	if idx := strings.Index(repoDigest, "@"); idx != -1 {
+		return repoDigest[idx+1:]
+	}
+	return repoDigest
+}
+
+// ghcrTokenResponse is the response from GHCR token endpoint
+type ghcrTokenResponse struct {
+	Token string `json:"token"`
+}
+
+// ghcrManifestResponse is a minimal manifest response to get digest
+type ghcrManifestResponse struct {
+	Digest string `json:"digest,omitempty"`
+}
+
+// GetRemoteImageDigest fetches the latest image digest from the registry
+// Returns empty string if unable to fetch (network error, etc.)
+func GetRemoteImageDigest() string {
+	// Parse image name: ghcr.io/imgajeed76/pg-xpatch:latest
+	// GHCR API: https://ghcr.io/v2/{owner}/{repo}/manifests/{tag}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Step 1: Get anonymous token for public image
+	tokenURL := "https://ghcr.io/token?scope=repository:imgajeed76/pg-xpatch:pull"
+	tokenResp, err := client.Get(tokenURL)
+	if err != nil {
+		return ""
+	}
+	defer tokenResp.Body.Close()
+
+	if tokenResp.StatusCode != 200 {
+		return ""
+	}
+
+	var tokenData ghcrTokenResponse
+	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenData); err != nil {
+		return ""
+	}
+
+	// Step 2: Get manifest with digest
+	manifestURL := "https://ghcr.io/v2/imgajeed76/pg-xpatch/manifests/latest"
+	req, err := http.NewRequest("GET", manifestURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+tokenData.Token)
+	// Request docker manifest to get digest in header
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+
+	manifestResp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer manifestResp.Body.Close()
+
+	if manifestResp.StatusCode != 200 {
+		return ""
+	}
+
+	// The digest is in the Docker-Content-Digest header
+	digest := manifestResp.Header.Get("Docker-Content-Digest")
+	return digest
+}
+
+// CheckForUpdate checks if a newer pg-xpatch image is available
+// Returns (updateAvailable, currentDigest, remoteDigest)
+func CheckForUpdate(runtime Runtime) (bool, string, string) {
+	if runtime == RuntimeNone {
+		return false, "", ""
+	}
+
+	localDigest := GetLocalImageDigest(runtime)
+	if localDigest == "" {
+		// No local image, update available
+		return true, "", ""
+	}
+
+	remoteDigest := GetRemoteImageDigest()
+	if remoteDigest == "" {
+		// Can't reach registry, assume no update
+		return false, localDigest, ""
+	}
+
+	// Both are now in sha256:xxx format
+	return localDigest != remoteDigest, localDigest, remoteDigest
+}
+
+// PullLatestImage pulls the latest pg-xpatch image
+func PullLatestImage(runtime Runtime) error {
+	if runtime == RuntimeNone {
+		return fmt.Errorf("no container runtime available")
+	}
+
+	cmd := exec.Command(string(runtime), "pull", DefaultImage)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// UpdateContainer updates the container to use the latest image
+// This requires recreating the container (data is preserved in volume)
+func UpdateContainer(runtime Runtime, progressFn func(stage string)) error {
+	if runtime == RuntimeNone {
+		return fmt.Errorf("no container runtime available")
+	}
+
+	// Get current port
+	port := DefaultPort
+	if IsContainerRunning(runtime) {
+		if p, err := GetContainerPort(runtime); err == nil {
+			port = p
+		}
+	}
+
+	// Step 1: Pull latest image
+	if progressFn != nil {
+		progressFn("Pulling latest image")
+	}
+	if err := PullLatestImage(runtime); err != nil {
+		return fmt.Errorf("failed to pull image: %w", err)
+	}
+
+	// Step 2: Stop and remove container
+	if ContainerExists(runtime) {
+		if progressFn != nil {
+			progressFn("Stopping container")
+		}
+		if err := StopContainer(runtime); err != nil {
+			return fmt.Errorf("failed to stop container: %w", err)
+		}
+
+		if progressFn != nil {
+			progressFn("Removing old container")
+		}
+		cmd := exec.Command(string(runtime), "rm", ContainerName)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to remove container: %w", err)
+		}
+	}
+
+	// Step 3: Start new container with same volume
+	if progressFn != nil {
+		progressFn("Starting updated container")
+	}
+	if err := StartContainer(runtime, port); err != nil {
+		return fmt.Errorf("failed to start container: %w", err)
+	}
+
+	// Step 4: Wait for postgres
+	if progressFn != nil {
+		progressFn("Waiting for PostgreSQL")
+	}
+	if err := WaitForPostgres(runtime, 30); err != nil {
+		return fmt.Errorf("PostgreSQL failed to start: %w", err)
+	}
 
 	return nil
 }
