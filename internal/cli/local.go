@@ -26,6 +26,7 @@ database within the container.`,
 		newLocalStopCmd(),
 		newLocalLogsCmd(),
 		newLocalDestroyCmd(),
+		newLocalMigrateCmd(),
 	)
 
 	return cmd
@@ -81,6 +82,24 @@ later without losing your repositories. Use --purge to also delete the data.`,
 	return cmd
 }
 
+func newLocalMigrateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "migrate",
+		Short: "Migrate legacy container to persistent storage",
+		Long: `Migrate data from a legacy container (using anonymous volume) to the new
+persistent named volume storage.
+
+This command:
+1. Stops the current container
+2. Copies all data to the new named volume
+3. Recreates the container with persistent storage
+4. Removes the old anonymous volume
+
+Your data is preserved throughout the process.`,
+		RunE: runLocalMigrate,
+	}
+}
+
 func runLocalStatus(cmd *cobra.Command, args []string) error {
 	runtime := container.DetectRuntime()
 	if runtime == container.RuntimeNone {
@@ -118,10 +137,8 @@ func runLocalStatus(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 		fmt.Println(styles.Warningf("Warning: Container uses anonymous volume (legacy)"))
 		fmt.Println(styles.Mute("Data will be lost if container is removed."))
-		fmt.Println(styles.Mute("To migrate to persistent storage:"))
-		fmt.Println(styles.Mute("  1. Export any important data"))
-		fmt.Println(styles.Mute("  2. Run: pgit local destroy"))
-		fmt.Println(styles.Mute("  3. Run: pgit local start"))
+		fmt.Println()
+		fmt.Println("Run 'pgit local migrate' to migrate to persistent storage.")
 	}
 
 	return nil
@@ -251,6 +268,50 @@ func runLocalDestroy(cmd *cobra.Command, args []string) error {
 			fmt.Println(styles.Mute("Data volume preserved. Use --purge to delete all data."))
 		}
 	}
+
+	return nil
+}
+
+func runLocalMigrate(cmd *cobra.Command, args []string) error {
+	runtime := container.DetectRuntime()
+	if runtime == container.RuntimeNone {
+		return util.ErrNoContainerRuntime
+	}
+
+	// Check if migration is needed
+	if !container.ContainerExists(runtime) {
+		fmt.Println("No container exists. Run 'pgit local start' to create one with persistent storage.")
+		return nil
+	}
+
+	if container.ContainerHasNamedVolume(runtime) {
+		fmt.Println(styles.Successf("Container already uses persistent storage. No migration needed."))
+		return nil
+	}
+
+	// Check for anonymous volume
+	anonVolume := container.GetContainerAnonymousVolume(runtime)
+	if anonVolume == "" {
+		return fmt.Errorf("could not find anonymous volume to migrate from")
+	}
+
+	fmt.Println("Migrating to persistent storage...")
+	fmt.Printf("Source volume: %s\n", styles.Mute(anonVolume))
+	fmt.Printf("Target volume: %s\n", styles.Cyan(container.VolumeName))
+	fmt.Println()
+
+	err := container.MigrateToNamedVolume(runtime, func(stage string) {
+		fmt.Printf("  %s...\n", stage)
+	})
+
+	if err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Println(styles.Successf("Migration complete!"))
+	fmt.Println("Your data is now stored in a persistent named volume.")
+	fmt.Println("It will survive container removal and recreation.")
 
 	return nil
 }

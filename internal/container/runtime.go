@@ -370,3 +370,133 @@ func RemoveVolume(runtime Runtime) error {
 	cmd := exec.Command(string(runtime), "volume", "rm", VolumeName)
 	return cmd.Run()
 }
+
+// GetContainerAnonymousVolume returns the anonymous volume ID used by the container
+// for /var/lib/postgresql/data, or empty string if using named volume or not found
+func GetContainerAnonymousVolume(runtime Runtime) string {
+	if runtime == RuntimeNone {
+		return ""
+	}
+
+	// Get all mounts and find the one for postgres data
+	// Format: {{.Type}} {{.Name}} {{.Destination}}
+	cmd := exec.Command(string(runtime), "inspect", ContainerName,
+		"--format", "{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Destination}}\n{{end}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(output), "\n") {
+		parts := strings.Split(line, "|")
+		if len(parts) != 3 {
+			continue
+		}
+		mountType, name, dest := parts[0], parts[1], parts[2]
+		// Look for volume mount to postgres data dir that's NOT our named volume
+		if dest == "/var/lib/postgresql/data" && mountType == "volume" && name != VolumeName {
+			return name
+		}
+	}
+	return ""
+}
+
+// MigrateToNamedVolume migrates data from an anonymous volume to the named pgit-data volume
+// This is used to upgrade legacy containers that used anonymous volumes
+func MigrateToNamedVolume(runtime Runtime, progressFn func(stage string)) error {
+	if runtime == RuntimeNone {
+		return fmt.Errorf("no container runtime available")
+	}
+
+	// Check container exists and uses anonymous volume
+	if !ContainerExists(runtime) {
+		return fmt.Errorf("no container to migrate")
+	}
+
+	if ContainerHasNamedVolume(runtime) {
+		return fmt.Errorf("container already uses named volume")
+	}
+
+	// Get the anonymous volume ID
+	anonVolume := GetContainerAnonymousVolume(runtime)
+	if anonVolume == "" {
+		return fmt.Errorf("could not find anonymous volume to migrate from")
+	}
+
+	// Get current port for restarting later
+	port := DefaultPort
+	if IsContainerRunning(runtime) {
+		if p, err := GetContainerPort(runtime); err == nil {
+			port = p
+		}
+	}
+
+	// Step 1: Stop the container
+	if progressFn != nil {
+		progressFn("Stopping container")
+	}
+	if err := StopContainer(runtime); err != nil {
+		return fmt.Errorf("failed to stop container: %w", err)
+	}
+
+	// Step 2: Create the named volume if it doesn't exist
+	if progressFn != nil {
+		progressFn("Creating named volume")
+	}
+	if !VolumeExists(runtime) {
+		createCmd := exec.Command(string(runtime), "volume", "create", VolumeName)
+		if err := createCmd.Run(); err != nil {
+			return fmt.Errorf("failed to create named volume: %w", err)
+		}
+	}
+
+	// Step 3: Copy data from anonymous volume to named volume using a temporary container
+	// We use --privileged because the postgres data directory has restricted permissions (700)
+	// that prevent even root from reading across volume boundaries on some systems (SELinux, etc.)
+	if progressFn != nil {
+		progressFn("Copying data to named volume")
+	}
+	copyCmd := exec.Command(string(runtime), "run", "--rm",
+		"--privileged",
+		"-v", fmt.Sprintf("%s:/source:ro", anonVolume),
+		"-v", fmt.Sprintf("%s:/dest", VolumeName),
+		DefaultImage, "sh", "-c", "cp -a /source/. /dest/")
+	if err := copyCmd.Run(); err != nil {
+		return fmt.Errorf("failed to copy data: %w", err)
+	}
+
+	// Step 4: Remove the old container
+	if progressFn != nil {
+		progressFn("Removing old container")
+	}
+	rmCmd := exec.Command(string(runtime), "rm", ContainerName)
+	if err := rmCmd.Run(); err != nil {
+		return fmt.Errorf("failed to remove old container: %w", err)
+	}
+
+	// Step 5: Create new container with named volume
+	if progressFn != nil {
+		progressFn("Creating new container with named volume")
+	}
+	if err := StartContainer(runtime, port); err != nil {
+		return fmt.Errorf("failed to start new container: %w", err)
+	}
+
+	// Step 6: Wait for postgres to be ready
+	if progressFn != nil {
+		progressFn("Waiting for PostgreSQL")
+	}
+	if err := WaitForPostgres(runtime, 30); err != nil {
+		return fmt.Errorf("PostgreSQL failed to start: %w", err)
+	}
+
+	// Step 7: Remove the old anonymous volume
+	if progressFn != nil {
+		progressFn("Cleaning up old volume")
+	}
+	cleanupCmd := exec.Command(string(runtime), "volume", "rm", anonVolume)
+	// Don't fail if cleanup fails - data is already migrated
+	_ = cleanupCmd.Run()
+
+	return nil
+}
