@@ -25,6 +25,7 @@ database within the container.`,
 		newLocalStartCmd(),
 		newLocalStopCmd(),
 		newLocalLogsCmd(),
+		newLocalDestroyCmd(),
 	)
 
 	return cmd
@@ -66,6 +67,20 @@ func newLocalLogsCmd() *cobra.Command {
 	return cmd
 }
 
+func newLocalDestroyCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "destroy",
+		Short: "Remove container and optionally delete all data",
+		Long: `Remove the pgit-local container.
+
+By default, the data volume is preserved so you can recreate the container
+later without losing your repositories. Use --purge to also delete the data.`,
+		RunE: runLocalDestroy,
+	}
+	cmd.Flags().Bool("purge", false, "Also delete the data volume (DESTROYS ALL DATA)")
+	return cmd
+}
+
 func runLocalStatus(cmd *cobra.Command, args []string) error {
 	runtime := container.DetectRuntime()
 	if runtime == container.RuntimeNone {
@@ -77,16 +92,36 @@ func runLocalStatus(cmd *cobra.Command, args []string) error {
 
 	if !container.ContainerExists(runtime) {
 		fmt.Printf("Status: %s\n", styles.Mute("not created"))
-		return nil
-	}
-
-	if container.IsContainerRunning(runtime) {
+	} else if container.IsContainerRunning(runtime) {
 		port, _ := container.GetContainerPort(runtime)
 		fmt.Printf("Status: %s\n", styles.Successf("running"))
 		fmt.Printf("Port: %d\n", port)
 		fmt.Printf("Image: %s\n", container.DefaultImage)
 	} else {
 		fmt.Printf("Status: %s\n", styles.Warningf("stopped"))
+	}
+
+	// Show volume info
+	fmt.Printf("\nData volume: %s\n", container.VolumeName)
+	if container.VolumeExists(runtime) {
+		_, size, err := container.GetVolumeInfo(runtime)
+		if err == nil && size != "" {
+			fmt.Printf("Volume size: %s\n", size)
+		}
+		fmt.Printf("Volume status: %s\n", styles.Successf("exists"))
+	} else {
+		fmt.Printf("Volume status: %s\n", styles.Mute("not created"))
+	}
+
+	// Warn if container exists but doesn't use named volume (legacy container)
+	if container.ContainerExists(runtime) && !container.ContainerHasNamedVolume(runtime) {
+		fmt.Println()
+		fmt.Println(styles.Warningf("Warning: Container uses anonymous volume (legacy)"))
+		fmt.Println(styles.Mute("Data will be lost if container is removed."))
+		fmt.Println(styles.Mute("To migrate to persistent storage:"))
+		fmt.Println(styles.Mute("  1. Export any important data"))
+		fmt.Println(styles.Mute("  2. Run: pgit local destroy"))
+		fmt.Println(styles.Mute("  3. Run: pgit local start"))
 	}
 
 	return nil
@@ -175,5 +210,47 @@ func runLocalLogs(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Print(logs)
+	return nil
+}
+
+func runLocalDestroy(cmd *cobra.Command, args []string) error {
+	runtime := container.DetectRuntime()
+	if runtime == container.RuntimeNone {
+		return util.ErrNoContainerRuntime
+	}
+
+	purge, _ := cmd.Flags().GetBool("purge")
+
+	// Remove container if it exists
+	if container.ContainerExists(runtime) {
+		fmt.Print("Removing container...")
+		if err := container.RemoveContainer(runtime); err != nil {
+			fmt.Println(styles.Errorf(" FAILED"))
+			return err
+		}
+		fmt.Println(styles.Successf(" OK"))
+	} else {
+		fmt.Println("Container does not exist")
+	}
+
+	// Optionally remove volume
+	if purge {
+		if container.VolumeExists(runtime) {
+			fmt.Print("Removing data volume...")
+			if err := container.RemoveVolume(runtime); err != nil {
+				fmt.Println(styles.Errorf(" FAILED"))
+				return err
+			}
+			fmt.Println(styles.Successf(" OK"))
+			fmt.Println(styles.Warningf("All pgit data has been permanently deleted"))
+		} else {
+			fmt.Println("Data volume does not exist")
+		}
+	} else {
+		if container.VolumeExists(runtime) {
+			fmt.Println(styles.Mute("Data volume preserved. Use --purge to delete all data."))
+		}
+	}
+
 	return nil
 }

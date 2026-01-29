@@ -19,6 +19,14 @@ const (
 // ContainerName is the name of the shared pgit local container
 const ContainerName = "pgit-local"
 
+// VolumeName is the named Docker volume for persistent PostgreSQL data
+// Named volumes are used instead of bind mounts for cross-platform compatibility:
+// - Work identically on Linux, macOS, and Windows
+// - No UID/GID permission issues (Docker manages this)
+// - No filesystem compatibility issues (NFS, NTFS, etc.)
+// - Survive container removal (docker rm)
+const VolumeName = "pgit-data"
+
 // DefaultImage is the pg-xpatch Docker image
 const DefaultImage = "ghcr.io/imgajeed76/pg-xpatch:latest"
 
@@ -131,6 +139,22 @@ func GetContainerPort(runtime Runtime) (int, error) {
 	return port, nil
 }
 
+// ContainerHasNamedVolume checks if the container uses the named pgit-data volume
+func ContainerHasNamedVolume(runtime Runtime) bool {
+	if runtime == RuntimeNone {
+		return false
+	}
+
+	// Get mounts info from container
+	cmd := exec.Command(string(runtime), "inspect", ContainerName,
+		"--format", "{{range .Mounts}}{{.Name}}{{end}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), VolumeName)
+}
+
 // StartContainer starts the pgit-local container
 func StartContainer(runtime Runtime, port int) error {
 	if runtime == RuntimeNone {
@@ -147,11 +171,14 @@ func StartContainer(runtime Runtime, port int) error {
 		return cmd.Run()
 	}
 
-	// Create and start new container
+	// Create and start new container with named volume for data persistence
+	// Named volumes are cross-platform compatible (Linux, macOS, Windows)
+	// and avoid UID/GID permission issues that plague bind mounts
 	args := []string{
 		"run", "-d",
 		"--name", ContainerName,
 		"-p", fmt.Sprintf("%d:5432", port),
+		"-v", fmt.Sprintf("%s:/var/lib/postgresql/data", VolumeName),
 		"-e", "POSTGRES_PASSWORD=" + DefaultPassword,
 		"-e", "POSTGRES_HOST_AUTH_METHOD=trust", // Allow local connections without password
 		"--restart", "unless-stopped",
@@ -288,4 +315,58 @@ func FindAvailablePort(startPort int) int {
 		}
 	}
 	return startPort // Return original if none found
+}
+
+// VolumeExists checks if the pgit data volume exists
+func VolumeExists(runtime Runtime) bool {
+	if runtime == RuntimeNone {
+		return false
+	}
+
+	cmd := exec.Command(string(runtime), "volume", "inspect", VolumeName)
+	return cmd.Run() == nil
+}
+
+// GetVolumeInfo returns information about the pgit data volume
+func GetVolumeInfo(runtime Runtime) (mountpoint string, size string, err error) {
+	if runtime == RuntimeNone {
+		return "", "", fmt.Errorf("no container runtime available")
+	}
+
+	// Get mountpoint
+	cmd := exec.Command(string(runtime), "volume", "inspect", VolumeName, "--format", "{{.Mountpoint}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", "", fmt.Errorf("volume %s not found", VolumeName)
+	}
+	mountpoint = strings.TrimSpace(string(output))
+
+	// Get size using du inside a container (cross-platform way)
+	sizeCmd := exec.Command(string(runtime), "run", "--rm",
+		"-v", fmt.Sprintf("%s:/data:ro", VolumeName),
+		"alpine", "du", "-sh", "/data")
+	sizeOutput, err := sizeCmd.Output()
+	if err == nil {
+		parts := strings.Fields(string(sizeOutput))
+		if len(parts) > 0 {
+			size = parts[0]
+		}
+	}
+
+	return mountpoint, size, nil
+}
+
+// RemoveVolume removes the pgit data volume (WARNING: destroys all data!)
+func RemoveVolume(runtime Runtime) error {
+	if runtime == RuntimeNone {
+		return fmt.Errorf("no container runtime available")
+	}
+
+	// Container must be removed first
+	if ContainerExists(runtime) {
+		return fmt.Errorf("cannot remove volume while container exists; run 'pgit local destroy' first")
+	}
+
+	cmd := exec.Command(string(runtime), "volume", "rm", VolumeName)
+	return cmd.Run()
 }
