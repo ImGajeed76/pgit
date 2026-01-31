@@ -16,12 +16,17 @@ import (
 
 func newCheckoutCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "checkout <commit> [path]",
+		Use:   "checkout [commit] [--] [path...]",
 		Short: "Restore working tree files",
 		Long: `Restore working tree files from a commit.
 
-With just a commit, restores the entire working tree.
-With a path, restores only that file or directory.
+Usage:
+  pgit checkout <commit>           # Switch to commit (updates HEAD)
+  pgit checkout <commit> <path>    # Restore file from commit
+  pgit checkout -- <path>          # Restore file from HEAD (discard changes)
+
+The '--' separates the commit from file paths, useful when restoring
+files from HEAD without specifying a commit.
 
 Warning: This will overwrite local changes!`,
 		Args: cobra.MinimumNArgs(1),
@@ -49,6 +54,28 @@ func runCheckout(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer r.Close()
+
+	// Handle "checkout -- <path>" syntax (restore from HEAD)
+	if args[0] == "--" {
+		if len(args) < 2 {
+			return fmt.Errorf("no files specified after '--'")
+		}
+		// Get HEAD commit
+		head, err := r.DB.GetHeadCommit(ctx)
+		if err != nil {
+			return err
+		}
+		if head == nil {
+			return util.ErrNoCommits
+		}
+		// Restore each file from HEAD
+		for _, path := range args[1:] {
+			if err := checkoutPath(ctx, r, head.ID, path, force); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	// Parse commit reference
 	ref := args[0]
@@ -93,7 +120,17 @@ func runCheckout(cmd *cobra.Command, args []string) error {
 
 	// If path specified, only restore that file/directory
 	if len(args) > 1 {
-		return checkoutPath(ctx, r, commitID, args[1], force)
+		// Handle "checkout <commit> -- <path>" by skipping the "--"
+		startIdx := 1
+		if args[1] == "--" {
+			startIdx = 2
+		}
+		for _, path := range args[startIdx:] {
+			if err := checkoutPath(ctx, r, commitID, path, force); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	// Full checkout

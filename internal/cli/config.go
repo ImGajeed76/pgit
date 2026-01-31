@@ -166,6 +166,7 @@ func runRepoConfig(cmd *cobra.Command, args []string, listAll bool) error {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
+	fmt.Printf("%s %s=%s\n", styles.Green("Set"), key, value)
 	return nil
 }
 

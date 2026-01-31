@@ -52,6 +52,14 @@ func init() {
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output")
 	rootCmd.PersistentFlags().Bool("no-color", false, "Disable colored output")
 
+	// Set up pre-run to handle global flags
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		noColor, _ := cmd.Flags().GetBool("no-color")
+		if noColor {
+			styles.SetNoColor(true)
+		}
+	}
+
 	// Add all subcommands
 	rootCmd.AddCommand(
 		newVersionCmd(),

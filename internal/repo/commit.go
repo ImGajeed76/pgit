@@ -138,8 +138,8 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 			})
 
 		case config.StatusDeleted:
-			// Mark as deleted (content = nil)
-			blob.Content = nil
+			// Mark as deleted (empty content, nil hash)
+			blob.Content = []byte{}
 			blob.ContentHash = nil
 			blob.Mode = 0
 		}

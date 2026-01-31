@@ -19,9 +19,17 @@ const (
 	SymbolArrow   = "→"
 )
 
+// noColorFlag is set by the CLI when --no-color is passed
+var noColorFlag bool
+
+// SetNoColor sets the no-color flag (called from CLI)
+func SetNoColor(v bool) {
+	noColorFlag = v
+}
+
 // NoColor checks if colors should be disabled
 func NoColor() bool {
-	return os.Getenv("NO_COLOR") != "" || os.Getenv("PGIT_NO_COLOR") != ""
+	return noColorFlag || os.Getenv("NO_COLOR") != "" || os.Getenv("PGIT_NO_COLOR") != ""
 }
 
 // IsAccessible checks if accessibility mode is enabled

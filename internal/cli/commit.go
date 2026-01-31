@@ -66,6 +66,14 @@ func runCommit(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Check if -m was provided but empty
+	messageFlag := cmd.Flags().Lookup("message")
+	messageProvided := messageFlag != nil && messageFlag.Changed
+
+	if messageProvided && strings.TrimSpace(message) == "" {
+		return fmt.Errorf("aborting commit due to empty commit message")
+	}
+
 	// If no message provided, open editor
 	if message == "" {
 		var err error

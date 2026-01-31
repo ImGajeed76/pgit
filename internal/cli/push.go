@@ -47,7 +47,7 @@ func runPush(cmd *cobra.Command, args []string) error {
 	// Get remote config
 	remote, exists := r.Config.GetRemote(remoteName)
 	if !exists {
-		return util.ErrRemoteNotFound
+		return util.RemoteNotFoundError(remoteName)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

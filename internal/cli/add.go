@@ -13,19 +13,19 @@ import (
 
 func newAddCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "add <path>...",
+		Use:   "add [path]...",
 		Short: "Add file contents to the staging area",
 		Long: `Add file contents to the staging area.
 
 This command updates the index using the current content found in
 the working tree, to prepare the content staged for the next commit.
 
-Use "pgit add ." to add all changes in the current directory.`,
-		Args: cobra.MinimumNArgs(1),
+Use "pgit add ." to add all changes in the current directory.
+Use "pgit add -A" to add all changes including untracked files.`,
 		RunE: runAdd,
 	}
 
-	cmd.Flags().BoolP("all", "A", false, "Add all changes (including deletions)")
+	cmd.Flags().BoolP("all", "A", false, "Add all changes (including untracked files)")
 	cmd.Flags().BoolP("verbose", "v", false, "Be verbose")
 
 	return cmd
@@ -33,6 +33,19 @@ Use "pgit add ." to add all changes in the current directory.`,
 
 func runAdd(cmd *cobra.Command, args []string) error {
 	verbose, _ := cmd.Flags().GetBool("verbose")
+	addAll, _ := cmd.Flags().GetBool("all")
+
+	// If no args and no -A flag, show helpful message
+	if len(args) == 0 && !addAll {
+		fmt.Println("Nothing specified, nothing added.")
+		fmt.Println()
+		fmt.Println("Maybe you wanted to say 'pgit add .'?")
+		fmt.Println()
+		fmt.Println("Use 'pgit add <path>...' to add specific files")
+		fmt.Println("Use 'pgit add .' to add all changes in current directory")
+		fmt.Println("Use 'pgit add -A' to add all changes including untracked files")
+		return nil
+	}
 
 	r, err := repo.Open()
 	if err != nil {
@@ -48,8 +61,8 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 	defer r.Close()
 
-	// Handle "." special case
-	if len(args) == 1 && args[0] == "." {
+	// Handle -A flag or "." special case
+	if addAll || (len(args) == 1 && args[0] == ".") {
 		if err := r.StageAll(ctx); err != nil {
 			return err
 		}
