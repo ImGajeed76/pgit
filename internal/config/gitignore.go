@@ -107,35 +107,31 @@ func (ip *IgnorePatterns) IsIgnored(path string, isDir bool) bool {
 // - ** matches anything including /
 // - ? matches any single character
 // - [abc] matches any character in brackets
+//
+// Per gitignore spec:
+// - If pattern has no slash, it matches basename at any level
+// - If pattern has slash in middle/beginning, it's relative to .gitignore location (root)
+// - Pattern starting with / is anchored to root
 func (ip *IgnorePatterns) matches(pattern, path string) bool {
 	// Handle patterns without /
 	if !strings.Contains(pattern, "/") {
-		// Match against basename only
+		// No slash: match against basename at any level
 		basename := filepath.Base(path)
 		return matchGlob(pattern, basename)
 	}
 
+	// Pattern contains / - it's relative to root (per gitignore spec)
+	// "If there is a separator at the beginning or middle (or both) of the
+	// pattern, then the pattern is relative to the directory level of the
+	// particular .gitignore file itself."
+
 	// Handle patterns starting with /
 	if strings.HasPrefix(pattern, "/") {
 		pattern = pattern[1:]
-		return matchGlob(pattern, path)
 	}
 
-	// Pattern contains / but doesn't start with /
-	// Match against path or any suffix
-	if matchGlob(pattern, path) {
-		return true
-	}
-
-	// Try matching against path suffixes
-	parts := strings.Split(path, "/")
-	for i := range parts {
-		suffix := strings.Join(parts[i:], "/")
-		if matchGlob(pattern, suffix) {
-			return true
-		}
-	}
-	return false
+	// Match against full path from root
+	return matchGlob(pattern, path)
 }
 
 // matchGlob performs glob matching with support for *, **, ?, and [...]

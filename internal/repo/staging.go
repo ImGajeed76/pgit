@@ -189,6 +189,11 @@ func (r *Repository) GetWorkingTreeChanges(ctx context.Context) ([]FileChange, e
 	// Check for deleted files
 	for path, blob := range committedFiles {
 		if !workingFiles[path] {
+			// Skip if file is ignored - it may exist but was skipped during scan
+			if ignorePatterns.IsIgnored(path, false) {
+				continue
+			}
+
 			oldHash := ""
 			if blob.ContentHash != nil {
 				oldHash = *blob.ContentHash

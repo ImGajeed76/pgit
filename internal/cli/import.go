@@ -277,16 +277,32 @@ func runImport(cmd *cobra.Command, args []string) error {
 	// Step 4: Import blobs with dual progress
 	// ═══════════════════════════════════════════════════════════════════════
 
-	// Filter to only additions and modifications (skip deletes)
+	// Separate additions/modifications from deletions
 	var blobsToImport []blobWork
+	var deletions []*db.Blob
 	for _, fc := range fileChanges {
-		if fc.ChangeType == 'D' || fc.BlobHash == "" || fc.BlobHash == "0000000000000000000000000000000000000000" {
-			continue
-		}
 		pgitCommitID, ok := commitMap[fc.CommitHash]
 		if !ok {
 			continue
 		}
+
+		if fc.ChangeType == 'D' {
+			// Record deletion (ContentHash = nil signals deletion)
+			deletions = append(deletions, &db.Blob{
+				Path:        fc.Path,
+				CommitID:    pgitCommitID,
+				Content:     []byte{},
+				ContentHash: nil, // nil = deleted
+				Mode:        0,
+				IsSymlink:   false,
+			})
+			continue
+		}
+
+		if fc.BlobHash == "" || fc.BlobHash == "0000000000000000000000000000000000000000" {
+			continue
+		}
+
 		blobsToImport = append(blobsToImport, blobWork{
 			Path:      fc.Path,
 			CommitID:  pgitCommitID,
@@ -296,12 +312,19 @@ func runImport(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	fmt.Printf("\nImporting %s file versions...\n", ui.FormatCount(len(blobsToImport)))
+	fmt.Printf("\nImporting %s file versions...\n", ui.FormatCount(len(blobsToImport)+len(deletions)))
 
 	if len(blobsToImport) > 0 {
 		err = importBlobsOptimized(ctx, r.DB, gitPath, blobsToImport, workers)
 		if err != nil {
 			return err
+		}
+	}
+
+	// Import deletions
+	if len(deletions) > 0 {
+		if err := r.DB.CreateBlobs(ctx, deletions); err != nil {
+			return fmt.Errorf("failed to import deletions: %w", err)
 		}
 	}
 
