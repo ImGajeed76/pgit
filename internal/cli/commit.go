@@ -27,7 +27,7 @@ The editor is determined by (in order):
   1. $PGIT_EDITOR environment variable
   2. $VISUAL environment variable
   3. $EDITOR environment variable
-  4. Fallback to 'vi'`,
+  4. First available: vi, vim, nano, notepad (Windows)`,
 		RunE: runCommit,
 	}
 
@@ -139,15 +139,9 @@ func runCommit(cmd *cobra.Command, args []string) error {
 // getCommitMessageFromEditor opens an editor for the user to write a commit message
 func getCommitMessageFromEditor(r *repo.Repository, staged []repo.FileChange) (string, error) {
 	// Determine editor
-	editor := os.Getenv("PGIT_EDITOR")
-	if editor == "" {
-		editor = os.Getenv("VISUAL")
-	}
-	if editor == "" {
-		editor = os.Getenv("EDITOR")
-	}
-	if editor == "" {
-		editor = "vi"
+	editor, err := findEditor()
+	if err != nil {
+		return "", err
 	}
 
 	// Create temp file with template
@@ -252,4 +246,39 @@ func firstLine(s string) string {
 		}
 	}
 	return s
+}
+
+// findEditor finds an available text editor
+func findEditor() (string, error) {
+	// Check environment variables first
+	if editor := os.Getenv("PGIT_EDITOR"); editor != "" {
+		if path, err := exec.LookPath(editor); err == nil {
+			return path, nil
+		}
+		return "", fmt.Errorf("editor '%s' (from $PGIT_EDITOR) not found", editor)
+	}
+
+	if editor := os.Getenv("VISUAL"); editor != "" {
+		if path, err := exec.LookPath(editor); err == nil {
+			return path, nil
+		}
+		// Don't error on VISUAL, fall through to EDITOR
+	}
+
+	if editor := os.Getenv("EDITOR"); editor != "" {
+		if path, err := exec.LookPath(editor); err == nil {
+			return path, nil
+		}
+		// Don't error on EDITOR, fall through to fallbacks
+	}
+
+	// Try common editors in order of preference
+	fallbacks := []string{"vi", "vim", "nano", "notepad"}
+	for _, editor := range fallbacks {
+		if path, err := exec.LookPath(editor); err == nil {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("no editor found. Set $EDITOR or $PGIT_EDITOR environment variable")
 }
