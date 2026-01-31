@@ -27,20 +27,32 @@ ORDER BY times_together DESC;
 
 ## Compression: pgit vs git
 
-Benchmarked on [tokio](https://github.com/tokio-rs/tokio) (4,375 commits, single branch, 178.6 MB uncompressed content):
+Benchmarked on real repositories (single branch, full history). Comparing packfile vs table data only (excluding indexes for both):
 
-| | git | pgit |
-|--|-----|------|
-| **Packfile / table data** | 8.3 MB | 8.0 MB |
+### git/git (79,588 commits, 3.8 GB raw content)
 
-pgit uses only delta compression via pg-xpatch (no zlib). Storage efficiency is comparable to git's packfiles.
+| | git --aggressive | pgit |
+|--|------------------|------|
+| **Storage** | 91 MB | **58 MB** |
+| **Import time** | - | 14 min |
+
+**pgit is 36% smaller than git with `git gc --aggressive`.**
+
+### tokio (4,377 commits, 179 MB raw content)
+
+| | git --aggressive | pgit |
+|--|------------------|------|
+| **Storage** | 8.3 MB | **8 MB** |
+| **Import time** | - | 19 sec |
+
+pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression with zstd. Compression improves with repository size - larger repos see better results.
 
 ## Features
 
 - **Git-familiar commands**: init, add, commit, log, diff, checkout, push, pull, clone
 - **PostgreSQL as remote**: Connection URL is your "remote" - no separate auth system
 - **SQL queryable**: Run arbitrary queries on your entire repo history
-- **Delta compression**: pg-xpatch provides comparable compression to git using pure delta encoding
+- **Delta compression**: pg-xpatch achieves better compression than git's packfiles (up to 36% smaller)
 - **Search across history**: `pgit search "pattern"` searches all versions of all files
 - **Local development**: Uses Docker/Podman container for local database
 - **Import from Git**: Migrate existing repositories with full history
