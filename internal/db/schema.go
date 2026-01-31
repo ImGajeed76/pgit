@@ -28,6 +28,9 @@ func (db *DB) InitSchema(ctx context.Context) error {
 	if err := db.createSyncStateTable(ctx); err != nil {
 		return err
 	}
+	if err := db.createMetadataTable(ctx); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -146,6 +149,20 @@ func (db *DB) createSyncStateTable(ctx context.Context) error {
 	return nil
 }
 
+func (db *DB) createMetadataTable(ctx context.Context) error {
+	sql := `
+	CREATE TABLE IF NOT EXISTS pgit_metadata (
+		key     TEXT PRIMARY KEY,
+		value   TEXT NOT NULL
+	)`
+
+	if err := db.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("failed to create pgit_metadata: %w", err)
+	}
+
+	return nil
+}
+
 // SchemaExists checks if the pgit schema exists
 func (db *DB) SchemaExists(ctx context.Context) (bool, error) {
 	var exists bool
@@ -161,6 +178,7 @@ func (db *DB) SchemaExists(ctx context.Context) (bool, error) {
 // DropSchema drops all pgit tables (use with caution!)
 func (db *DB) DropSchema(ctx context.Context) error {
 	tables := []string{
+		"pgit_metadata",
 		"pgit_sync_state",
 		"pgit_refs",
 		"pgit_blobs",

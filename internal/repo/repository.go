@@ -155,6 +155,11 @@ func (r *Repository) Connect(ctx context.Context) error {
 		}
 	}
 
+	// Ensure repo path is stored in metadata (for pgit repos command)
+	// Create metadata table if it doesn't exist (for old databases)
+	_ = r.DB.EnsureMetadataTable(ctx)
+	_ = r.DB.SetRepoPath(ctx, r.Root)
+
 	return nil
 }
 

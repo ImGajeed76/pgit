@@ -78,6 +78,7 @@ func init() {
 		newStatsCmd(),
 		newSearchCmd(),
 		newCompletionCmd(),
+		newReposCmd(),
 	)
 }
 
