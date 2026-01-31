@@ -38,7 +38,7 @@ type RepoStats struct {
 	TotalIndexSize   int64
 }
 
-// GetRepoStatsFast returns repository statistics using parallel queries
+// GetRepoStatsFast returns repository statistics using xpatch.stats() for O(1) performance
 func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 	stats := &RepoStats{}
 	var wg sync.WaitGroup
@@ -54,48 +54,31 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 		mu.Unlock()
 	}
 
-	// Query 1: Commit count (slow on xpatch, ~3s)
+	// Query 1: Commit stats from xpatch.stats() - O(1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := db.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_commits").Scan(&stats.TotalCommits)
+		err := db.QueryRow(ctx, "SELECT total_rows FROM xpatch.stats('pgit_commits')").Scan(&stats.TotalCommits)
 		if err != nil {
 			setErr(err)
 		}
 	}()
 
-	// Query 2: Blob count (slow on xpatch, ~5s)
+	// Query 2: Blob stats from xpatch.stats() - O(1)
+	// total_rows = blob count, total_groups = unique files, raw_size_bytes = content size
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := db.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_blobs").Scan(&stats.TotalBlobs)
+		err := db.QueryRow(ctx, `
+			SELECT total_rows, total_groups, raw_size_bytes 
+			FROM xpatch.stats('pgit_blobs')
+		`).Scan(&stats.TotalBlobs, &stats.UniqueFiles, &stats.TotalContentSize)
 		if err != nil {
 			setErr(err)
 		}
 	}()
 
-	// Query 3: Unique files count
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		err := db.QueryRow(ctx, "SELECT COUNT(DISTINCT path) FROM pgit_blobs").Scan(&stats.UniqueFiles)
-		if err != nil {
-			setErr(err)
-		}
-	}()
-
-	// Query 4: Total content size
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var size *int64
-		_ = db.QueryRow(ctx, "SELECT SUM(LENGTH(content)) FROM pgit_blobs WHERE content IS NOT NULL").Scan(&size)
-		if size != nil {
-			stats.TotalContentSize = *size
-		}
-	}()
-
-	// Query 5: Table sizes (fast, from pg_class)
+	// Query 3: Table sizes (fast, from pg_class)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -113,7 +96,7 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 		`).Scan(&stats.TotalIndexSize)
 	}()
 
-	// Query 6: Min/max commit IDs (fast with index)
+	// Query 4: Min/max commit IDs (fast with index)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -134,41 +117,47 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 func (db *DB) GetXpatchStats(ctx context.Context, tableName string) (*XpatchStats, error) {
 	stats := &XpatchStats{}
 
-	rows, err := db.Query(ctx, `SELECT * FROM xpatch_stats($1)`, tableName)
+	sql := `
+	SELECT 
+		total_rows,
+		total_groups,
+		keyframe_count,
+		delta_count,
+		raw_size_bytes,
+		compressed_size_bytes,
+		compression_ratio::float8,
+		cache_hits,
+		cache_misses,
+		avg_compression_depth::float8
+	FROM xpatch.stats($1)`
+
+	err := db.QueryRow(ctx, sql, tableName).Scan(
+		&stats.TotalRows,
+		&stats.TotalGroups,
+		&stats.KeyframeCount,
+		&stats.DeltaCount,
+		&stats.RawSizeBytes,
+		&stats.CompressedBytes,
+		&stats.CompressionRatio,
+		&stats.CacheHits,
+		&stats.CacheMisses,
+		&stats.AvgChainLength,
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	if rows.Next() {
-		err = rows.Scan(
-			&stats.TotalRows,
-			&stats.TotalGroups,
-			&stats.KeyframeCount,
-			&stats.DeltaCount,
-			&stats.RawSizeBytes,
-			&stats.CompressedBytes,
-			&stats.CompressionRatio,
-			&stats.CacheHits,
-			&stats.CacheMisses,
-			&stats.AvgChainLength,
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return stats, rows.Err()
+	return stats, nil
 }
 
 // Legacy functions for backwards compatibility
 
-// GetCommitStats returns statistics about commits
+// GetCommitStats returns statistics about commits using xpatch.stats() for O(1) performance
 func (db *DB) GetCommitStats(ctx context.Context) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 
 	var totalCommits int64
-	if err := db.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_commits").Scan(&totalCommits); err != nil {
+	if err := db.QueryRow(ctx, "SELECT total_rows FROM xpatch.stats('pgit_commits')").Scan(&totalCommits); err != nil {
 		return nil, err
 	}
 	stats["total_commits"] = totalCommits
@@ -176,29 +165,22 @@ func (db *DB) GetCommitStats(ctx context.Context) (map[string]interface{}, error
 	return stats, nil
 }
 
-// GetBlobStats returns statistics about blobs
+// GetBlobStats returns statistics about blobs using xpatch.stats() for O(1) performance
 func (db *DB) GetBlobStats(ctx context.Context) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 
-	var totalBlobs int64
-	if err := db.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_blobs").Scan(&totalBlobs); err != nil {
+	var totalBlobs, uniquePaths, totalSize int64
+	err := db.QueryRow(ctx, `
+		SELECT total_rows, total_groups, raw_size_bytes 
+		FROM xpatch.stats('pgit_blobs')
+	`).Scan(&totalBlobs, &uniquePaths, &totalSize)
+	if err != nil {
 		return nil, err
 	}
+
 	stats["total_blobs"] = totalBlobs
-
-	var uniquePaths int64
-	if err := db.QueryRow(ctx, "SELECT COUNT(DISTINCT path) FROM pgit_blobs").Scan(&uniquePaths); err != nil {
-		return nil, err
-	}
 	stats["unique_paths"] = uniquePaths
-
-	var totalSize *int64
-	_ = db.QueryRow(ctx, "SELECT SUM(LENGTH(content)) FROM pgit_blobs WHERE content IS NOT NULL").Scan(&totalSize)
-	if totalSize != nil {
-		stats["total_content_size"] = *totalSize
-	} else {
-		stats["total_content_size"] = int64(0)
-	}
+	stats["total_content_size"] = totalSize
 
 	return stats, nil
 }

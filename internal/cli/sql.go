@@ -41,6 +41,7 @@ Use with caution - this can corrupt your repository!`,
 	cmd.Flags().Bool("raw", false, "Output raw values without formatting (for piping)")
 	cmd.Flags().Bool("json", false, "Output results as JSON array")
 	cmd.Flags().Bool("no-pager", false, "Disable interactive table view")
+	cmd.Flags().Int("timeout", 60, "Query timeout in seconds")
 
 	return cmd
 }
@@ -51,6 +52,7 @@ func runSQL(cmd *cobra.Command, args []string) error {
 	raw, _ := cmd.Flags().GetBool("raw")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	noPager, _ := cmd.Flags().GetBool("no-pager")
+	timeout, _ := cmd.Flags().GetInt("timeout")
 
 	// Check if query is a write operation
 	upperQuery := strings.ToUpper(strings.TrimSpace(query))
@@ -75,7 +77,7 @@ func runSQL(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
 	// Connect to database

@@ -264,7 +264,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 		}
 
 		for _, blob := range tree {
-			if blob.Content == nil {
+			if blob.ContentHash == nil {
 				continue
 			}
 

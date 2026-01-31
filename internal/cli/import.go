@@ -584,11 +584,9 @@ func importBlobsOptimized(
 						continue
 					}
 
-					var contentHash *string
-					if len(content) > 0 {
-						h := util.HashBytes(content)
-						contentHash = &h
-					}
+					// Always compute hash (even for empty files - nil hash means deleted)
+					h := util.HashBytes(content)
+					contentHash := &h
 
 					blob := &db.Blob{
 						Path:        bw.Path,
@@ -602,7 +600,6 @@ func importBlobsOptimized(
 					if bw.IsSymlink {
 						target := string(content)
 						blob.SymlinkTarget = &target
-						blob.Content = nil
 					}
 
 					dbBlobs = append(dbBlobs, blob)

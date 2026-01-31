@@ -11,8 +11,8 @@ import (
 type Blob struct {
 	Path          string
 	CommitID      string
-	Content       []byte  // nil = deleted
-	ContentHash   *string // nil if deleted
+	Content       []byte  // file bytes (empty for empty files)
+	ContentHash   *string // nil = deleted, otherwise hash of content
 	Mode          int
 	IsSymlink     bool
 	SymlinkTarget *string
@@ -24,7 +24,13 @@ func (db *DB) CreateBlob(ctx context.Context, b *Blob) error {
 	INSERT INTO pgit_blobs (path, commit_id, content, content_hash, mode, is_symlink, symlink_target)
 	VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
-	return db.Exec(ctx, sql, b.Path, b.CommitID, b.Content, b.ContentHash, b.Mode, b.IsSymlink, b.SymlinkTarget)
+	// Ensure content is never nil (delta columns can't be NULL)
+	content := b.Content
+	if content == nil {
+		content = []byte{}
+	}
+
+	return db.Exec(ctx, sql, b.Path, b.CommitID, content, b.ContentHash, b.Mode, b.IsSymlink, b.SymlinkTarget)
 }
 
 // CreateBlobs inserts multiple blobs using COPY for speed
@@ -35,8 +41,13 @@ func (db *DB) CreateBlobs(ctx context.Context, blobs []*Blob) error {
 
 	rows := make([][]interface{}, len(blobs))
 	for i, b := range blobs {
+		// Ensure content is never nil (delta columns can't be NULL)
+		content := b.Content
+		if content == nil {
+			content = []byte{}
+		}
 		rows[i] = []interface{}{
-			b.Path, b.CommitID, b.Content, b.ContentHash,
+			b.Path, b.CommitID, content, b.ContentHash,
 			b.Mode, b.IsSymlink, b.SymlinkTarget,
 		}
 	}
@@ -113,7 +124,7 @@ func (db *DB) GetTreeAtCommit(ctx context.Context, commitID string) ([]*Blob, er
 	)
 	SELECT path, commit_id, content, content_hash, mode, is_symlink, symlink_target
 	FROM latest_versions
-	WHERE content IS NOT NULL
+	WHERE content_hash IS NOT NULL
 	ORDER BY path`
 
 	rows, err := db.Query(ctx, sql, commitID)
@@ -200,7 +211,7 @@ func (db *DB) GetFileAtCommit(ctx context.Context, path, commitID string) (*Blob
 	}
 
 	// Check if file was deleted
-	if b.Content == nil {
+	if b.ContentHash == nil {
 		return nil, nil
 	}
 
@@ -281,14 +292,14 @@ func (db *DB) SearchAllBlobs(ctx context.Context, pathPattern string) ([]*Blob, 
 		sql = `
 		SELECT path, commit_id, content, content_hash, mode, is_symlink, symlink_target
 		FROM pgit_blobs
-		WHERE content IS NOT NULL AND path LIKE $1
+		WHERE content_hash IS NOT NULL AND path LIKE $1
 		ORDER BY path, commit_id DESC`
 		args = []interface{}{likePattern}
 	} else {
 		sql = `
 		SELECT path, commit_id, content, content_hash, mode, is_symlink, symlink_target
 		FROM pgit_blobs
-		WHERE content IS NOT NULL
+		WHERE content_hash IS NOT NULL
 		ORDER BY path, commit_id DESC`
 	}
 

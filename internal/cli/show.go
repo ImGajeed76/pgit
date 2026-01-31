@@ -146,7 +146,7 @@ func showCommitDetails(ctx context.Context, r *repo.Repository, ref string, show
 			NewContent: newContent,
 		}
 
-		if blob.Content == nil {
+		if blob.ContentHash == nil {
 			result.Status = repo.StatusDeleted
 		} else if oldContent == "" {
 			result.Status = repo.StatusNew

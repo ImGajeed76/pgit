@@ -81,7 +81,7 @@ func (db *DB) createBlobsTable(ctx context.Context) error {
 		path            TEXT NOT NULL,
 		commit_id       TEXT NOT NULL,
 		insert_seq      BIGINT GENERATED ALWAYS AS IDENTITY,
-		content         BYTEA,
+		content         BYTEA NOT NULL DEFAULT ''::bytea,
 		content_hash    TEXT,
 		mode            INTEGER NOT NULL DEFAULT 33188,
 		is_symlink      BOOLEAN NOT NULL DEFAULT FALSE,
