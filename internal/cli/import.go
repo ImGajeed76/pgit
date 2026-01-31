@@ -314,6 +314,33 @@ func runImport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to set HEAD: %w", err)
 	}
 
+	// ═══════════════════════════════════════════════════════════════════════
+	// Step 6: Checkout working tree
+	// ═══════════════════════════════════════════════════════════════════════
+
+	fmt.Printf("\nChecking out files...\n")
+	tree, err := r.DB.GetTreeAtCommit(ctx, latestCommit.ID)
+	if err != nil {
+		return fmt.Errorf("failed to get tree: %w", err)
+	}
+
+	for _, blob := range tree {
+		absPath := r.AbsPath(blob.Path)
+
+		// Ensure directory exists
+		if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+			continue
+		}
+
+		// Write file
+		if blob.IsSymlink && blob.SymlinkTarget != nil {
+			os.Remove(absPath)
+			_ = os.Symlink(*blob.SymlinkTarget, absPath)
+		} else {
+			_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+		}
+	}
+
 	fmt.Printf("\n%s Imported %s commits from git repository\n",
 		styles.Green("Success!"),
 		ui.FormatCount(len(commits)))
