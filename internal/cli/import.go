@@ -47,7 +47,7 @@ The current directory must be a pgit repository (run 'pgit init' first).`,
 		RunE: runImport,
 	}
 
-	cmd.Flags().IntP("workers", "w", 0, "Number of parallel workers (default: number of CPUs, max 3)")
+	cmd.Flags().IntP("workers", "w", 0, "Number of parallel workers (default 4, max 16)")
 	cmd.Flags().BoolP("dry-run", "n", false, "Show what would be imported without actually importing")
 	cmd.Flags().BoolP("force", "f", false, "Overwrite existing data in database")
 	cmd.Flags().StringP("branch", "b", "", "Branch to import (default: current branch, or interactive picker)")
