@@ -183,7 +183,7 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 	if strings.HasPrefix(ref, "HEAD~") {
 		n := 1
 		if len(ref) > 5 {
-			fmt.Sscanf(ref[5:], "%d", &n)
+			_, _ = fmt.Sscanf(ref[5:], "%d", &n)
 		}
 		head, err := r.DB.GetHeadCommit(ctx)
 		if err != nil || head == nil {
@@ -368,14 +368,12 @@ func resetWorkingTree(ctx context.Context, r *repo.Repository, commitID string) 
 	}
 
 	// Remove files that exist in current tree but not in target
-	if currentTree != nil {
-		for path := range currentTree {
-			if !targetFiles[path] {
-				absPath := r.AbsPath(path)
-				os.Remove(absPath)
-				// Try to remove empty parent directories
-				removeEmptyParents(filepath.Dir(absPath), r.Root)
-			}
+	for path := range currentTree {
+		if !targetFiles[path] {
+			absPath := r.AbsPath(path)
+			os.Remove(absPath)
+			// Try to remove empty parent directories
+			removeEmptyParents(filepath.Dir(absPath), r.Root)
 		}
 	}
 

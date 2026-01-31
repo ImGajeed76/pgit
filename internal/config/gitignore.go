@@ -126,9 +126,7 @@ func (ip *IgnorePatterns) matches(pattern, path string) bool {
 	// particular .gitignore file itself."
 
 	// Handle patterns starting with /
-	if strings.HasPrefix(pattern, "/") {
-		pattern = pattern[1:]
-	}
+	pattern = strings.TrimPrefix(pattern, "/")
 
 	// Match against full path from root
 	return matchGlob(pattern, path)

@@ -576,7 +576,7 @@ func importBlobsOptimized(
 				firstErr.CompareAndSwap(nil, fmt.Errorf("failed to start cat-file: %w", err))
 				return
 			}
-			defer catFile.Wait()
+			defer func() { _ = catFile.Wait() }()
 			defer catStdin.Close()
 
 			catReader := bufio.NewReaderSize(catStdout, 1024*1024)
@@ -611,7 +611,7 @@ func importBlobsOptimized(
 				}
 
 				// Read trailing newline
-				catReader.ReadByte()
+				_, _ = catReader.ReadByte()
 
 				return content, nil
 			}

@@ -565,11 +565,6 @@ type ghcrTokenResponse struct {
 	Token string `json:"token"`
 }
 
-// ghcrManifestResponse is a minimal manifest response to get digest
-type ghcrManifestResponse struct {
-	Digest string `json:"digest,omitempty"`
-}
-
 // GetRemoteImageDigest fetches the latest image digest from the registry
 // Returns empty string if unable to fetch (network error, etc.)
 func GetRemoteImageDigest() string {
