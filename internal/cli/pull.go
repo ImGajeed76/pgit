@@ -657,14 +657,8 @@ func fileChanged(ancestor, current *db.Blob) bool {
 	if ancestor == nil || current == nil {
 		return true // Added or deleted
 	}
-	// Compare hashes
-	if ancestor.ContentHash == nil && current.ContentHash == nil {
-		return false
-	}
-	if ancestor.ContentHash == nil || current.ContentHash == nil {
-		return true
-	}
-	return *ancestor.ContentHash != *current.ContentHash
+	// Compare hashes using ContentHashEqual
+	return !util.ContentHashEqual(ancestor.ContentHash, current.ContentHash)
 }
 
 // filesEqual checks if two blobs have the same content
@@ -675,11 +669,5 @@ func filesEqual(a, b *db.Blob) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if a.ContentHash == nil && b.ContentHash == nil {
-		return true
-	}
-	if a.ContentHash == nil || b.ContentHash == nil {
-		return false
-	}
-	return *a.ContentHash == *b.ContentHash
+	return util.ContentHashEqual(a.ContentHash, b.ContentHash)
 }

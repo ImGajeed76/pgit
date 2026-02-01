@@ -1055,17 +1055,20 @@ func runStats(cmd *cobra.Command, args []string) error {
 	fmt.Println(styles.Boldf("Storage (on disk)"))
 	fmt.Println()
 
-	totalStorage := stats.CommitsTableSize + stats.BlobsTableSize
-	fmt.Printf("  Commits table:  %s\n", formatBytes(stats.CommitsTableSize))
-	fmt.Printf("  Blobs table:    %s\n", formatBytes(stats.BlobsTableSize))
-	fmt.Printf("  Indexes:        %s\n", formatBytes(stats.TotalIndexSize))
+	// Calculate total for all data tables
+	totalDataStorage := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize + stats.ContentTableSize
+	fmt.Printf("  Commits table:   %s\n", formatBytes(stats.CommitsTableSize))
+	fmt.Printf("  Paths table:     %s\n", formatBytes(stats.PathsTableSize))
+	fmt.Printf("  File refs table: %s\n", formatBytes(stats.FileRefsTableSize))
+	fmt.Printf("  Content table:   %s\n", formatBytes(stats.ContentTableSize))
+	fmt.Printf("  Indexes:         %s\n", formatBytes(stats.TotalIndexSize))
 	fmt.Printf("  ─────────────────────\n")
-	fmt.Printf("  Total:          %s\n", styles.SuccessText(formatBytes(totalStorage+stats.TotalIndexSize)))
+	fmt.Printf("  Total:           %s\n", styles.SuccessText(formatBytes(totalDataStorage+stats.TotalIndexSize)))
 
 	// Show compression ratio if we have meaningful content size
-	if stats.TotalContentSize > 1024 && stats.BlobsTableSize > 0 {
-		ratio := float64(stats.TotalContentSize) / float64(stats.BlobsTableSize)
-		savings := (1 - float64(stats.BlobsTableSize)/float64(stats.TotalContentSize)) * 100
+	if stats.TotalContentSize > 1024 && stats.ContentTableSize > 0 {
+		ratio := float64(stats.TotalContentSize) / float64(stats.ContentTableSize)
+		savings := (1 - float64(stats.ContentTableSize)/float64(stats.TotalContentSize)) * 100
 		if savings > 0 {
 			fmt.Printf("\n  %s %.1fx compression (%.0f%% space saved)\n",
 				styles.Successf("→"), ratio, savings)
@@ -1087,14 +1090,14 @@ func runStats(cmd *cobra.Command, args []string) error {
 			printXpatchStats(commitXpatch)
 		}
 
-		// Blobs xpatch
+		// Content xpatch (replaces pgit_blobs in schema v2)
 		fmt.Println()
-		fmt.Printf("  %s\n", styles.Mute("pgit_blobs:"))
-		blobXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_blobs")
+		fmt.Printf("  %s\n", styles.Mute("pgit_content:"))
+		contentXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_content")
 		if err != nil {
 			fmt.Printf("    Unable to get stats: %v\n", styles.Mute(err.Error()))
 		} else {
-			printXpatchStats(blobXpatch)
+			printXpatchStats(contentXpatch)
 		}
 	} else {
 		fmt.Println()
@@ -1156,17 +1159,19 @@ type JSONRepoStats struct {
 }
 
 type JSONStorageStats struct {
-	CommitsTableBytes int64   `json:"commits_table_bytes"`
-	BlobsTableBytes   int64   `json:"blobs_table_bytes"`
-	IndexesBytes      int64   `json:"indexes_bytes"`
-	TotalBytes        int64   `json:"total_bytes"`
-	CompressionRatio  float64 `json:"compression_ratio,omitempty"`
-	SpaceSavedPercent float64 `json:"space_saved_percent,omitempty"`
+	CommitsTableBytes  int64   `json:"commits_table_bytes"`
+	PathsTableBytes    int64   `json:"paths_table_bytes"`
+	FileRefsTableBytes int64   `json:"file_refs_table_bytes"`
+	ContentTableBytes  int64   `json:"content_table_bytes"`
+	IndexesBytes       int64   `json:"indexes_bytes"`
+	TotalBytes         int64   `json:"total_bytes"`
+	CompressionRatio   float64 `json:"compression_ratio,omitempty"`
+	SpaceSavedPercent  float64 `json:"space_saved_percent,omitempty"`
 }
 
 type JSONXpatchStats struct {
 	Commits *JSONXpatchTableStats `json:"commits,omitempty"`
-	Blobs   *JSONXpatchTableStats `json:"blobs,omitempty"`
+	Content *JSONXpatchTableStats `json:"content,omitempty"`
 }
 
 type JSONXpatchTableStats struct {
@@ -1182,7 +1187,7 @@ type JSONXpatchTableStats struct {
 }
 
 func printJSONStats(ctx context.Context, r *repo.Repository, stats *db.RepoStats, showXpatch bool) error {
-	totalStorage := stats.CommitsTableSize + stats.BlobsTableSize + stats.TotalIndexSize
+	totalStorage := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize + stats.ContentTableSize + stats.TotalIndexSize
 
 	jsonStats := JSONStats{
 		Repository: JSONRepoStats{
@@ -1192,16 +1197,18 @@ func printJSONStats(ctx context.Context, r *repo.Repository, stats *db.RepoStats
 			ContentSizeBytes: stats.TotalContentSize,
 		},
 		Storage: JSONStorageStats{
-			CommitsTableBytes: stats.CommitsTableSize,
-			BlobsTableBytes:   stats.BlobsTableSize,
-			IndexesBytes:      stats.TotalIndexSize,
-			TotalBytes:        totalStorage,
+			CommitsTableBytes:  stats.CommitsTableSize,
+			PathsTableBytes:    stats.PathsTableSize,
+			FileRefsTableBytes: stats.FileRefsTableSize,
+			ContentTableBytes:  stats.ContentTableSize,
+			IndexesBytes:       stats.TotalIndexSize,
+			TotalBytes:         totalStorage,
 		},
 	}
 
-	if stats.TotalContentSize > 1024 && stats.BlobsTableSize > 0 {
-		ratio := float64(stats.TotalContentSize) / float64(stats.BlobsTableSize)
-		savings := (1 - float64(stats.BlobsTableSize)/float64(stats.TotalContentSize)) * 100
+	if stats.TotalContentSize > 1024 && stats.ContentTableSize > 0 {
+		ratio := float64(stats.TotalContentSize) / float64(stats.ContentTableSize)
+		savings := (1 - float64(stats.ContentTableSize)/float64(stats.TotalContentSize)) * 100
 		if savings > 0 {
 			jsonStats.Storage.CompressionRatio = ratio
 			jsonStats.Storage.SpaceSavedPercent = savings
@@ -1216,9 +1223,9 @@ func printJSONStats(ctx context.Context, r *repo.Repository, stats *db.RepoStats
 			jsonStats.Xpatch.Commits = xpatchToJSON(commitXpatch)
 		}
 
-		blobXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_blobs")
-		if err == nil && blobXpatch != nil {
-			jsonStats.Xpatch.Blobs = xpatchToJSON(blobXpatch)
+		contentXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_content")
+		if err == nil && contentXpatch != nil {
+			jsonStats.Xpatch.Content = xpatchToJSON(contentXpatch)
 		}
 	}
 

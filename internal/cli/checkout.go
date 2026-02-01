@@ -153,8 +153,10 @@ func checkoutPath(ctx context.Context, r *repo.Repository, commitID, path string
 	if !force {
 		if _, err := os.Stat(absPath); err == nil {
 			// File exists, check if modified
-			currentHash, _ := util.HashFile(absPath)
-			if blob.ContentHash != nil && currentHash != *blob.ContentHash {
+			// Compare using BLAKE3 hash (hex format for comparison)
+			currentHash, _ := util.HashFileBlake3Hex(absPath)
+			blobHash := util.ContentHashToHex(blob.ContentHash)
+			if blob.ContentHash != nil && currentHash != blobHash {
 				return fmt.Errorf("uncommitted changes in %s (use -f to force)", path)
 			}
 		}

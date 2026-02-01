@@ -27,9 +27,9 @@ func Connect(ctx context.Context, url string) (*DB, error) {
 		return nil, fmt.Errorf("invalid connection URL: %w", err)
 	}
 
-	// Configure pool
-	config.MaxConns = 10
-	config.MinConns = 1
+	// Configure pool - aggressive settings for local dev
+	config.MaxConns = 64
+	config.MinConns = 4
 	config.MaxConnLifetime = time.Hour
 	config.MaxConnIdleTime = 30 * time.Minute
 

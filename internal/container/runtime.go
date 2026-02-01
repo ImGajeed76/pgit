@@ -205,6 +205,31 @@ func StartContainer(runtime Runtime, port int) error {
 		image,
 	}
 
+	// Add PostgreSQL configuration flags if set
+	if globalCfg != nil {
+		if globalCfg.Container.MaxConnections > 0 {
+			args = append(args, "-c", fmt.Sprintf("max_connections=%d", globalCfg.Container.MaxConnections))
+		}
+		if globalCfg.Container.SharedBuffers != "" {
+			args = append(args, "-c", fmt.Sprintf("shared_buffers=%s", globalCfg.Container.SharedBuffers))
+		}
+		if globalCfg.Container.WorkMem != "" {
+			args = append(args, "-c", fmt.Sprintf("work_mem=%s", globalCfg.Container.WorkMem))
+		}
+		if globalCfg.Container.EffectiveCacheSize != "" {
+			args = append(args, "-c", fmt.Sprintf("effective_cache_size=%s", globalCfg.Container.EffectiveCacheSize))
+		}
+		if globalCfg.Container.MaxParallelWorkers > 0 {
+			args = append(args, "-c", fmt.Sprintf("max_parallel_workers=%d", globalCfg.Container.MaxParallelWorkers))
+		}
+		if globalCfg.Container.MaxWorkerProcesses > 0 {
+			args = append(args, "-c", fmt.Sprintf("max_worker_processes=%d", globalCfg.Container.MaxWorkerProcesses))
+		}
+		if globalCfg.Container.MaxParallelPerGather > 0 {
+			args = append(args, "-c", fmt.Sprintf("max_parallel_workers_per_gather=%d", globalCfg.Container.MaxParallelPerGather))
+		}
+	}
+
 	cmd := exec.Command(string(runtime), args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

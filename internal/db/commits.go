@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -258,4 +259,82 @@ func (db *DB) FindCommonAncestor(ctx context.Context, commitA, commitB string) (
 		return "", nil
 	}
 	return id, err
+}
+
+// FindCommitByPartialID finds a commit by partial ID match.
+// Returns the commit if exactly one match is found.
+// Returns nil if no match is found.
+// Returns an error if multiple matches are found (ambiguous).
+func (db *DB) FindCommitByPartialID(ctx context.Context, partialID string) (*Commit, error) {
+	// Try prefix match first (more common), then suffix match
+	// ULID IDs are uppercase, so normalize the input
+	sql := `
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at
+	FROM pgit_commits
+	WHERE id LIKE $1 || '%' OR id LIKE '%' || $1
+	LIMIT 2`
+
+	rows, err := db.Query(ctx, sql, partialID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var commits []*Commit
+	for rows.Next() {
+		c := &Commit{}
+		if err := rows.Scan(
+			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
+			&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		commits = append(commits, c)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	switch len(commits) {
+	case 0:
+		return nil, nil
+	case 1:
+		return commits[0], nil
+	default:
+		return nil, fmt.Errorf("ambiguous commit reference '%s' matches multiple commits", partialID)
+	}
+}
+
+// GetCommitsBatch retrieves multiple commits by their IDs in a single query.
+// Returns a map of commit ID to Commit. Missing commits are not included in the map.
+func (db *DB) GetCommitsBatch(ctx context.Context, ids []string) (map[string]*Commit, error) {
+	if len(ids) == 0 {
+		return make(map[string]*Commit), nil
+	}
+
+	sql := `
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at
+	FROM pgit_commits
+	WHERE id = ANY($1)`
+
+	rows, err := db.Query(ctx, sql, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]*Commit, len(ids))
+	for rows.Next() {
+		c := &Commit{}
+		if err := rows.Scan(
+			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
+			&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		result[c.ID] = c
+	}
+
+	return result, rows.Err()
 }

@@ -62,11 +62,12 @@ func (s ChangeStatus) Symbol() string {
 
 // GetWorkingTreeChanges compares the working directory with the last commit
 func (r *Repository) GetWorkingTreeChanges(ctx context.Context) ([]FileChange, error) {
-	// Get the current tree from the database
+	// Get the current tree METADATA from the database (no content - much faster!)
+	// We only need paths and content hashes for comparison
 	var currentTree []*db.Blob
 	if r.DB != nil {
 		var err error
-		currentTree, err = r.DB.GetCurrentTree(ctx)
+		currentTree, err = r.DB.GetCurrentTreeMetadata(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -129,7 +130,7 @@ func (r *Repository) GetWorkingTreeChanges(ctx context.Context) ([]FileChange, e
 		}
 		isSymlink := info.Mode()&os.ModeSymlink != 0
 
-		// Compute hash of working file
+		// Compute hash of working file using BLAKE3 (hex for comparison)
 		var newHash string
 		var symlinkTarget string
 		if isSymlink {
@@ -138,9 +139,9 @@ func (r *Repository) GetWorkingTreeChanges(ctx context.Context) ([]FileChange, e
 				return err
 			}
 			symlinkTarget = target
-			newHash = util.HashBytes([]byte(target))
+			newHash = util.HashBytesBlake3Hex([]byte(target))
 		} else {
-			newHash, err = util.HashFile(path)
+			newHash, err = util.HashFileBlake3Hex(path)
 			if err != nil {
 				return err
 			}
@@ -162,10 +163,8 @@ func (r *Repository) GetWorkingTreeChanges(ctx context.Context) ([]FileChange, e
 			})
 		} else {
 			// Check if modified
-			oldHash := ""
-			if committed.ContentHash != nil {
-				oldHash = *committed.ContentHash
-			}
+			// ContentHash is []byte (BLAKE3), convert to hex for comparison
+			oldHash := util.ContentHashToHex(committed.ContentHash)
 			if oldHash != newHash {
 				changes = append(changes, FileChange{
 					Path:          relPath,
@@ -194,10 +193,8 @@ func (r *Repository) GetWorkingTreeChanges(ctx context.Context) ([]FileChange, e
 				continue
 			}
 
-			oldHash := ""
-			if blob.ContentHash != nil {
-				oldHash = *blob.ContentHash
-			}
+			// ContentHash is []byte (BLAKE3), convert to hex
+			oldHash := util.ContentHashToHex(blob.ContentHash)
 			changes = append(changes, FileChange{
 				Path:    path,
 				Status:  StatusDeleted,
@@ -231,7 +228,7 @@ func (r *Repository) GetStagedChanges(ctx context.Context) ([]FileChange, error)
 			change.Status = StatusDeleted
 		}
 
-		// Get current hash for new/modified files
+		// Get current hash for new/modified files using BLAKE3
 		if change.Status != StatusDeleted {
 			absPath := r.AbsPath(entry.Path)
 			info, err := os.Lstat(absPath)
@@ -241,9 +238,9 @@ func (r *Repository) GetStagedChanges(ctx context.Context) ([]FileChange, error)
 				if change.IsSymlink {
 					target, _ := os.Readlink(absPath)
 					change.SymlinkTarget = target
-					change.NewHash = util.HashBytes([]byte(target))
+					change.NewHash = util.HashBytesBlake3Hex([]byte(target))
 				} else {
-					change.NewHash, _ = util.HashFile(absPath)
+					change.NewHash, _ = util.HashFileBlake3Hex(absPath)
 				}
 			}
 		}
@@ -290,20 +287,19 @@ func (r *Repository) StageFile(ctx context.Context, path string) error {
 	_, err = os.Lstat(absPath)
 	fileExists := err == nil
 
-	// Get current tree to check if file is new or modified
-	var currentTree []*db.Blob
+	// Check if file exists in current tree (only need to check existence, not load all files)
+	inTree := false
 	if r.DB != nil {
-		currentTree, err = r.DB.GetCurrentTree(ctx)
+		head, err := r.DB.GetHeadCommit(ctx)
 		if err != nil {
 			return err
 		}
-	}
-
-	inTree := false
-	for _, blob := range currentTree {
-		if blob.Path == path {
-			inTree = true
-			break
+		if head != nil {
+			// Use FileExistsInTree to check if file is tracked (fast, no content load)
+			inTree, err = r.DB.FileExistsInTree(ctx, path, head.ID)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

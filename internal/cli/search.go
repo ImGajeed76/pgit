@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/imgajeed76/pgit/internal/db"
 	"github.com/imgajeed76/pgit/internal/repo"
 	"github.com/imgajeed76/pgit/internal/ui"
 	"github.com/imgajeed76/pgit/internal/ui/styles"
@@ -50,11 +51,12 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	searchAll, _ := cmd.Flags().GetBool("all")
 	commitRef, _ := cmd.Flags().GetString("commit")
 
-	// Compile regex
+	// Compile regex for Go-side line matching and highlighting
+	goPattern := pattern
 	if ignoreCase {
-		pattern = "(?i)" + pattern
+		goPattern = "(?i)" + pattern
 	}
-	re, err := regexp.Compile(pattern)
+	re, err := regexp.Compile(goPattern)
 	if err != nil {
 		return fmt.Errorf("invalid pattern: %w", err)
 	}
@@ -94,7 +96,35 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	spinner := ui.NewSpinner("Searching repository")
 	spinner.Start()
 
-	type searchResult struct {
+	// Search in PostgreSQL - much faster than loading all content
+	// We set a high limit for matching FILES, then extract lines in Go
+	searchOpts := db.SearchContentOptions{
+		Pattern:     pattern,
+		IgnoreCase:  ignoreCase,
+		PathPattern: pathFilter,
+		Limit:       limit * 10, // Get more files since each file may have multiple matches
+	}
+
+	var searchResults []*db.SearchContentResult
+	if searchAll {
+		searchOpts.CommitID = "" // Search all versions
+		searchResults, err = r.DB.SearchContent(ctx, searchOpts)
+	} else {
+		searchResults, err = r.DB.SearchContentAtCommit(ctx, commitID, searchOpts)
+	}
+	spinner.Stop()
+
+	if err != nil {
+		return err
+	}
+
+	if len(searchResults) == 0 {
+		fmt.Println("No matches found")
+		return nil
+	}
+
+	// Extract line-level matches from the files PostgreSQL found
+	type lineResult struct {
 		Path       string
 		CommitID   string
 		CommitTime time.Time
@@ -103,97 +133,48 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		MatchPos   []int
 	}
 
-	var results []searchResult
+	var results []lineResult
 	resultCount := 0
 
-	// Cache for commit timestamps
-	commitTimes := make(map[string]time.Time)
-	getCommitTime := func(commitID string) time.Time {
-		if t, ok := commitTimes[commitID]; ok {
-			return t
+	// Batch fetch commit times for all unique commits
+	commitIDs := make([]string, 0, len(searchResults))
+	seenCommits := make(map[string]bool)
+	for _, sr := range searchResults {
+		if !seenCommits[sr.CommitID] {
+			seenCommits[sr.CommitID] = true
+			commitIDs = append(commitIDs, sr.CommitID)
 		}
-		commit, err := r.DB.GetCommit(ctx, commitID)
-		if err == nil && commit != nil {
-			commitTimes[commitID] = commit.CreatedAt
-			return commit.CreatedAt
+	}
+	commitMap, _ := r.DB.GetCommitsBatch(ctx, commitIDs)
+
+	getCommitTime := func(cid string) time.Time {
+		if c, ok := commitMap[cid]; ok {
+			return c.CreatedAt
 		}
 		return time.Time{}
 	}
 
-	if searchAll {
-		// Search all blobs
-		blobs, err := r.DB.SearchAllBlobs(ctx, pathFilter)
-		spinner.Stop()
-		if err != nil {
-			return err
+	// Process each matching file and extract line matches
+	for _, sr := range searchResults {
+		if resultCount >= limit {
+			break
 		}
 
-		for _, blob := range blobs {
-			if blob.ContentHash == nil {
-				continue
-			}
-
-			lines := strings.Split(string(blob.Content), "\n")
-			for lineNum, line := range lines {
-				if matches := re.FindStringIndex(line); matches != nil {
-					results = append(results, searchResult{
-						Path:       blob.Path,
-						CommitID:   blob.CommitID,
-						CommitTime: getCommitTime(blob.CommitID),
-						LineNum:    lineNum + 1,
-						Line:       line,
-						MatchPos:   matches,
-					})
-					resultCount++
-					if resultCount >= limit {
-						break
-					}
+		lines := strings.Split(string(sr.Content), "\n")
+		for lineNum, line := range lines {
+			if matches := re.FindStringIndex(line); matches != nil {
+				results = append(results, lineResult{
+					Path:       sr.Path,
+					CommitID:   sr.CommitID,
+					CommitTime: getCommitTime(sr.CommitID),
+					LineNum:    lineNum + 1,
+					Line:       line,
+					MatchPos:   matches,
+				})
+				resultCount++
+				if resultCount >= limit {
+					break
 				}
-			}
-			if resultCount >= limit {
-				break
-			}
-		}
-	} else {
-		// Search at specific commit
-		tree, err := r.DB.GetTreeAtCommit(ctx, commitID)
-		spinner.Stop()
-		if err != nil {
-			return err
-		}
-
-		for _, blob := range tree {
-			if blob.ContentHash == nil {
-				continue
-			}
-
-			// Path filter
-			if pathFilter != "" {
-				matched, _ := matchGlob(pathFilter, blob.Path)
-				if !matched {
-					continue
-				}
-			}
-
-			lines := strings.Split(string(blob.Content), "\n")
-			for lineNum, line := range lines {
-				if matches := re.FindStringIndex(line); matches != nil {
-					results = append(results, searchResult{
-						Path:       blob.Path,
-						CommitID:   commitID,
-						CommitTime: getCommitTime(commitID),
-						LineNum:    lineNum + 1,
-						Line:       line,
-						MatchPos:   matches,
-					})
-					resultCount++
-					if resultCount >= limit {
-						break
-					}
-				}
-			}
-			if resultCount >= limit {
-				break
 			}
 		}
 	}
@@ -281,19 +262,4 @@ func highlightMatch(line string, re *regexp.Regexp) string {
 	result.WriteString(line[lastEnd:])
 
 	return result.String()
-}
-
-// matchGlob does simple glob matching
-func matchGlob(pattern, name string) (bool, error) {
-	// Simple implementation - supports * and ?
-	pattern = strings.ReplaceAll(pattern, ".", "\\.")
-	pattern = strings.ReplaceAll(pattern, "*", ".*")
-	pattern = strings.ReplaceAll(pattern, "?", ".")
-	pattern = "^" + pattern + "$"
-
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return false, err
-	}
-	return re.MatchString(name), nil
 }

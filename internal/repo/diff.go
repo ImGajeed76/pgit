@@ -90,6 +90,12 @@ func (r *Repository) Diff(ctx context.Context, opts DiffOptions) ([]DiffResult, 
 			Status: change.Status,
 		}
 
+		// For name-only or name-status, we don't need content at all
+		if opts.NameOnly || opts.NameStatus {
+			results = append(results, result)
+			continue
+		}
+
 		// Get old content (from database)
 		if change.Status != StatusNew {
 			blob, err := r.getFileContent(ctx, change.Path)
@@ -108,9 +114,7 @@ func (r *Repository) Diff(ctx context.Context, opts DiffOptions) ([]DiffResult, 
 		}
 
 		// Generate hunks
-		if !opts.NameOnly && !opts.NameStatus {
-			result.Hunks = GenerateHunks(result.OldContent, result.NewContent, opts.Context)
-		}
+		result.Hunks = GenerateHunks(result.OldContent, result.NewContent, opts.Context)
 
 		results = append(results, result)
 	}

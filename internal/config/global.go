@@ -21,6 +21,15 @@ type ContainerConfig struct {
 	ShmSize string `toml:"shm_size"` // Shared memory size (default: 256m)
 	Port    int    `toml:"port"`     // PostgreSQL port (default: 5433)
 	Image   string `toml:"image"`    // Custom image (default: ghcr.io/imgajeed76/pg-xpatch:latest)
+
+	// PostgreSQL performance settings (passed as -c flags to postgres)
+	MaxConnections       int    `toml:"max_connections"`         // Default: 200
+	SharedBuffers        string `toml:"shared_buffers"`          // Default: 2GB
+	WorkMem              string `toml:"work_mem"`                // Default: 64MB
+	EffectiveCacheSize   string `toml:"effective_cache_size"`    // Default: 8GB
+	MaxParallelWorkers   int    `toml:"max_parallel_workers"`    // Default: 8
+	MaxWorkerProcesses   int    `toml:"max_worker_processes"`    // Default: 8
+	MaxParallelPerGather int    `toml:"max_parallel_per_gather"` // Default: 4
 }
 
 // ImportConfig contains default import settings
@@ -29,17 +38,27 @@ type ImportConfig struct {
 }
 
 // DefaultGlobalConfig returns a new global config with default values
+// Uses conservative defaults suitable for laptops (8GB RAM, 4 cores)
 func DefaultGlobalConfig() *GlobalConfig {
 	workers := runtime.NumCPU()
 	if workers > 3 {
 		workers = 3
 	}
 
+	// Conservative defaults - suitable for 8GB RAM laptop
+	// Users with more resources can increase via pgit config --global
 	return &GlobalConfig{
 		Container: ContainerConfig{
-			ShmSize: "256m",
-			Port:    5433,
-			Image:   "", // Empty means use default
+			ShmSize:              "256m",
+			Port:                 5433,
+			Image:                "", // Empty means use default
+			MaxConnections:       100,
+			SharedBuffers:        "256MB",
+			WorkMem:              "16MB",
+			EffectiveCacheSize:   "1GB",
+			MaxParallelWorkers:   4,
+			MaxWorkerProcesses:   4,
+			MaxParallelPerGather: 2,
 		},
 		Import: ImportConfig{
 			Workers: workers,
@@ -85,18 +104,37 @@ func LoadGlobal() (*GlobalConfig, error) {
 	}
 
 	// Apply defaults for any missing values
+	defaults := DefaultGlobalConfig()
+
 	if cfg.Container.ShmSize == "" {
-		cfg.Container.ShmSize = "256m"
+		cfg.Container.ShmSize = defaults.Container.ShmSize
 	}
 	if cfg.Container.Port == 0 {
-		cfg.Container.Port = 5433
+		cfg.Container.Port = defaults.Container.Port
+	}
+	if cfg.Container.MaxConnections == 0 {
+		cfg.Container.MaxConnections = defaults.Container.MaxConnections
+	}
+	if cfg.Container.SharedBuffers == "" {
+		cfg.Container.SharedBuffers = defaults.Container.SharedBuffers
+	}
+	if cfg.Container.WorkMem == "" {
+		cfg.Container.WorkMem = defaults.Container.WorkMem
+	}
+	if cfg.Container.EffectiveCacheSize == "" {
+		cfg.Container.EffectiveCacheSize = defaults.Container.EffectiveCacheSize
+	}
+	if cfg.Container.MaxParallelWorkers == 0 {
+		cfg.Container.MaxParallelWorkers = defaults.Container.MaxParallelWorkers
+	}
+	if cfg.Container.MaxWorkerProcesses == 0 {
+		cfg.Container.MaxWorkerProcesses = defaults.Container.MaxWorkerProcesses
+	}
+	if cfg.Container.MaxParallelPerGather == 0 {
+		cfg.Container.MaxParallelPerGather = defaults.Container.MaxParallelPerGather
 	}
 	if cfg.Import.Workers == 0 {
-		workers := runtime.NumCPU()
-		if workers > 3 {
-			workers = 3
-		}
-		cfg.Import.Workers = workers
+		cfg.Import.Workers = defaults.Import.Workers
 	}
 
 	return cfg, nil
@@ -130,6 +168,20 @@ func (c *GlobalConfig) GetValue(key string) (string, bool) {
 		return strconv.Itoa(c.Container.Port), true
 	case "container.image":
 		return c.Container.Image, true
+	case "container.max_connections":
+		return strconv.Itoa(c.Container.MaxConnections), true
+	case "container.shared_buffers":
+		return c.Container.SharedBuffers, true
+	case "container.work_mem":
+		return c.Container.WorkMem, true
+	case "container.effective_cache_size":
+		return c.Container.EffectiveCacheSize, true
+	case "container.max_parallel_workers":
+		return strconv.Itoa(c.Container.MaxParallelWorkers), true
+	case "container.max_worker_processes":
+		return strconv.Itoa(c.Container.MaxWorkerProcesses), true
+	case "container.max_parallel_per_gather":
+		return strconv.Itoa(c.Container.MaxParallelPerGather), true
 	case "import.workers":
 		return strconv.Itoa(c.Import.Workers), true
 	default:
@@ -153,6 +205,48 @@ func (c *GlobalConfig) SetValue(key, value string) error {
 		c.Container.Port = port
 	case "container.image":
 		c.Container.Image = value
+	case "container.max_connections":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if v < 10 || v > 1000 {
+			return os.ErrInvalid
+		}
+		c.Container.MaxConnections = v
+	case "container.shared_buffers":
+		c.Container.SharedBuffers = value
+	case "container.work_mem":
+		c.Container.WorkMem = value
+	case "container.effective_cache_size":
+		c.Container.EffectiveCacheSize = value
+	case "container.max_parallel_workers":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if v < 0 || v > 64 {
+			return os.ErrInvalid
+		}
+		c.Container.MaxParallelWorkers = v
+	case "container.max_worker_processes":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if v < 1 || v > 64 {
+			return os.ErrInvalid
+		}
+		c.Container.MaxWorkerProcesses = v
+	case "container.max_parallel_per_gather":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if v < 0 || v > 16 {
+			return os.ErrInvalid
+		}
+		c.Container.MaxParallelPerGather = v
 	case "import.workers":
 		workers, err := strconv.Atoi(value)
 		if err != nil {
@@ -174,6 +268,13 @@ func ListGlobalKeys() []string {
 		"container.shm_size",
 		"container.port",
 		"container.image",
+		"container.max_connections",
+		"container.shared_buffers",
+		"container.work_mem",
+		"container.effective_cache_size",
+		"container.max_parallel_workers",
+		"container.max_worker_processes",
+		"container.max_parallel_per_gather",
 		"import.workers",
 	}
 }

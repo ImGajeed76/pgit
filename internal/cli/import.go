@@ -85,6 +85,7 @@ type blobWork struct {
 	BlobHash  string
 	Mode      int
 	IsSymlink bool
+	IsDeleted bool // true for deletions (no content to fetch)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -277,9 +278,8 @@ func runImport(cmd *cobra.Command, args []string) error {
 	// Step 4: Import blobs with dual progress
 	// ═══════════════════════════════════════════════════════════════════════
 
-	// Separate additions/modifications from deletions
+	// Collect all file changes (additions, modifications, AND deletions)
 	var blobsToImport []blobWork
-	var deletions []*db.Blob
 	for _, fc := range fileChanges {
 		pgitCommitID, ok := commitMap[fc.CommitHash]
 		if !ok {
@@ -287,14 +287,14 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 
 		if fc.ChangeType == 'D' {
-			// Record deletion (ContentHash = nil signals deletion)
-			deletions = append(deletions, &db.Blob{
-				Path:        fc.Path,
-				CommitID:    pgitCommitID,
-				Content:     []byte{},
-				ContentHash: nil, // nil = deleted
-				Mode:        0,
-				IsSymlink:   false,
+			// Deletion - no content to fetch, will be handled in importBlobsOptimized
+			blobsToImport = append(blobsToImport, blobWork{
+				Path:      fc.Path,
+				CommitID:  pgitCommitID,
+				BlobHash:  "",
+				Mode:      0,
+				IsSymlink: false,
+				IsDeleted: true,
 			})
 			continue
 		}
@@ -309,22 +309,16 @@ func runImport(cmd *cobra.Command, args []string) error {
 			BlobHash:  fc.BlobHash,
 			Mode:      fc.Mode,
 			IsSymlink: fc.Mode == 0120000,
+			IsDeleted: false,
 		})
 	}
 
-	fmt.Printf("\nImporting %s file versions...\n", ui.FormatCount(len(blobsToImport)+len(deletions)))
+	fmt.Printf("\nImporting %s file versions...\n", ui.FormatCount(len(blobsToImport)))
 
 	if len(blobsToImport) > 0 {
 		err = importBlobsOptimized(ctx, r.DB, gitPath, blobsToImport, workers)
 		if err != nil {
 			return err
-		}
-	}
-
-	// Import deletions
-	if len(deletions) > 0 {
-		if err := r.DB.CreateBlobs(ctx, deletions); err != nil {
-			return fmt.Errorf("failed to import deletions: %w", err)
 		}
 	}
 
@@ -397,6 +391,7 @@ func parseGitHistory(gitPath, branch string) ([]gitCommitInfo, []gitFileChange, 
 
 	var commits []gitCommitInfo
 	var fileChanges []gitFileChange
+	seenChanges := make(map[string]bool) // Dedupe merge commit duplicates
 
 	scanner := bufio.NewScanner(stdout)
 	// Increase buffer size for long lines
@@ -466,6 +461,14 @@ func parseGitHistory(gitPath, branch string) ([]gitCommitInfo, []gitFileChange, 
 					path = pathParts[1] // Use destination path
 				}
 			}
+
+			// Deduplicate: merge commits can list the same file change multiple times
+			// (once for each parent). We only want the first one.
+			changeKey := currentCommit.Hash + "\x00" + path
+			if seenChanges[changeKey] {
+				continue
+			}
+			seenChanges[changeKey] = true
 
 			fc := gitFileChange{
 				CommitHash: currentCommit.Hash,
@@ -628,15 +631,27 @@ func importBlobsOptimized(
 
 				// Fetch content for all blobs in this path (in order)
 				for _, bw := range group {
+					if bw.IsDeleted {
+						// Deletion - no content to fetch
+						dbBlobs = append(dbBlobs, &db.Blob{
+							Path:        bw.Path,
+							CommitID:    bw.CommitID,
+							Content:     []byte{},
+							ContentHash: nil, // nil = deleted
+							Mode:        0,
+							IsSymlink:   false,
+						})
+						continue
+					}
+
 					content, err := fetchBlobContent(bw.BlobHash)
 					if err != nil {
 						// Skip missing blobs (may have been garbage collected)
 						continue
 					}
 
-					// Always compute hash (even for empty files - nil hash means deleted)
-					h := util.HashBytes(content)
-					contentHash := &h
+					// Compute BLAKE3 hash (16 bytes)
+					contentHash := util.HashBytesBlake3(content)
 
 					blob := &db.Blob{
 						Path:        bw.Path,

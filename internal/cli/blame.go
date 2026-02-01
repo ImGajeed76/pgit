@@ -91,13 +91,23 @@ func runBlame(cmd *cobra.Command, args []string) error {
 		blameLines[i] = blameInfo{lineContent: line}
 	}
 
+	// Batch fetch all commits for the history (avoid N+1 queries)
+	commitIDs := make([]string, len(history))
+	for i, blob := range history {
+		commitIDs[i] = blob.CommitID
+	}
+	commitMap, err := r.DB.GetCommitsBatch(ctx, commitIDs)
+	if err != nil {
+		return err
+	}
+
 	// Process history from oldest to newest
 	for i := len(history) - 1; i >= 0; i-- {
 		blob := history[i]
 
-		// Get commit info
-		commit, err := r.DB.GetCommit(ctx, blob.CommitID)
-		if err != nil || commit == nil {
+		// Get commit info from batch map
+		commit, ok := commitMap[blob.CommitID]
+		if !ok || commit == nil {
 			continue
 		}
 

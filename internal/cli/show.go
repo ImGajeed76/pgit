@@ -251,21 +251,13 @@ func resolveCommitRef(ctx context.Context, r *repo.Repository, ref string) (stri
 		return commit.ID, nil
 	}
 
-	// Try partial match (suffix matching for short hashes)
-	commits, err := r.DB.GetAllCommits(ctx)
+	// Try partial match using SQL LIKE (much faster than loading all commits)
+	commit, err = r.DB.FindCommitByPartialID(ctx, refUpper)
 	if err != nil {
-		return "", err
+		return "", err // This includes "ambiguous reference" errors
 	}
-
-	for _, c := range commits {
-		// Match suffix (since we show last 7 chars)
-		if strings.HasSuffix(strings.ToUpper(c.ID), refUpper) {
-			return c.ID, nil
-		}
-		// Also try prefix for full IDs
-		if strings.HasPrefix(c.ID, refUpper) {
-			return c.ID, nil
-		}
+	if commit != nil {
+		return commit.ID, nil
 	}
 
 	return "", util.ErrCommitNotFound

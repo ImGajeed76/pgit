@@ -118,23 +118,21 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 				}
 				blob.SymlinkTarget = &target
 				blob.Content = []byte(target)
-				hash := util.HashBytes(blob.Content)
-				blob.ContentHash = &hash
+				blob.ContentHash = util.HashBytesBlake3(blob.Content)
 			} else {
 				content, err := os.ReadFile(absPath)
 				if err != nil {
 					return nil, err
 				}
 				blob.Content = content
-				hash := util.HashBytes(content)
-				blob.ContentHash = &hash
+				blob.ContentHash = util.HashBytesBlake3(content)
 			}
 
 			// Add to tree entries
 			treeEntries = append(treeEntries, util.TreeEntry{
 				Mode:        blob.Mode,
 				Path:        blob.Path,
-				ContentHash: *blob.ContentHash,
+				ContentHash: blob.ContentHash,
 			})
 
 		case config.StatusDeleted:
@@ -153,7 +151,7 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 			treeEntries = append(treeEntries, util.TreeEntry{
 				Mode:        blob.Mode,
 				Path:        blob.Path,
-				ContentHash: *blob.ContentHash,
+				ContentHash: blob.ContentHash,
 			})
 		}
 	}
@@ -184,15 +182,9 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 			return err
 		}
 
-		// Create blobs
-		for _, b := range blobs {
-			_, err := tx.Exec(ctx, `
-				INSERT INTO pgit_blobs (path, commit_id, content, content_hash, mode, is_symlink, symlink_target)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-				b.Path, b.CommitID, b.Content, b.ContentHash, b.Mode, b.IsSymlink, b.SymlinkTarget)
-			if err != nil {
-				return err
-			}
+		// Create blobs using the new schema
+		if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
+			return err
 		}
 
 		// Update HEAD
