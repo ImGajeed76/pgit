@@ -18,10 +18,12 @@ No scripts, no parsing `git log` output. Just SQL.
 
 ```sql
 -- Which files are always changed together?
-SELECT a.path, b.path, COUNT(*) as times_together
-FROM pgit_blobs a
-JOIN pgit_blobs b ON a.commit_id = b.commit_id AND a.path < b.path
-GROUP BY a.path, b.path
+SELECT pa.path, pb.path, COUNT(*) as times_together
+FROM pgit_file_refs a
+JOIN pgit_paths pa ON pa.group_id = a.group_id
+JOIN pgit_file_refs b ON a.commit_id = b.commit_id AND a.group_id < b.group_id
+JOIN pgit_paths pb ON pb.group_id = b.group_id
+GROUP BY pa.path, pb.path
 ORDER BY times_together DESC;
 ```
 
@@ -33,17 +35,17 @@ Benchmarked on real repositories (single branch, full history). Comparing packfi
 
 | | git --aggressive | pgit | fossil |
 |--|------------------|------|--------|
-| **Storage** | 91 MB | **58 MB** | 326 MB |
-| **Import time** | - | 14 min | 32 min |
+| **Storage** | 91 MB | **53.5 MB** | 326 MB |
+| **Import time** | - | 16 min | 32 min |
 
-**pgit is 36% smaller than git with `git gc --aggressive`, and 82% smaller than fossil.**
+**pgit is 41% smaller than git with `git gc --aggressive`, and 84% smaller than fossil.**
 
 ### tokio (4,377 commits, 179 MB raw content)
 
 | | git --aggressive | pgit | fossil |
 |--|------------------|------|--------|
-| **Storage** | 8.3 MB | **8 MB** | 8.1 MB |
-| **Import time** | - | 19 sec | 13 sec |
+| **Storage** | 8.3 MB | **7.4 MB** | 8.1 MB |
+| **Import time** | - | 17 sec | 13 sec |
 
 pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression with zstd. Compression improves with repository size - larger repos see better results.
 
@@ -52,7 +54,7 @@ pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression
 - **Git-familiar commands**: init, add, commit, log, diff, checkout, push, pull, clone
 - **PostgreSQL as remote**: Connection URL is your "remote" - no separate auth system
 - **SQL queryable**: Run arbitrary queries on your entire repo history
-- **Delta compression**: pg-xpatch achieves better compression than git's packfiles (up to 36% smaller)
+- **Delta compression**: pg-xpatch achieves better compression than git's packfiles (up to 41% smaller)
 - **Search across history**: `pgit search "pattern"` searches all versions of all files
 - **Local development**: Uses Docker/Podman container for local database
 - **Import from Git**: Migrate existing repositories with full history
@@ -126,18 +128,20 @@ pgit sql "SELECT * FROM pgit_commits ORDER BY created_at DESC LIMIT 10"
 
 ```sql
 -- Most frequently changed files
-SELECT path, COUNT(*) as versions
-FROM pgit_blobs
-GROUP BY path
+SELECT p.path, COUNT(*) as versions
+FROM pgit_file_refs r
+JOIN pgit_paths p ON p.group_id = r.group_id
+GROUP BY p.path
 ORDER BY versions DESC
 LIMIT 10;
 
 -- File size growth over time
 SELECT 
   EXTRACT(YEAR FROM c.created_at)::int as year,
-  pg_size_pretty(AVG(LENGTH(b.content))::bigint) as avg_size
-FROM pgit_blobs b
-JOIN pgit_commits c ON b.commit_id = c.id
+  pg_size_pretty(AVG(LENGTH(ct.content))::bigint) as avg_size
+FROM pgit_file_refs r
+JOIN pgit_commits c ON r.commit_id = c.id
+JOIN pgit_content ct ON ct.group_id = r.group_id AND ct.version_id = r.version_id
 GROUP BY EXTRACT(YEAR FROM c.created_at)
 ORDER BY year;
 ```
