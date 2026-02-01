@@ -25,25 +25,25 @@ GROUP BY a.path, b.path
 ORDER BY times_together DESC;
 ```
 
-## Compression: pgit vs git
+## Compression: pgit vs git vs fossil
 
 Benchmarked on real repositories (single branch, full history). Comparing packfile vs table data only (excluding indexes for both):
 
 ### git/git (79,588 commits, 3.8 GB raw content)
 
-| | git --aggressive | pgit |
-|--|------------------|------|
-| **Storage** | 91 MB | **58 MB** |
-| **Import time** | - | 14 min |
+| | git --aggressive | pgit | fossil |
+|--|------------------|------|--------|
+| **Storage** | 91 MB | **58 MB** | 326 MB |
+| **Import time** | - | 14 min | 32 min |
 
-**pgit is 36% smaller than git with `git gc --aggressive`.**
+**pgit is 36% smaller than git with `git gc --aggressive`, and 82% smaller than fossil.**
 
 ### tokio (4,377 commits, 179 MB raw content)
 
-| | git --aggressive | pgit |
-|--|------------------|------|
-| **Storage** | 8.3 MB | **8 MB** |
-| **Import time** | - | 19 sec |
+| | git --aggressive | pgit | fossil |
+|--|------------------|------|--------|
+| **Storage** | 8.3 MB | **8 MB** | 8.1 MB |
+| **Import time** | - | 19 sec | 13 sec |
 
 pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression with zstd. Compression improves with repository size - larger repos see better results.
 
