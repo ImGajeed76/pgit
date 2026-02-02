@@ -352,8 +352,8 @@ type sqlTableModel struct {
 	colStates     []colState // display state for each column
 	cursor        int        // selected row (in filtered view)
 	colCursor     int        // selected column
-	scrollX       int        // horizontal scroll offset (in pixels/chars)
-	scrollY       int        // vertical scroll offset (in rows)
+	scrollX       int        // horizontal scroll offset in characters
+	scrollY       int        // vertical scroll offset in rows
 	width         int        // terminal width
 	height        int        // terminal height
 	ready         bool
@@ -361,6 +361,11 @@ type sqlTableModel struct {
 	searchInput   textinput.Model
 	searchQuery   string
 	exitMode      exitMode // how to exit (for re-printing data)
+
+	// Animation state for smooth scrolling
+	animating   bool // whether animation is in progress
+	animTargetX int  // target scrollX for animation
+	animTargetY int  // target scrollY for animation
 }
 
 type sqlKeyMap struct {
@@ -368,6 +373,10 @@ type sqlKeyMap struct {
 	Down        key.Binding
 	Left        key.Binding
 	Right       key.Binding
+	ShiftUp     key.Binding
+	ShiftDown   key.Binding
+	ShiftLeft   key.Binding
+	ShiftRight  key.Binding
 	PageUp      key.Binding
 	PageDown    key.Binding
 	Home        key.Binding
@@ -386,6 +395,10 @@ var sqlKeys = sqlKeyMap{
 	Down:        key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
 	Left:        key.NewBinding(key.WithKeys("left"), key.WithHelp("←", "prev column")),
 	Right:       key.NewBinding(key.WithKeys("right"), key.WithHelp("→", "next column")),
+	ShiftUp:     key.NewBinding(key.WithKeys("shift+up"), key.WithHelp("⇧↑", "half page up")),
+	ShiftDown:   key.NewBinding(key.WithKeys("shift+down"), key.WithHelp("⇧↓", "half page down")),
+	ShiftLeft:   key.NewBinding(key.WithKeys("shift+left"), key.WithHelp("⇧←", "scroll half left")),
+	ShiftRight:  key.NewBinding(key.WithKeys("shift+right"), key.WithHelp("⇧→", "scroll half right")),
 	PageUp:      key.NewBinding(key.WithKeys("pgup", "ctrl+u"), key.WithHelp("pgup", "page up")),
 	PageDown:    key.NewBinding(key.WithKeys("pgdown", "ctrl+d"), key.WithHelp("pgdn", "page down")),
 	Home:        key.NewBinding(key.WithKeys("home", "g"), key.WithHelp("g", "first row")),
@@ -476,7 +489,15 @@ func (m sqlTableModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ready = true
 
+	case animTickMsg:
+		// Handle animation frame
+		cmd := m.updateAnimation()
+		return m, cmd
+
 	case tea.KeyMsg:
+		// Cancel any ongoing animation when user presses a key
+		m.cancelAnimation()
+
 		// Handle search mode
 		if m.mode == tableModeSearch {
 			return m.updateSearch(msg)
@@ -506,16 +527,100 @@ func (m sqlTableModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case key.Matches(msg, sqlKeys.Left):
-			if m.colCursor > 0 {
+			// Character-level edge scrolling: if column is not fully visible,
+			// scroll by character. Once fully visible, move to previous column.
+			colStartX := m.getColStartX(m.colCursor)
+
+			if colStartX < m.scrollX {
+				// Column start is off-screen to the left, scroll left by characters
+				// Scroll enough to reveal more of the column (scroll by a few chars at a time)
+				m.scrollX -= 3
+				if m.scrollX < colStartX {
+					m.scrollX = colStartX
+				}
+				if m.scrollX < 0 {
+					m.scrollX = 0
+				}
+			} else if m.colCursor > 0 {
+				// Column is fully visible on the left side, move to previous column
 				m.colCursor--
-				m.ensureColVisible()
+				// When entering from the right, show the END of the new column
+				m.ensureColVisibleFromRight()
 			}
 
 		case key.Matches(msg, sqlKeys.Right):
-			if m.colCursor < len(m.columns)-1 {
+			// Character-level edge scrolling: if column is not fully visible,
+			// scroll by character. Once fully visible, move to next column.
+			colEndX := m.getColEndX(m.colCursor)
+			viewportEndX := m.scrollX + m.width - 2
+
+			if colEndX > viewportEndX {
+				// Column end is off-screen to the right, scroll right by characters
+				m.scrollX += 3
+				maxX := m.getMaxScrollX()
+				if m.scrollX > maxX {
+					m.scrollX = maxX
+				}
+			} else if m.colCursor < len(m.columns)-1 {
+				// Column is fully visible, move to next column
 				m.colCursor++
-				m.ensureColVisible()
+				// When entering from the left, show the START of the new column
+				m.ensureColVisibleFromLeft()
 			}
+
+		case key.Matches(msg, sqlKeys.ShiftLeft):
+			// Animated scroll half screen width to the left
+			halfWidth := m.width / 2
+			if halfWidth < 1 {
+				halfWidth = 1
+			}
+			targetX := m.scrollX - halfWidth
+			cmd := m.startAnimation(targetX, m.scrollY)
+			return m, cmd
+
+		case key.Matches(msg, sqlKeys.ShiftRight):
+			// Animated scroll half screen width to the right
+			halfWidth := m.width / 2
+			if halfWidth < 1 {
+				halfWidth = 1
+			}
+			targetX := m.scrollX + halfWidth
+			cmd := m.startAnimation(targetX, m.scrollY)
+			return m, cmd
+
+		case key.Matches(msg, sqlKeys.ShiftUp):
+			// Animated scroll half page up
+			halfPage := m.visibleRowCount() / 2
+			if halfPage < 1 {
+				halfPage = 1
+			}
+			targetY := m.scrollY - halfPage
+			// Also move cursor to stay in view
+			m.cursor -= halfPage
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+			cmd := m.startAnimation(m.scrollX, targetY)
+			return m, cmd
+
+		case key.Matches(msg, sqlKeys.ShiftDown):
+			// Animated scroll half page down
+			halfPage := m.visibleRowCount() / 2
+			if halfPage < 1 {
+				halfPage = 1
+			}
+			targetY := m.scrollY + halfPage
+			// Also move cursor to stay in view
+			maxRows := m.displayRowCount()
+			m.cursor += halfPage
+			if m.cursor >= maxRows {
+				m.cursor = maxRows - 1
+			}
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+			cmd := m.startAnimation(m.scrollX, targetY)
+			return m, cmd
 
 		case key.Matches(msg, sqlKeys.PageUp):
 			visibleRows := m.visibleRowCount()
@@ -540,6 +645,7 @@ func (m sqlTableModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, sqlKeys.Home):
 			m.cursor = 0
 			m.scrollY = 0
+			m.scrollX = 0
 
 		case key.Matches(msg, sqlKeys.End):
 			maxRows := m.displayRowCount()
@@ -556,6 +662,8 @@ func (m sqlTableModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.colStates[m.colCursor] = colStateExpanded
 				}
+				// Re-ensure visibility after size change
+				m.ensureColVisible()
 			}
 
 		case key.Matches(msg, sqlKeys.Hide):
@@ -566,6 +674,8 @@ func (m sqlTableModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.colStates[m.colCursor] = colStateHidden
 				}
+				// Re-ensure visibility after size change
+				m.ensureColVisible()
 			}
 
 		case key.Matches(msg, sqlKeys.ExportJSON):
@@ -662,24 +772,6 @@ func (m sqlTableModel) getDisplayRow(displayIdx int) []string {
 	return nil
 }
 
-// highlightSearchMatch highlights the search query in a string
-func (m sqlTableModel) highlightSearchMatch(text string) string {
-	if m.searchQuery == "" {
-		return text
-	}
-
-	lowerText := strings.ToLower(text)
-	lowerQuery := strings.ToLower(m.searchQuery)
-
-	idx := strings.Index(lowerText, lowerQuery)
-	if idx == -1 {
-		return text
-	}
-
-	// Simple highlight - just return text as-is since we're using color on entire cell
-	return text
-}
-
 // getColDisplayWidth returns the display width for a column based on its state
 func (m sqlTableModel) getColDisplayWidth(colIdx int) int {
 	if colIdx >= len(m.colStates) {
@@ -707,6 +799,269 @@ func (m sqlTableModel) getColDisplayWidth(colIdx int) int {
 	}
 }
 
+// getColStartX returns the X character position where a column starts
+func (m sqlTableModel) getColStartX(colIdx int) int {
+	x := 0
+	for i := 0; i < colIdx && i < len(m.columns); i++ {
+		x += m.getColDisplayWidth(i) + 2 // +2 for column separator spacing
+	}
+	return x
+}
+
+// getColEndX returns the X character position where a column ends (exclusive)
+func (m sqlTableModel) getColEndX(colIdx int) int {
+	return m.getColStartX(colIdx) + m.getColDisplayWidth(colIdx)
+}
+
+// getTotalWidth returns total width of all columns including separators
+func (m sqlTableModel) getTotalWidth() int {
+	total := 0
+	for i := range m.columns {
+		total += m.getColDisplayWidth(i) + 2
+	}
+	return total
+}
+
+// getMaxScrollX returns the maximum valid scrollX value
+func (m sqlTableModel) getMaxScrollX() int {
+	maxX := m.getTotalWidth() - m.width + 2 // +2 for some padding
+	if maxX < 0 {
+		return 0
+	}
+	return maxX
+}
+
+// getMaxScrollY returns the maximum valid scrollY value
+func (m sqlTableModel) getMaxScrollY() int {
+	maxY := m.displayRowCount() - m.visibleRowCount()
+	if maxY < 0 {
+		return 0
+	}
+	return maxY
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Animation Support
+// ═══════════════════════════════════════════════════════════════════════════
+
+// animTickMsg is sent on each animation frame
+type animTickMsg time.Time
+
+// animationFrameInterval is how often we update during animation (~60fps)
+const animationFrameInterval = 16 * time.Millisecond
+
+// animationFraction is how much of the remaining distance to cover each frame
+// 0.25 means move 25% of remaining distance each frame = smooth exponential decay
+const animationFraction = 0.25
+
+// animationSnapThreshold - when remaining distance is this small, snap to target
+const animationSnapThreshold = 1
+
+// animTick returns a command that triggers the next animation frame
+func animTick() tea.Cmd {
+	return tea.Tick(animationFrameInterval, func(t time.Time) tea.Msg {
+		return animTickMsg(t)
+	})
+}
+
+// startAnimation begins a smooth scroll animation to the target position
+// If already animating, just updates the target (animation continues smoothly)
+func (m *sqlTableModel) startAnimation(targetX, targetY int) tea.Cmd {
+	// Clamp targets to valid range
+	maxX := m.getMaxScrollX()
+	if targetX < 0 {
+		targetX = 0
+	} else if targetX > maxX {
+		targetX = maxX
+	}
+
+	maxY := m.getMaxScrollY()
+	if targetY < 0 {
+		targetY = 0
+	} else if targetY > maxY {
+		targetY = maxY
+	}
+
+	// Update target (even if already animating - this allows smooth re-targeting)
+	m.animTargetX = targetX
+	m.animTargetY = targetY
+
+	// Skip if already at target
+	if targetX == m.scrollX && targetY == m.scrollY {
+		m.animating = false
+		return nil
+	}
+
+	// Start animation if not already running
+	if !m.animating {
+		m.animating = true
+		return animTick()
+	}
+
+	// Already animating - tick is already scheduled, just return
+	return nil
+}
+
+// updateAnimation processes an animation frame using proportional movement
+// Each frame moves a fraction of the remaining distance to target
+func (m *sqlTableModel) updateAnimation() tea.Cmd {
+	if !m.animating {
+		return nil
+	}
+
+	// Calculate remaining distance
+	remainingX := m.animTargetX - m.scrollX
+	remainingY := m.animTargetY - m.scrollY
+
+	// Check if we're close enough to snap
+	if abs(remainingX) <= animationSnapThreshold && abs(remainingY) <= animationSnapThreshold {
+		m.scrollX = m.animTargetX
+		m.scrollY = m.animTargetY
+		m.animating = false
+		return nil
+	}
+
+	// Move a fraction of the remaining distance
+	if remainingX != 0 {
+		deltaX := int(float64(remainingX) * animationFraction)
+		if deltaX == 0 {
+			// Ensure we always move at least 1 pixel toward target
+			if remainingX > 0 {
+				deltaX = 1
+			} else {
+				deltaX = -1
+			}
+		}
+		m.scrollX += deltaX
+	}
+
+	if remainingY != 0 {
+		deltaY := int(float64(remainingY) * animationFraction)
+		if deltaY == 0 {
+			if remainingY > 0 {
+				deltaY = 1
+			} else {
+				deltaY = -1
+			}
+		}
+		m.scrollY += deltaY
+	}
+
+	return animTick()
+}
+
+// cancelAnimation stops any in-progress animation immediately
+func (m *sqlTableModel) cancelAnimation() {
+	m.animating = false
+}
+
+// abs returns absolute value of an int
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ANSI-aware Viewport Slicing
+// ═══════════════════════════════════════════════════════════════════════════
+
+// applyViewport extracts a horizontal slice of a string, handling ANSI escape codes properly.
+// It returns the portion of the string from visual column startX with the given width.
+func applyViewport(s string, startX, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if startX < 0 {
+		startX = 0
+	}
+
+	var result strings.Builder
+	result.Grow(width + 64) // Pre-allocate with some room for ANSI codes
+
+	visualPos := 0         // Current visual (displayed) column position
+	outputChars := 0       // Number of visible characters written to result
+	stylesApplied := false // Whether we've applied styles at viewport start
+	inEscape := false
+	escapeSeq := strings.Builder{}
+
+	// Track active ANSI state to re-apply at viewport start
+	var activeStyles []string
+
+	runes := []rune(s)
+	i := 0
+
+	for i < len(runes) && outputChars < width {
+		r := runes[i]
+
+		// Check for ANSI escape sequence start
+		if r == '\x1b' && i+1 < len(runes) && runes[i+1] == '[' {
+			inEscape = true
+			escapeSeq.Reset()
+			escapeSeq.WriteRune(r)
+			i++
+			continue
+		}
+
+		if inEscape {
+			escapeSeq.WriteRune(r)
+			// ANSI sequences end with a letter
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEscape = false
+				seq := escapeSeq.String()
+
+				// Track style state
+				if r == 'm' {
+					// SGR (Select Graphic Rendition) sequence
+					if seq == "\x1b[0m" || seq == "\x1b[m" {
+						// Reset - clear all active styles
+						activeStyles = nil
+					} else {
+						activeStyles = append(activeStyles, seq)
+					}
+				}
+
+				// If we're in the visible region, include the escape sequence
+				if visualPos >= startX {
+					result.WriteString(seq)
+				}
+			}
+			i++
+			continue
+		}
+
+		// Regular character
+		if visualPos >= startX {
+			// We're in the visible region
+			if !stylesApplied && len(activeStyles) > 0 {
+				// Re-apply active styles at the start of visible region
+				for _, style := range activeStyles {
+					result.WriteString(style)
+				}
+				stylesApplied = true
+			}
+			result.WriteRune(r)
+			outputChars++
+		}
+
+		visualPos++
+		i++
+	}
+
+	// If we ended with active styles, reset them
+	if len(activeStyles) > 0 && outputChars > 0 {
+		result.WriteString("\x1b[0m")
+	}
+
+	// Pad to fill width if content is shorter
+	if outputChars < width {
+		result.WriteString(strings.Repeat(" ", width-outputChars))
+	}
+
+	return result.String()
+}
+
 func (m *sqlTableModel) ensureRowVisible() {
 	visibleRows := m.visibleRowCount()
 	if visibleRows <= 0 {
@@ -720,10 +1075,76 @@ func (m *sqlTableModel) ensureRowVisible() {
 }
 
 func (m *sqlTableModel) ensureColVisible() {
-	// Calculate column positions and ensure selected column is visible
-	// This is done in renderTable, but we track scrollX as character offset
-	// For simplicity, we'll just ensure the column cursor doesn't go out of bounds
-	// The render function handles actual visibility
+	// Calculate the character positions of the current column
+	colStartX := m.getColStartX(m.colCursor)
+	colEndX := m.getColEndX(m.colCursor)
+	colWidth := colEndX - colStartX
+	viewportWidth := m.width - 2 // -2 for margin
+
+	// If column starts before viewport, scroll left to show column start
+	if colStartX < m.scrollX {
+		m.scrollX = colStartX
+	} else if colEndX > m.scrollX+viewportWidth {
+		// Column ends after viewport
+		if colWidth <= viewportWidth {
+			// Column fits in viewport - scroll to show the whole column
+			m.scrollX = colEndX - viewportWidth
+		} else {
+			// Column is wider than viewport - show the start of the column
+			m.scrollX = colStartX
+		}
+	}
+
+	// Clamp scrollX to valid range
+	maxX := m.getMaxScrollX()
+	if m.scrollX < 0 {
+		m.scrollX = 0
+	} else if m.scrollX > maxX {
+		m.scrollX = maxX
+	}
+}
+
+// ensureColVisibleFromLeft shows the START of the column (used when entering from the left via Right arrow)
+func (m *sqlTableModel) ensureColVisibleFromLeft() {
+	colStartX := m.getColStartX(m.colCursor)
+
+	// Always show the start of the column
+	m.scrollX = colStartX
+
+	// Clamp scrollX to valid range
+	maxX := m.getMaxScrollX()
+	if m.scrollX < 0 {
+		m.scrollX = 0
+	} else if m.scrollX > maxX {
+		m.scrollX = maxX
+	}
+}
+
+// ensureColVisibleFromRight shows the END of the column (used when entering from the right via Left arrow)
+func (m *sqlTableModel) ensureColVisibleFromRight() {
+	colStartX := m.getColStartX(m.colCursor)
+	colEndX := m.getColEndX(m.colCursor)
+	colWidth := colEndX - colStartX
+	viewportWidth := m.width - 2 // -2 for margin
+
+	if colWidth <= viewportWidth {
+		// Column fits in viewport - show the whole column (align to end)
+		m.scrollX = colEndX - viewportWidth
+		if m.scrollX < colStartX {
+			m.scrollX = colStartX
+		}
+	} else {
+		// Column is wider than viewport - show the END of the column
+		m.scrollX = colEndX - viewportWidth
+	}
+
+	// Clamp scrollX to valid range
+	maxX := m.getMaxScrollX()
+	if m.scrollX < 0 {
+		m.scrollX = 0
+	} else if m.scrollX > maxX {
+		m.scrollX = maxX
+	}
 }
 
 func (m sqlTableModel) visibleRowCount() int {
@@ -782,7 +1203,7 @@ func (m sqlTableModel) View() string {
 		help := styles.MutedMsg("enter confirm  esc cancel")
 		sb.WriteString(help)
 	} else {
-		help := styles.MutedMsg("↑↓←→ navigate  enter expand  H hide  / search  J json  R raw  P table  q quit")
+		help := styles.MutedMsg("↑↓←→ nav  ⇧+arrow scroll  enter expand  H hide  / search  J json  R raw  P table  q quit")
 		sb.WriteString(help)
 	}
 
@@ -796,114 +1217,29 @@ func (m sqlTableModel) renderTable() string {
 		return "No columns"
 	}
 
-	// Calculate which columns fit in the available width
-	availableWidth := m.width - 2 // margin
+	// Available viewport width
+	viewportWidth := m.width - 2 // margin
 
-	// Find columns that fit, starting from scrollX offset
-	type visibleCol struct {
-		index    int
-		width    int
-		startPos int
-	}
-	var visibleCols []visibleCol
-	currentPos := 0
-
-	// Calculate total width before scrollX to handle horizontal scrolling
-	scrollOffset := 0
-	for i := 0; i < len(m.columns); i++ {
-		colW := m.getColDisplayWidth(i) + 2 // +2 for padding between columns
-		if i < m.colCursor {
-			scrollOffset += colW
-		}
-		if i == m.colCursor {
-			break
-		}
-	}
-
-	// Adjust scrollX to keep selected column visible
-	// Start from beginning and add columns until we run out of space
-	usedWidth := 0
-	startCol := 0
-
-	// Find starting column based on scroll position
-	// Try to keep colCursor visible
-	for startCol < len(m.columns) {
-		testWidth := 0
-		canFitCursor := false
-		for i := startCol; i < len(m.columns); i++ {
-			colW := m.getColDisplayWidth(i) + 2
-			if testWidth+colW > availableWidth && i > startCol {
-				break
-			}
-			testWidth += colW
-			if i == m.colCursor {
-				canFitCursor = true
-			}
-		}
-		if canFitCursor {
-			break
-		}
-		startCol++
-	}
-
-	// Now build visible columns list
-	usedWidth = 0
-	for i := startCol; i < len(m.columns); i++ {
-		colW := m.getColDisplayWidth(i)
-		totalW := colW + 2 // +2 for separator
-		if usedWidth+totalW > availableWidth && len(visibleCols) > 0 {
-			break
-		}
-		visibleCols = append(visibleCols, visibleCol{
-			index:    i,
-			width:    colW,
-			startPos: currentPos,
-		})
-		usedWidth += totalW
-		currentPos += totalW
-	}
-
-	if len(visibleCols) == 0 && len(m.columns) > 0 {
-		// At least show one column
-		visibleCols = append(visibleCols, visibleCol{
-			index: m.colCursor,
-			width: m.getColDisplayWidth(m.colCursor),
-		})
-	}
-
-	// Column header
+	// Define styles
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(styles.Info)
 	selectedHeaderStyle := lipgloss.NewStyle().Bold(true).Foreground(styles.Accent)
-
-	for _, vc := range visibleCols {
-		var name string
-		if m.colStates[vc.index] == colStateHidden {
-			name = "..."
-		} else {
-			name = padOrTruncate(m.columns[vc.index], vc.width)
-		}
-
-		if vc.index == m.colCursor {
-			sb.WriteString(selectedHeaderStyle.Render(name))
-		} else {
-			sb.WriteString(headerStyle.Render(name))
-		}
-		sb.WriteString("  ")
-	}
-	sb.WriteString("\n")
-
-	// Separator
 	separatorStyle := lipgloss.NewStyle().Foreground(styles.Muted)
 	selectedSepStyle := lipgloss.NewStyle().Foreground(styles.Accent)
-	for _, vc := range visibleCols {
-		sep := strings.Repeat("─", vc.width)
-		if vc.index == m.colCursor {
-			sb.WriteString(selectedSepStyle.Render(sep))
-		} else {
-			sb.WriteString(separatorStyle.Render(sep))
-		}
-		sb.WriteString("  ")
-	}
+	selectedRowStyle := lipgloss.NewStyle().Background(styles.BgHighlight)
+	selectedCellStyle := lipgloss.NewStyle().Background(styles.Accent).Foreground(lipgloss.Color("#000000"))
+	normalStyle := lipgloss.NewStyle()
+	highlightStyle := lipgloss.NewStyle().Foreground(styles.Warning)
+
+	// Build full-width header line (without viewport truncation)
+	headerLine := m.buildFullHeaderLine(headerStyle, selectedHeaderStyle)
+
+	// Build full-width separator line
+	separatorLine := m.buildFullSeparatorLine(separatorStyle, selectedSepStyle)
+
+	// Apply horizontal viewport to header and separator
+	sb.WriteString(applyViewport(headerLine, m.scrollX, viewportWidth))
+	sb.WriteString("\n")
+	sb.WriteString(applyViewport(separatorLine, m.scrollX, viewportWidth))
 	sb.WriteString("\n")
 
 	// Rows
@@ -914,11 +1250,6 @@ func (m sqlTableModel) renderTable() string {
 		endRow = displayCount
 	}
 
-	selectedRowStyle := lipgloss.NewStyle().Background(styles.BgHighlight)
-	selectedCellStyle := lipgloss.NewStyle().Background(styles.Accent).Foreground(lipgloss.Color("#000000"))
-	normalStyle := lipgloss.NewStyle()
-	highlightStyle := lipgloss.NewStyle().Foreground(styles.Warning) // highlight search matches
-
 	for displayIdx := m.scrollY; displayIdx < endRow; displayIdx++ {
 		row := m.getDisplayRow(displayIdx)
 		if row == nil {
@@ -926,54 +1257,115 @@ func (m sqlTableModel) renderTable() string {
 		}
 		isSelectedRow := displayIdx == m.cursor
 
-		for _, vc := range visibleCols {
-			val := ""
-			if vc.index < len(row) {
-				val = row[vc.index]
-			}
+		// Build full-width row line
+		rowLine := m.buildFullRowLine(row, isSelectedRow, normalStyle, selectedRowStyle, selectedCellStyle, highlightStyle)
 
-			if m.colStates[vc.index] == colStateHidden {
-				val = "..."
-			} else {
-				val = padOrTruncate(val, vc.width)
-			}
-
-			isSelectedCol := vc.index == m.colCursor
-
-			// Highlight search matches in the value
-			displayVal := val
-			if m.searchQuery != "" && strings.Contains(strings.ToLower(val), strings.ToLower(m.searchQuery)) {
-				displayVal = m.highlightSearchMatch(val)
-			}
-
-			if isSelectedRow && isSelectedCol {
-				sb.WriteString(selectedCellStyle.Render(val))
-			} else if isSelectedRow {
-				sb.WriteString(selectedRowStyle.Render(val))
-			} else if m.searchQuery != "" && strings.Contains(strings.ToLower(val), strings.ToLower(m.searchQuery)) {
-				sb.WriteString(highlightStyle.Render(displayVal))
-			} else {
-				sb.WriteString(normalStyle.Render(val))
-			}
-			sb.WriteString("  ")
-		}
+		// Apply horizontal viewport
+		sb.WriteString(applyViewport(rowLine, m.scrollX, viewportWidth))
 		sb.WriteString("\n")
 	}
 
 	// Scroll indicators
 	var indicators []string
-	if startCol > 0 {
+	if m.scrollX > 0 {
 		indicators = append(indicators, "◀")
 	}
-	lastVisibleCol := 0
-	if len(visibleCols) > 0 {
-		lastVisibleCol = visibleCols[len(visibleCols)-1].index
-	}
-	if lastVisibleCol < len(m.columns)-1 {
+	totalWidth := m.getTotalWidth()
+	if m.scrollX+viewportWidth < totalWidth {
 		indicators = append(indicators, "▶")
+	}
+	if m.scrollY > 0 {
+		indicators = append(indicators, "▲")
+	}
+	if m.scrollY+visibleRows < displayCount {
+		indicators = append(indicators, "▼")
 	}
 	if len(indicators) > 0 {
 		sb.WriteString(styles.MutedMsg(strings.Join(indicators, " ")))
+	}
+
+	return sb.String()
+}
+
+// buildFullHeaderLine builds the complete header line at full width (no viewport truncation)
+func (m sqlTableModel) buildFullHeaderLine(normalStyle, selectedStyle lipgloss.Style) string {
+	var sb strings.Builder
+
+	for i, colName := range m.columns {
+		colWidth := m.getColDisplayWidth(i)
+
+		var displayName string
+		if m.colStates[i] == colStateHidden {
+			displayName = padOrTruncate("...", colWidth)
+		} else {
+			displayName = padOrTruncate(colName, colWidth)
+		}
+
+		if i == m.colCursor {
+			sb.WriteString(selectedStyle.Render(displayName))
+		} else {
+			sb.WriteString(normalStyle.Render(displayName))
+		}
+		sb.WriteString("  ") // Column separator
+	}
+
+	return sb.String()
+}
+
+// buildFullSeparatorLine builds the complete separator line at full width
+func (m sqlTableModel) buildFullSeparatorLine(normalStyle, selectedStyle lipgloss.Style) string {
+	var sb strings.Builder
+
+	for i := range m.columns {
+		colWidth := m.getColDisplayWidth(i)
+		sep := strings.Repeat("─", colWidth)
+
+		if i == m.colCursor {
+			sb.WriteString(selectedStyle.Render(sep))
+		} else {
+			sb.WriteString(normalStyle.Render(sep))
+		}
+		sb.WriteString("  ") // Column separator
+	}
+
+	return sb.String()
+}
+
+// buildFullRowLine builds a complete data row line at full width
+func (m sqlTableModel) buildFullRowLine(row []string, isSelectedRow bool, normalStyle, selectedRowStyle, selectedCellStyle, highlightStyle lipgloss.Style) string {
+	var sb strings.Builder
+
+	for i := range m.columns {
+		colWidth := m.getColDisplayWidth(i)
+
+		// Get cell value
+		var val string
+		if i < len(row) {
+			val = row[i]
+		}
+
+		// Format the cell value
+		var displayVal string
+		if m.colStates[i] == colStateHidden {
+			displayVal = padOrTruncate("...", colWidth)
+		} else {
+			displayVal = padOrTruncate(val, colWidth)
+		}
+
+		isSelectedCol := i == m.colCursor
+		hasSearchMatch := m.searchQuery != "" && strings.Contains(strings.ToLower(val), strings.ToLower(m.searchQuery))
+
+		// Apply appropriate style
+		if isSelectedRow && isSelectedCol {
+			sb.WriteString(selectedCellStyle.Render(displayVal))
+		} else if isSelectedRow {
+			sb.WriteString(selectedRowStyle.Render(displayVal))
+		} else if hasSearchMatch {
+			sb.WriteString(highlightStyle.Render(displayVal))
+		} else {
+			sb.WriteString(normalStyle.Render(displayVal))
+		}
+		sb.WriteString("  ") // Column separator
 	}
 
 	return sb.String()
