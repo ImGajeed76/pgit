@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/imgajeed76/pgit/internal/config"
-	"github.com/imgajeed76/pgit/internal/ui/styles"
-	"github.com/imgajeed76/pgit/internal/util"
+	"github.com/imgajeed76/pgit/v2/internal/config"
+	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v2/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -29,10 +29,22 @@ Examples:
   pgit config --global container.shm_size 512m  # Set global value
 
 Global settings:
-  container.shm_size   Shared memory for PostgreSQL (default: 256m)
-  container.port       Default port (default: 5433)
-  container.image      Custom pg-xpatch image (empty = default)
-  import.workers       Default import workers (default: CPU count, max 3)`,
+  Container:
+    container.shm_size              Shared memory for PostgreSQL (default: 256m)
+    container.port                  PostgreSQL port (default: 5433)
+    container.image                 Custom pg-xpatch image (empty = default)
+
+  PostgreSQL performance (require container restart):
+    container.max_connections       Max database connections (default: 100)
+    container.shared_buffers        Shared buffer size (default: 256MB)
+    container.work_mem              Work memory per operation (default: 16MB)
+    container.effective_cache_size  Planner cache size hint (default: 1GB)
+    container.max_parallel_workers  Max parallel workers (default: 4)
+    container.max_worker_processes  Max worker processes (default: 4)
+    container.max_parallel_per_gather  Workers per gather (default: 2)
+
+  Import:
+    import.workers                  Default import workers (default: CPU count, max 3)`,
 		RunE: runConfig,
 	}
 
