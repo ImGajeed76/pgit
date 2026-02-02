@@ -44,7 +44,11 @@ Global settings:
     container.max_parallel_per_gather  Workers per gather (default: 2)
 
   Import:
-    import.workers                  Default import workers (default: CPU count, max 3)`,
+    import.workers                  Default import workers (default: CPU count, max 3)
+
+  User identity (used as default for new repositories):
+    user.name                       Default author name
+    user.email                      Default author email`,
 		RunE: runConfig,
 	}
 

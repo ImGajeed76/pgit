@@ -2,7 +2,9 @@ package repo
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/imgajeed76/pgit/v2/internal/config"
@@ -36,16 +38,22 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 	if authorName == "" {
 		authorName = r.Config.GetUserName()
 	}
-	if authorName == "" {
-		return nil, &MissingConfigError{Field: "user.name"}
-	}
 
 	authorEmail := opts.AuthorEmail
 	if authorEmail == "" {
 		authorEmail = r.Config.GetUserEmail()
 	}
+
+	// Check for missing config
+	var missingFields []string
+	if authorName == "" {
+		missingFields = append(missingFields, "user.name")
+	}
 	if authorEmail == "" {
-		return nil, &MissingConfigError{Field: "user.email"}
+		missingFields = append(missingFields, "user.email")
+	}
+	if len(missingFields) > 0 {
+		return nil, &MissingConfigError{Fields: missingFields}
 	}
 
 	// Get timestamp
@@ -208,11 +216,18 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 	return commit, nil
 }
 
-// MissingConfigError indicates a missing configuration value
+// MissingConfigError indicates missing configuration values
 type MissingConfigError struct {
-	Field string
+	Fields []string
 }
 
 func (e *MissingConfigError) Error() string {
-	return "missing configuration: " + e.Field + "\n\nPlease set it with:\n  pgit config " + e.Field + " \"Your Value\""
+	var sb strings.Builder
+	sb.WriteString("missing configuration: ")
+	sb.WriteString(strings.Join(e.Fields, ", "))
+	sb.WriteString("\n\nPlease set with:\n")
+	for _, field := range e.Fields {
+		sb.WriteString(fmt.Sprintf("  pgit config %s \"Your Value\"\n", field))
+	}
+	return strings.TrimSuffix(sb.String(), "\n")
 }

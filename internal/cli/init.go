@@ -3,8 +3,11 @@ package cli
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
+	"github.com/imgajeed76/pgit/v2/internal/config"
 	"github.com/imgajeed76/pgit/v2/internal/repo"
 	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
 	"github.com/imgajeed76/pgit/v2/internal/util"
@@ -72,15 +75,83 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Container runtime: %s\n", styles.Cyan(string(r.Runtime)))
 	fmt.Printf("  Local database: %s\n", styles.Cyan(r.Config.Core.LocalDB))
 
-	// Check if user config is set
-	if r.Config.GetUserName() == "" || r.Config.GetUserEmail() == "" {
+	// Try to copy user config from pgit global or git config
+	name, email, source := getUserConfigWithFallback()
+	configUpdated := false
+	if name != "" && r.Config.User.Name == "" {
+		r.Config.User.Name = name
+		configUpdated = true
+	}
+	if email != "" && r.Config.User.Email == "" {
+		r.Config.User.Email = email
+		configUpdated = true
+	}
+	if configUpdated {
+		_ = r.Config.Save(r.Root)
+	}
+
+	// Show user config status
+	if r.Config.GetUserName() != "" && r.Config.GetUserEmail() != "" {
+		if source != "" {
+			fmt.Printf("Using %s config: user.name %q, user.email %q\n", source, r.Config.GetUserName(), r.Config.GetUserEmail())
+		}
+	} else {
 		fmt.Println()
-		fmt.Println(styles.Warningf("Warning: User identity not configured"))
-		fmt.Println()
-		fmt.Println("Set your identity with:")
-		fmt.Println("  pgit config user.name \"Your Name\"")
-		fmt.Println("  pgit config user.email \"your@email.com\"")
+		fmt.Println(styles.Mute("Tip: Set user config with:"))
+		if r.Config.GetUserName() == "" {
+			fmt.Println(styles.Mute("  pgit config user.name \"Your Name\""))
+		}
+		if r.Config.GetUserEmail() == "" {
+			fmt.Println(styles.Mute("  pgit config user.email \"your@email.com\""))
+		}
 	}
 
 	return nil
+}
+
+// getUserConfigWithFallback returns user name/email from pgit global config or git config.
+// Returns the values and the source ("pgit global", "git", "pgit global and git", or "").
+func getUserConfigWithFallback() (name, email, source string) {
+	// 1. Try pgit global config first
+	globalCfg, err := config.LoadGlobal()
+	if err == nil {
+		if globalCfg.User.Name != "" {
+			name = globalCfg.User.Name
+			source = "pgit global"
+		}
+		if globalCfg.User.Email != "" {
+			email = globalCfg.User.Email
+			if source == "" {
+				source = "pgit global"
+			}
+		}
+	}
+
+	// 2. Fall back to git config for missing values
+	if name == "" {
+		if out, err := exec.Command("git", "config", "--global", "user.name").Output(); err == nil {
+			name = strings.TrimSpace(string(out))
+			if name != "" {
+				if source == "" {
+					source = "git"
+				} else {
+					source = "pgit global and git"
+				}
+			}
+		}
+	}
+	if email == "" {
+		if out, err := exec.Command("git", "config", "--global", "user.email").Output(); err == nil {
+			email = strings.TrimSpace(string(out))
+			if email != "" {
+				if source == "" {
+					source = "git"
+				} else if source == "pgit global" {
+					source = "pgit global and git"
+				}
+			}
+		}
+	}
+
+	return name, email, source
 }

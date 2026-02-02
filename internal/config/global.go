@@ -12,8 +12,15 @@ import (
 // GlobalConfig represents global pgit settings stored in user's config directory
 // These settings affect all repositories and the local container
 type GlobalConfig struct {
-	Container ContainerConfig `toml:"container"`
-	Import    ImportConfig    `toml:"import"`
+	Container ContainerConfig  `toml:"container"`
+	Import    ImportConfig     `toml:"import"`
+	User      GlobalUserConfig `toml:"user"`
+}
+
+// GlobalUserConfig contains default user identity settings
+type GlobalUserConfig struct {
+	Name  string `toml:"name"`
+	Email string `toml:"email"`
 }
 
 // ContainerConfig contains Docker/Podman container settings
@@ -184,6 +191,10 @@ func (c *GlobalConfig) GetValue(key string) (string, bool) {
 		return strconv.Itoa(c.Container.MaxParallelPerGather), true
 	case "import.workers":
 		return strconv.Itoa(c.Import.Workers), true
+	case "user.name":
+		return c.User.Name, true
+	case "user.email":
+		return c.User.Email, true
 	default:
 		return "", false
 	}
@@ -256,6 +267,10 @@ func (c *GlobalConfig) SetValue(key, value string) error {
 			return os.ErrInvalid
 		}
 		c.Import.Workers = workers
+	case "user.name":
+		c.User.Name = value
+	case "user.email":
+		c.User.Email = value
 	default:
 		return os.ErrNotExist
 	}
@@ -276,5 +291,7 @@ func ListGlobalKeys() []string {
 		"container.max_worker_processes",
 		"container.max_parallel_per_gather",
 		"import.workers",
+		"user.name",
+		"user.email",
 	}
 }
