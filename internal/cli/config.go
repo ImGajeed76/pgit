@@ -29,26 +29,7 @@ Examples:
   pgit config --global container.shm_size 512m  # Set global value
 
 Global settings:
-  Container:
-    container.shm_size              Shared memory for PostgreSQL (default: 256m)
-    container.port                  PostgreSQL port (default: 5433)
-    container.image                 Custom pg-xpatch image (empty = default)
-
-  PostgreSQL performance (require container restart):
-    container.max_connections       Max database connections (default: 100)
-    container.shared_buffers        Shared buffer size (default: 256MB)
-    container.work_mem              Work memory per operation (default: 16MB)
-    container.effective_cache_size  Planner cache size hint (default: 1GB)
-    container.max_parallel_workers  Max parallel workers (default: 4)
-    container.max_worker_processes  Max worker processes (default: 4)
-    container.max_parallel_per_gather  Workers per gather (default: 2)
-
-  Import:
-    import.workers                  Default import workers (default: CPU count, max 3)
-
-  User identity (used as default for new repositories):
-    user.name                       Default author name
-    user.email                      Default author email`,
+` + config.GenerateHelpText(),
 		RunE: runConfig,
 	}
 
@@ -62,11 +43,54 @@ func runConfig(cmd *cobra.Command, args []string) error {
 	listAll, _ := cmd.Flags().GetBool("list")
 	global, _ := cmd.Flags().GetBool("global")
 
+	// If no args and no flags, show all config (global + local if in repo)
+	if len(args) == 0 && !listAll && !global {
+		return showAllConfig()
+	}
+
 	if global {
 		return runGlobalConfig(cmd, args, listAll)
 	}
 
 	return runRepoConfig(cmd, args, listAll)
+}
+
+func showAllConfig() error {
+	// Load and show global config
+	globalCfg, err := config.LoadGlobal()
+	if err != nil {
+		return fmt.Errorf("failed to load global config: %w", err)
+	}
+
+	fmt.Println(styles.Boldf("Global config:"))
+	for _, key := range config.ListGlobalKeys() {
+		if value, ok := globalCfg.GetValue(key); ok && value != "" {
+			fmt.Printf("  %s = %s\n", key, value)
+		}
+	}
+
+	// Try to load local config if in a repo
+	root, err := util.FindRepoRoot()
+	if err == nil {
+		localCfg, err := config.Load(root)
+		if err == nil {
+			fmt.Println()
+			fmt.Println(styles.Boldf("Local config:"))
+			for _, key := range config.ListLocalKeys() {
+				if value, ok := localCfg.GetValue(key); ok && value != "" {
+					fmt.Printf("  %s = %s\n", key, value)
+				}
+			}
+			// Show read-only fields
+			fmt.Printf("  %s = %s %s\n", "core.local_db", localCfg.Core.LocalDB, styles.Mute("(read-only)"))
+			// Show remotes
+			for name, remote := range localCfg.Remotes {
+				fmt.Printf("  remote.%s.url = %s\n", name, remote.URL)
+			}
+		}
+	}
+
+	return nil
 }
 
 func runGlobalConfig(cmd *cobra.Command, args []string, listAll bool) error {

@@ -17,13 +17,13 @@ type Config struct {
 
 // CoreConfig contains core repository settings
 type CoreConfig struct {
-	LocalDB string `toml:"local_db"` // Local database name (e.g., "pgit_a1b2c3d4")
+	LocalDB string `toml:"local_db" config:"core.local_db" desc:"Local database name" readonly:"true"`
 }
 
 // UserConfig contains user information for commits
 type UserConfig struct {
-	Name  string `toml:"name"`
-	Email string `toml:"email"`
+	Name  string `toml:"name" config:"user.name" desc:"Author name for commits"`
+	Email string `toml:"email" config:"user.email" desc:"Author email for commits"`
 }
 
 // RemoteConfig contains remote repository settings
@@ -97,6 +97,16 @@ func (c *Config) RemoveRemote(name string) bool {
 		return true
 	}
 	return false
+}
+
+// GetValue returns a config value by key (uses reflection)
+func (c *Config) GetValue(key string) (string, bool) {
+	return getFieldValue(c, key)
+}
+
+// SetValue sets a config value by key (uses reflection with validation)
+func (c *Config) SetValue(key, value string) error {
+	return setFieldValue(c, key, value)
 }
 
 // GetUserName returns the user name from config or environment

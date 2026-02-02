@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 
 	"github.com/BurntSushi/toml"
 )
@@ -19,29 +18,29 @@ type GlobalConfig struct {
 
 // GlobalUserConfig contains default user identity settings
 type GlobalUserConfig struct {
-	Name  string `toml:"name"`
-	Email string `toml:"email"`
+	Name  string `toml:"name" config:"user.name" desc:"Default author name"`
+	Email string `toml:"email" config:"user.email" desc:"Default author email"`
 }
 
 // ContainerConfig contains Docker/Podman container settings
 type ContainerConfig struct {
-	ShmSize string `toml:"shm_size"` // Shared memory size (default: 256m)
-	Port    int    `toml:"port"`     // PostgreSQL port (default: 5433)
-	Image   string `toml:"image"`    // Custom image (default: ghcr.io/imgajeed76/pg-xpatch:latest)
+	ShmSize string `toml:"shm_size" config:"container.shm_size" default:"256m" desc:"Shared memory for PostgreSQL"`
+	Port    int    `toml:"port" config:"container.port" default:"5433" min:"1" max:"65535" desc:"PostgreSQL port"`
+	Image   string `toml:"image" config:"container.image" desc:"Custom pg-xpatch image (empty = default)"`
 
 	// PostgreSQL performance settings (passed as -c flags to postgres)
-	MaxConnections       int    `toml:"max_connections"`         // Default: 200
-	SharedBuffers        string `toml:"shared_buffers"`          // Default: 2GB
-	WorkMem              string `toml:"work_mem"`                // Default: 64MB
-	EffectiveCacheSize   string `toml:"effective_cache_size"`    // Default: 8GB
-	MaxParallelWorkers   int    `toml:"max_parallel_workers"`    // Default: 8
-	MaxWorkerProcesses   int    `toml:"max_worker_processes"`    // Default: 8
-	MaxParallelPerGather int    `toml:"max_parallel_per_gather"` // Default: 4
+	MaxConnections       int    `toml:"max_connections" config:"container.max_connections" default:"100" min:"10" max:"1000" desc:"Max database connections"`
+	SharedBuffers        string `toml:"shared_buffers" config:"container.shared_buffers" default:"256MB" desc:"Shared buffer size"`
+	WorkMem              string `toml:"work_mem" config:"container.work_mem" default:"16MB" desc:"Work memory per operation"`
+	EffectiveCacheSize   string `toml:"effective_cache_size" config:"container.effective_cache_size" default:"1GB" desc:"Planner cache size hint"`
+	MaxParallelWorkers   int    `toml:"max_parallel_workers" config:"container.max_parallel_workers" default:"4" min:"0" max:"64" desc:"Max parallel workers"`
+	MaxWorkerProcesses   int    `toml:"max_worker_processes" config:"container.max_worker_processes" default:"4" min:"1" max:"64" desc:"Max worker processes"`
+	MaxParallelPerGather int    `toml:"max_parallel_per_gather" config:"container.max_parallel_per_gather" default:"2" min:"0" max:"16" desc:"Workers per gather"`
 }
 
 // ImportConfig contains default import settings
 type ImportConfig struct {
-	Workers int `toml:"workers"` // Default number of workers (default: CPU count, max 3)
+	Workers int `toml:"workers" config:"import.workers" default:"3" min:"1" max:"16" desc:"Default import workers"`
 }
 
 // DefaultGlobalConfig returns a new global config with default values
@@ -166,132 +165,17 @@ func (c *GlobalConfig) Save() error {
 	return encoder.Encode(c)
 }
 
-// GetGlobalValue returns a global config value by key
+// GetValue returns a global config value by key (uses reflection)
 func (c *GlobalConfig) GetValue(key string) (string, bool) {
-	switch key {
-	case "container.shm_size", "container.shmsize":
-		return c.Container.ShmSize, true
-	case "container.port":
-		return strconv.Itoa(c.Container.Port), true
-	case "container.image":
-		return c.Container.Image, true
-	case "container.max_connections":
-		return strconv.Itoa(c.Container.MaxConnections), true
-	case "container.shared_buffers":
-		return c.Container.SharedBuffers, true
-	case "container.work_mem":
-		return c.Container.WorkMem, true
-	case "container.effective_cache_size":
-		return c.Container.EffectiveCacheSize, true
-	case "container.max_parallel_workers":
-		return strconv.Itoa(c.Container.MaxParallelWorkers), true
-	case "container.max_worker_processes":
-		return strconv.Itoa(c.Container.MaxWorkerProcesses), true
-	case "container.max_parallel_per_gather":
-		return strconv.Itoa(c.Container.MaxParallelPerGather), true
-	case "import.workers":
-		return strconv.Itoa(c.Import.Workers), true
-	case "user.name":
-		return c.User.Name, true
-	case "user.email":
-		return c.User.Email, true
-	default:
-		return "", false
-	}
+	return getFieldValue(c, key)
 }
 
-// SetGlobalValue sets a global config value by key
+// SetValue sets a global config value by key (uses reflection with validation)
 func (c *GlobalConfig) SetValue(key, value string) error {
-	switch key {
-	case "container.shm_size", "container.shmsize":
-		c.Container.ShmSize = value
-	case "container.port":
-		port, err := strconv.Atoi(value)
-		if err != nil {
-			return err
-		}
-		if port < 1 || port > 65535 {
-			return os.ErrInvalid
-		}
-		c.Container.Port = port
-	case "container.image":
-		c.Container.Image = value
-	case "container.max_connections":
-		v, err := strconv.Atoi(value)
-		if err != nil {
-			return err
-		}
-		if v < 10 || v > 1000 {
-			return os.ErrInvalid
-		}
-		c.Container.MaxConnections = v
-	case "container.shared_buffers":
-		c.Container.SharedBuffers = value
-	case "container.work_mem":
-		c.Container.WorkMem = value
-	case "container.effective_cache_size":
-		c.Container.EffectiveCacheSize = value
-	case "container.max_parallel_workers":
-		v, err := strconv.Atoi(value)
-		if err != nil {
-			return err
-		}
-		if v < 0 || v > 64 {
-			return os.ErrInvalid
-		}
-		c.Container.MaxParallelWorkers = v
-	case "container.max_worker_processes":
-		v, err := strconv.Atoi(value)
-		if err != nil {
-			return err
-		}
-		if v < 1 || v > 64 {
-			return os.ErrInvalid
-		}
-		c.Container.MaxWorkerProcesses = v
-	case "container.max_parallel_per_gather":
-		v, err := strconv.Atoi(value)
-		if err != nil {
-			return err
-		}
-		if v < 0 || v > 16 {
-			return os.ErrInvalid
-		}
-		c.Container.MaxParallelPerGather = v
-	case "import.workers":
-		workers, err := strconv.Atoi(value)
-		if err != nil {
-			return err
-		}
-		if workers < 1 || workers > 16 {
-			return os.ErrInvalid
-		}
-		c.Import.Workers = workers
-	case "user.name":
-		c.User.Name = value
-	case "user.email":
-		c.User.Email = value
-	default:
-		return os.ErrNotExist
-	}
-	return nil
+	return setFieldValue(c, key, value)
 }
 
-// ListGlobalKeys returns all available global config keys
+// ListGlobalKeys returns all available global config keys (uses reflection)
 func ListGlobalKeys() []string {
-	return []string{
-		"container.shm_size",
-		"container.port",
-		"container.image",
-		"container.max_connections",
-		"container.shared_buffers",
-		"container.work_mem",
-		"container.effective_cache_size",
-		"container.max_parallel_workers",
-		"container.max_worker_processes",
-		"container.max_parallel_per_gather",
-		"import.workers",
-		"user.name",
-		"user.email",
-	}
+	return ListKeys()
 }
