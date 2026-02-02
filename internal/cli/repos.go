@@ -10,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/imgajeed76/pgit/v2/internal/config"
 	"github.com/imgajeed76/pgit/v2/internal/container"
 	"github.com/imgajeed76/pgit/v2/internal/db"
 	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v2/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -34,6 +36,7 @@ This command works from any directory.`,
 	cmd.AddCommand(
 		newReposListCmd(),
 		newReposCleanupCmd(),
+		newReposDeleteCmd(),
 	)
 
 	return cmd
@@ -69,6 +72,37 @@ This helps clean up orphaned databases from deleted projects.`,
 
 	cmd.Flags().Bool("dry-run", false, "Show what would be removed without actually removing")
 	cmd.Flags().Bool("unknown", false, "Also remove databases with no stored path")
+
+	return cmd
+}
+
+func newReposDeleteCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "delete [path|database]",
+		Short: "Delete a pgit repository",
+		Long: `Delete a pgit repository by dropping its database and removing the .pgit folder.
+
+This is a destructive operation that cannot be undone. Your project files
+will NOT be deleted - only the pgit data (.pgit folder and database).
+
+The argument is auto-detected:
+  - Starts with "pgit_": treated as database name
+  - Otherwise: treated as path
+
+When deleting by database name and the path is not stored, use --search
+to find the .pgit folder on the filesystem.
+
+Examples:
+  pgit repos delete --force              # Delete repo in current directory
+  pgit repos delete --force ./my-project # Delete repo at path
+  pgit repos delete --force pgit_abc123  # Delete by database name
+  pgit repos delete --force --search pgit_abc123  # Search for .pgit folder`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runReposDelete,
+	}
+
+	cmd.Flags().Bool("force", false, "Required to confirm deletion")
+	cmd.Flags().Bool("search", false, "Search filesystem for .pgit folder (when deleting by database name)")
 
 	return cmd
 }
@@ -213,6 +247,150 @@ func runReposCleanup(cmd *cobra.Command, args []string) error {
 	fmt.Println(styles.Successf("Cleanup complete."))
 
 	return nil
+}
+
+func runReposDelete(cmd *cobra.Command, args []string) error {
+	force, _ := cmd.Flags().GetBool("force")
+	searchFS, _ := cmd.Flags().GetBool("search")
+
+	if !force {
+		return fmt.Errorf("this will permanently delete the repository\n\nUse --force to confirm")
+	}
+
+	var dbName string
+	var repoPath string
+
+	if len(args) == 0 {
+		// No argument: use current directory
+		root, err := util.FindRepoRoot()
+		if err != nil {
+			return fmt.Errorf("not in a pgit repository (use a path or database name as argument)")
+		}
+		repoPath = root
+
+		// Load config to get database name
+		cfg, err := config.Load(root)
+		if err != nil {
+			return fmt.Errorf("failed to load config: %w", err)
+		}
+		dbName = cfg.Core.LocalDB
+	} else {
+		arg := args[0]
+
+		if strings.HasPrefix(arg, "pgit_") {
+			// Argument is a database name
+			dbName = arg
+
+			// Try to find the path from database metadata
+			repoPath = getPathFromDatabase(dbName)
+
+			// If not found and --search flag is set, search filesystem
+			if repoPath == "" && searchFS {
+				fmt.Println("Searching for repository on filesystem...")
+				repoPath = findWorkingDir(dbName, "", 0)
+			}
+		} else {
+			// Argument is a path
+			absPath, err := filepath.Abs(arg)
+			if err != nil {
+				return fmt.Errorf("invalid path: %w", err)
+			}
+
+			// Check path exists
+			if _, err := os.Stat(absPath); err != nil {
+				return fmt.Errorf("path not found: %s", absPath)
+			}
+
+			// Check it's a pgit repo
+			pgitDir := filepath.Join(absPath, ".pgit")
+			if _, err := os.Stat(pgitDir); err != nil {
+				return fmt.Errorf("not a pgit repository: %s", absPath)
+			}
+
+			repoPath = absPath
+
+			// Load config to get database name
+			cfg, err := config.Load(absPath)
+			if err != nil {
+				return fmt.Errorf("failed to load config: %w", err)
+			}
+			dbName = cfg.Core.LocalDB
+		}
+	}
+
+	// Print what we're about to delete
+	fmt.Println("Deleting repository...")
+	fmt.Printf("  Database: %s\n", styles.Cyan(dbName))
+	if repoPath != "" {
+		fmt.Printf("  Path: %s\n", repoPath)
+	} else {
+		fmt.Printf("  Path: %s\n", styles.Mute("(unknown)"))
+	}
+	fmt.Println()
+
+	// Drop database
+	runtime := container.DetectRuntime()
+	if runtime == container.RuntimeNone {
+		return fmt.Errorf("no container runtime found")
+	}
+
+	fmt.Printf("Dropping database... ")
+	if err := container.DropDatabase(runtime, dbName); err != nil {
+		fmt.Println(styles.Errorf("FAILED"))
+		fmt.Printf("  %v\n", err)
+	} else {
+		fmt.Println(styles.Successf("OK"))
+	}
+
+	// Remove .pgit folder
+	if repoPath != "" {
+		pgitDir := filepath.Join(repoPath, ".pgit")
+		if _, err := os.Stat(pgitDir); err == nil {
+			fmt.Printf("Removing .pgit folder... ")
+			if err := os.RemoveAll(pgitDir); err != nil {
+				fmt.Println(styles.Errorf("FAILED"))
+				fmt.Printf("  %v\n", err)
+			} else {
+				fmt.Println(styles.Successf("OK"))
+			}
+		}
+	}
+
+	fmt.Println()
+	fmt.Println(styles.Successf("Repository deleted."))
+
+	return nil
+}
+
+// getPathFromDatabase retrieves the stored path from a database's metadata
+func getPathFromDatabase(dbName string) string {
+	runtime := container.DetectRuntime()
+	if runtime == container.RuntimeNone {
+		return ""
+	}
+
+	if !container.IsContainerRunning(runtime) {
+		return ""
+	}
+
+	port, err := container.GetContainerPort(runtime)
+	if err != nil {
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	connURL := container.LocalConnectionURL(port, dbName)
+
+	// Use lightweight single connection instead of pool for quick metadata lookup
+	repoDb, err := db.ConnectLite(ctx, connURL)
+	if err != nil {
+		return ""
+	}
+	defer repoDb.Close()
+
+	return repoDb.GetRepoPath(ctx)
 }
 
 // gatherRepoInfo collects information about all pgit databases

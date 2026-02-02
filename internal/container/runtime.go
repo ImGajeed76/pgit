@@ -334,12 +334,19 @@ func EnsureDatabase(runtime Runtime, database string) error {
 	return createCmd.Run()
 }
 
-// DropDatabase drops a database
+// DropDatabase drops a database, terminating any active connections first
 func DropDatabase(runtime Runtime, database string) error {
 	if runtime == RuntimeNone {
 		return fmt.Errorf("no container runtime available")
 	}
 
+	// First, terminate all connections to this database
+	terminateCmd := exec.Command(string(runtime), "exec", ContainerName,
+		"psql", "-U", "postgres", "-c",
+		fmt.Sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()", database))
+	_ = terminateCmd.Run() // Ignore errors - database might not exist or have no connections
+
+	// Now drop the database
 	cmd := exec.Command(string(runtime), "exec", ContainerName,
 		"psql", "-U", "postgres", "-c",
 		fmt.Sprintf("DROP DATABASE IF EXISTS %s", database))

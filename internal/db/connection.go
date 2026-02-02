@@ -20,7 +20,7 @@ type DB struct {
 // Global database instance for convenience
 var defaultDB *DB
 
-// Connect establishes a connection to the database
+// Connect establishes a connection to the database with a full connection pool
 func Connect(ctx context.Context, url string) (*DB, error) {
 	config, err := pgxpool.ParseConfig(url)
 	if err != nil {
@@ -32,6 +32,39 @@ func Connect(ctx context.Context, url string) (*DB, error) {
 	config.MinConns = 4
 	config.MaxConnLifetime = time.Hour
 	config.MaxConnIdleTime = 30 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+
+	// Test connection
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	db := &DB{
+		pool: pool,
+		url:  url,
+	}
+
+	return db, nil
+}
+
+// ConnectLite establishes a lightweight connection (single connection, no pool)
+// Use this for quick operations like metadata lookups
+func ConnectLite(ctx context.Context, url string) (*DB, error) {
+	config, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("invalid connection URL: %w", err)
+	}
+
+	// Minimal pool - just 1 connection for quick operations
+	config.MaxConns = 1
+	config.MinConns = 0
+	config.MaxConnLifetime = time.Minute
+	config.MaxConnIdleTime = 10 * time.Second
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
