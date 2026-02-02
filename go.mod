@@ -1,4 +1,4 @@
-module github.com/imgajeed76/pgit
+module github.com/imgajeed76/pgit/v2
 
 go 1.24.11
 

@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/imgajeed76/pgit/internal/util"
+	"github.com/imgajeed76/pgit/v2/internal/util"
 )
 
 // MergeState tracks the state of an in-progress merge/pull operation

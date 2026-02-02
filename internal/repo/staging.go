@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/imgajeed76/pgit/internal/config"
-	"github.com/imgajeed76/pgit/internal/db"
-	"github.com/imgajeed76/pgit/internal/util"
+	"github.com/imgajeed76/pgit/v2/internal/config"
+	"github.com/imgajeed76/pgit/v2/internal/db"
+	"github.com/imgajeed76/pgit/v2/internal/util"
 )
 
 // FileChange represents a change to a file
