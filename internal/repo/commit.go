@@ -74,7 +74,7 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 	// First, get the current tree to carry forward unchanged files
 	var currentTree []*db.Blob
 	if headCommit != nil {
-		currentTree, err = r.DB.GetTreeAtCommit(ctx, headCommit.ID)
+		currentTree, err = r.DB.GetTreeMetadataAtCommit(ctx, headCommit.ID)
 		if err != nil {
 			return nil, err
 		}
