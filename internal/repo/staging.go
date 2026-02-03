@@ -368,3 +368,14 @@ func (r *Repository) UnstageAll() error {
 	idx.Clear()
 	return idx.Save(r.Root)
 }
+
+// StageDelete stages a file deletion
+func (r *Repository) StageDelete(path string) error {
+	idx, err := r.LoadIndex()
+	if err != nil {
+		return err
+	}
+
+	idx.Delete(path)
+	return idx.Save(r.Root)
+}

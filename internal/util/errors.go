@@ -207,7 +207,7 @@ func CommitNotFoundError(ref string) *PgitError {
 func MissingArgumentError(argName, example string) *PgitError {
 	e := NewError(fmt.Sprintf("Missing required argument: <%s>", argName))
 	if example != "" {
-		e.WithSuggestion(example)
+		e = e.WithSuggestion(example)
 	}
 	return e
 }

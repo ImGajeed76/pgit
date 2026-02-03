@@ -354,8 +354,11 @@ func runSQL(cmd *cobra.Command, args []string) error {
 	if isWrite && !allowWrite {
 		fmt.Println(styles.Errorf("Error: Write operations require --write flag"))
 		fmt.Println()
-		fmt.Println("This is a safety measure to prevent accidental data modification.")
-		fmt.Println("If you're sure, run again with: pgit sql --write \"" + query + "\"")
+		fmt.Println(styles.WarningText("WARNING: Direct SQL writes bypass pgit's safety checks and can"))
+		fmt.Println(styles.WarningText("corrupt your repository! Only use if you know what you're doing."))
+		fmt.Println()
+		fmt.Println("If you're sure, run again with:")
+		fmt.Printf("  %s\n", styles.Cyan("pgit sql --write \""+query+"\""))
 		return fmt.Errorf("write operation not allowed")
 	}
 

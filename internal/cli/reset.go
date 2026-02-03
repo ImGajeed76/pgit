@@ -108,7 +108,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 		targetCommit = head.ID
 	} else {
 		// Check if first arg looks like a commit ref
-		commitID, isCommit := tryResolveCommit(ctx, r, args[0])
+		commitID, refResult := tryResolveCommit(ctx, r, args[0])
 
 		// Handle -- separator
 		dashDashIdx := -1
@@ -122,8 +122,13 @@ func runReset(cmd *cobra.Command, args []string) error {
 		if dashDashIdx >= 0 {
 			// Explicit separator: before -- is commit, after is paths
 			if dashDashIdx > 0 {
-				commitID, isCommit = tryResolveCommit(ctx, r, args[0])
-				if !isCommit {
+				commitID, refResult = tryResolveCommit(ctx, r, args[0])
+				if refResult == commitRefInvalid {
+					return util.NewError(fmt.Sprintf("Invalid commit reference: %s", args[0])).
+						WithMessage("Cannot resolve this commit reference").
+						WithSuggestion("pgit log --oneline  # View available commits")
+				}
+				if refResult == commitRefNotARef {
 					return fmt.Errorf("invalid commit: %s", args[0])
 				}
 				targetCommit = commitID
@@ -139,10 +144,16 @@ func runReset(cmd *cobra.Command, args []string) error {
 				targetCommit = head.ID
 			}
 			paths = args[dashDashIdx+1:]
-		} else if isCommit {
-			// First arg is a commit
+		} else if refResult == commitRefResolved {
+			// First arg is a valid commit
 			targetCommit = commitID
 			paths = args[1:]
+		} else if refResult == commitRefInvalid {
+			// Looks like a commit ref but couldn't resolve (e.g., HEAD~99)
+			return util.NewError(fmt.Sprintf("Invalid commit reference: %s", args[0])).
+				WithMessage("This looks like a commit reference but cannot be resolved").
+				WithCause("The commit may not exist or you're trying to go back too far in history").
+				WithSuggestion("pgit log --oneline  # View available commits")
 		} else {
 			// First arg is not a commit, treat all as paths (unstage mode)
 			head, err := r.DB.GetHeadCommit(ctx)
@@ -167,16 +178,32 @@ func runReset(cmd *cobra.Command, args []string) error {
 	return resetToCommit(ctx, r, targetCommit, mode)
 }
 
+// commitRefResult represents the result of trying to resolve a commit reference
+type commitRefResult int
+
+const (
+	commitRefNotARef  commitRefResult = iota // Doesn't look like a commit ref (probably a path)
+	commitRefInvalid                         // Looks like a commit ref but invalid (e.g., HEAD~99)
+	commitRefResolved                        // Successfully resolved to a commit
+)
+
 // tryResolveCommit attempts to resolve a string to a commit ID
-// Returns the commit ID and true if found, empty string and false if not
-func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (string, bool) {
+// Returns the commit ID and a result indicating what happened
+func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (string, commitRefResult) {
+	// Check if this looks like a commit reference pattern
+	looksLikeCommitRef := ref == "HEAD" ||
+		strings.HasPrefix(ref, "HEAD~") ||
+		strings.HasPrefix(ref, "HEAD^") ||
+		(len(ref) >= 7 && isHexOrULID(ref)) || // Short commit IDs
+		!strings.Contains(ref, "/") && !strings.Contains(ref, ".") // Doesn't look like a path
+
 	// Special refs
 	if ref == "HEAD" {
 		head, err := r.DB.GetHeadCommit(ctx)
 		if err != nil || head == nil {
-			return "", false
+			return "", commitRefInvalid
 		}
-		return head.ID, true
+		return head.ID, commitRefResolved
 	}
 
 	// HEAD~N syntax
@@ -187,37 +214,78 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 		}
 		head, err := r.DB.GetHeadCommit(ctx)
 		if err != nil || head == nil {
-			return "", false
+			return "", commitRefInvalid
 		}
 		// Walk back n commits
 		commits, err := r.DB.GetCommitLogFrom(ctx, head.ID, n+1)
 		if err != nil || len(commits) <= n {
-			return "", false
+			// This looks like a commit ref but we can't go back that far
+			return "", commitRefInvalid
 		}
-		return commits[n].ID, true
+		return commits[n].ID, commitRefResolved
+	}
+
+	// HEAD^ syntax
+	if strings.HasPrefix(ref, "HEAD^") {
+		n := strings.Count(ref, "^")
+		head, err := r.DB.GetHeadCommit(ctx)
+		if err != nil || head == nil {
+			return "", commitRefInvalid
+		}
+		commits, err := r.DB.GetCommitLogFrom(ctx, head.ID, n+1)
+		if err != nil || len(commits) <= n {
+			return "", commitRefInvalid
+		}
+		return commits[n].ID, commitRefResolved
 	}
 
 	// Try exact match first
 	commit, err := r.DB.GetCommit(ctx, ref)
 	if err == nil && commit != nil {
-		return commit.ID, true
+		return commit.ID, commitRefResolved
 	}
 
 	// Try partial match (short ID)
 	commits, err := r.DB.GetAllCommits(ctx)
 	if err != nil {
-		return "", false
+		if looksLikeCommitRef {
+			return "", commitRefInvalid
+		}
+		return "", commitRefNotARef
 	}
 
 	refUpper := strings.ToUpper(ref)
 	for _, c := range commits {
 		// Match suffix (short ID uses last 7 chars) or prefix
 		if strings.HasSuffix(c.ID, refUpper) || strings.HasPrefix(c.ID, refUpper) {
-			return c.ID, true
+			return c.ID, commitRefResolved
 		}
 	}
 
-	return "", false
+	// If it doesn't look like a path (no / or . extension), treat as invalid ref
+	// This prevents treating typos like "nonexistent-ref" as filenames
+	if looksLikeCommitRef {
+		return "", commitRefInvalid
+	}
+
+	// Check if a file/directory with this name exists - if so, treat as path
+	absPath := r.AbsPath(ref)
+	if _, err := os.Stat(absPath); err == nil {
+		return "", commitRefNotARef
+	}
+
+	// Doesn't exist as file and doesn't look like a path - likely a typo'd ref
+	return "", commitRefInvalid
+}
+
+// isHexOrULID checks if a string looks like a commit ID (hex or ULID chars)
+func isHexOrULID(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+			return false
+		}
+	}
+	return true
 }
 
 // unstageAll removes all files from staging area

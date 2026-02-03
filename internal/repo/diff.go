@@ -28,6 +28,7 @@ type DiffResult struct {
 	OldContent string
 	NewContent string
 	Hunks      []DiffHunk
+	IsBinary   bool // True if this is a binary file
 }
 
 // DiffHunk represents a single hunk in a diff
@@ -96,10 +97,13 @@ func (r *Repository) Diff(ctx context.Context, opts DiffOptions) ([]DiffResult, 
 			continue
 		}
 
+		var oldBytes, newBytes []byte
+
 		// Get old content (from database)
 		if change.Status != StatusNew {
 			blob, err := r.getFileContent(ctx, change.Path)
 			if err == nil && blob != nil && blob.Content != nil {
+				oldBytes = blob.Content
 				result.OldContent = string(blob.Content)
 			}
 		}
@@ -109,8 +113,17 @@ func (r *Repository) Diff(ctx context.Context, opts DiffOptions) ([]DiffResult, 
 			absPath := r.AbsPath(change.Path)
 			content, err := os.ReadFile(absPath)
 			if err == nil {
+				newBytes = content
 				result.NewContent = string(content)
 			}
+		}
+
+		// Check if either content is binary
+		if isBinary(oldBytes) || isBinary(newBytes) {
+			result.IsBinary = true
+			// Don't generate hunks for binary files
+			results = append(results, result)
+			continue
 		}
 
 		// Generate hunks
@@ -120,6 +133,28 @@ func (r *Repository) Diff(ctx context.Context, opts DiffOptions) ([]DiffResult, 
 	}
 
 	return results, nil
+}
+
+// isBinary checks if content appears to be binary (contains null bytes or non-text chars)
+func isBinary(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+
+	// Check first 8000 bytes (like Git does)
+	checkLen := len(data)
+	if checkLen > 8000 {
+		checkLen = 8000
+	}
+
+	for i := 0; i < checkLen; i++ {
+		// Null byte is a strong indicator of binary
+		if data[i] == 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // getFileContent gets the content of a file at HEAD
@@ -273,6 +308,22 @@ func FormatDiff(result DiffResult, noColor bool) string {
 		sb.WriteString(header + "\n")
 	} else {
 		sb.WriteString(styles.DiffFileHeader.Render(header) + "\n")
+	}
+
+	// Handle binary files
+	if result.IsBinary {
+		binaryMsg := fmt.Sprintf("Binary files a/%s and b/%s differ", result.Path, result.Path)
+		if result.Status == StatusNew {
+			binaryMsg = fmt.Sprintf("Binary file b/%s (new)", result.Path)
+		} else if result.Status == StatusDeleted {
+			binaryMsg = fmt.Sprintf("Binary file a/%s (deleted)", result.Path)
+		}
+		if noColor {
+			sb.WriteString(binaryMsg + "\n")
+		} else {
+			sb.WriteString(styles.WarningText(binaryMsg) + "\n")
+		}
+		return sb.String()
 	}
 
 	switch result.Status {

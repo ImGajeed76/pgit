@@ -66,6 +66,13 @@ func runCommit(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Get parent commit BEFORE we create new commit (for diff stats)
+	parentHead, _ := r.DB.GetHeadCommit(ctx)
+	var parentCommitID string
+	if parentHead != nil {
+		parentCommitID = parentHead.ID
+	}
+
 	// Check if -m was provided but empty
 	messageFlag := cmd.Flags().Lookup("message")
 	messageProvided := messageFlag != nil && messageFlag.Changed
@@ -112,36 +119,99 @@ func runCommit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("[%s] %s\n", hash, firstLine(commit.Message))
 	fmt.Println()
 
-	// Count changes by type
-	var added, modified, deleted int
+	// Count changes by type and compute insertion/deletion stats
+	var fileCount int
+	var totalInsertions, totalDeletions int
+
 	for _, c := range staged {
+		fileCount++
+
+		// Count insertions/deletions based on change type
 		switch c.Status {
 		case repo.StatusNew:
-			added++
-		case repo.StatusModified:
-			modified++
-		case repo.StatusDeleted:
-			deleted++
-		}
-	}
-
-	// Summary line
-	total := added + modified + deleted
-	fmt.Printf(" %d file(s) changed\n", total)
-
-	// File mode changes
-	for _, c := range staged {
-		switch c.Status {
-		case repo.StatusNew:
+			// New file - count all lines as insertions
+			absPath := r.AbsPath(c.Path)
+			if content, err := os.ReadFile(absPath); err == nil {
+				lines := strings.Count(string(content), "\n")
+				if len(content) > 0 && content[len(content)-1] != '\n' {
+					lines++ // Count last line if no trailing newline
+				}
+				totalInsertions += lines
+			}
 			fmt.Printf(" %s %s\n", styles.Green("create"), c.Path)
+
 		case repo.StatusModified:
+			// Modified - get diff and count (use parent commit, not HEAD which is now the new commit)
+			insertions, deletions := countDiffStats(ctx, r, c.Path, parentCommitID)
+			totalInsertions += insertions
+			totalDeletions += deletions
 			fmt.Printf(" %s %s\n", styles.Yellow("modify"), c.Path)
+
 		case repo.StatusDeleted:
+			// Deleted - count all lines as deletions
+			head, _ := r.DB.GetHeadCommit(ctx)
+			if head != nil {
+				if blob, err := r.DB.GetFileAtCommit(ctx, c.Path, head.ID); err == nil && blob != nil {
+					lines := strings.Count(string(blob.Content), "\n")
+					if len(blob.Content) > 0 && blob.Content[len(blob.Content)-1] != '\n' {
+						lines++
+					}
+					totalDeletions += lines
+				}
+			}
 			fmt.Printf(" %s %s\n", styles.Red("delete"), c.Path)
 		}
 	}
 
+	// Summary line with insertions/deletions
+	fmt.Println()
+	summary := fmt.Sprintf(" %d file(s) changed", fileCount)
+	if totalInsertions > 0 {
+		summary += fmt.Sprintf(", %s", styles.Green(fmt.Sprintf("%d insertions(+)", totalInsertions)))
+	}
+	if totalDeletions > 0 {
+		summary += fmt.Sprintf(", %s", styles.Red(fmt.Sprintf("%d deletions(-)", totalDeletions)))
+	}
+	fmt.Println(summary)
+
 	return nil
+}
+
+// countDiffStats counts insertions and deletions for a modified file
+// parentCommitID is the commit to compare against (the parent of the new commit)
+func countDiffStats(ctx context.Context, r *repo.Repository, path string, parentCommitID string) (insertions, deletions int) {
+	if parentCommitID == "" {
+		return 0, 0
+	}
+
+	blob, err := r.DB.GetFileAtCommit(ctx, path, parentCommitID)
+	if err != nil || blob == nil {
+		return 0, 0
+	}
+	oldContent := string(blob.Content)
+
+	// Get new content from working directory
+	absPath := r.AbsPath(path)
+	newBytes, err := os.ReadFile(absPath)
+	if err != nil {
+		return 0, 0
+	}
+	newContent := string(newBytes)
+
+	// Generate hunks and count
+	hunks := repo.GenerateHunks(oldContent, newContent, 3)
+	for _, hunk := range hunks {
+		for _, line := range hunk.Lines {
+			switch line.Type {
+			case repo.DiffLineAdd:
+				insertions++
+			case repo.DiffLineDelete:
+				deletions++
+			}
+		}
+	}
+
+	return insertions, deletions
 }
 
 // getCommitMessageFromEditor opens an editor for the user to write a commit message

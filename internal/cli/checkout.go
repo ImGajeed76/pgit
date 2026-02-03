@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/imgajeed76/pgit/v2/internal/repo"
@@ -24,12 +23,13 @@ Usage:
   pgit checkout <commit>           # Switch to commit (updates HEAD)
   pgit checkout <commit> <path>    # Restore file from commit
   pgit checkout -- <path>          # Restore file from HEAD (discard changes)
+  pgit checkout <commit> -- <path> # Restore file from specific commit
 
 The '--' separates the commit from file paths, useful when restoring
 files from HEAD without specifying a commit.
 
 Warning: This will overwrite local changes!`,
-		Args: cobra.MinimumNArgs(1),
+		Args: cobra.ArbitraryArgs,
 		RunE: runCheckout,
 	}
 
@@ -55,77 +55,43 @@ func runCheckout(cmd *cobra.Command, args []string) error {
 	}
 	defer r.Close()
 
-	// Handle "checkout -- <path>" syntax (restore from HEAD)
-	if args[0] == "--" {
-		if len(args) < 2 {
-			return fmt.Errorf("no files specified after '--'")
-		}
-		// Get HEAD commit
-		head, err := r.DB.GetHeadCommit(ctx)
-		if err != nil {
-			return err
-		}
-		if head == nil {
-			return util.ErrNoCommits
-		}
-		// Restore each file from HEAD
-		for _, path := range args[1:] {
-			if err := checkoutPath(ctx, r, head.ID, path, force); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
+	// Parse args using cobra's dash detection
+	// pgit checkout -- file.txt        -> dashAt=0, args=[file.txt]
+	// pgit checkout HEAD -- file.txt   -> dashAt=1, args=[HEAD, file.txt]
+	// pgit checkout HEAD file.txt      -> dashAt=-1, args=[HEAD, file.txt]
+	dashAt := cmd.ArgsLenAtDash()
 
-	// Parse commit reference
-	ref := args[0]
-	var commitID string
+	var commitRef string
+	var paths []string
 
-	if ref == "HEAD" {
-		head, err := r.DB.GetHeadCommit(ctx)
-		if err != nil {
-			return err
-		}
-		if head == nil {
-			return util.ErrNoCommits
-		}
-		commitID = head.ID
+	if dashAt == 0 {
+		// "checkout -- <paths>" - restore from HEAD
+		commitRef = "HEAD"
+		paths = args
+	} else if dashAt > 0 {
+		// "checkout <commit> -- <paths>"
+		commitRef = args[0]
+		paths = args[dashAt:]
+	} else if len(args) == 0 {
+		return fmt.Errorf("nothing specified to checkout\n\nUsage:\n  pgit checkout <commit>           # Switch to commit\n  pgit checkout -- <file>          # Restore file from HEAD\n  pgit checkout <commit> -- <file> # Restore file from commit")
+	} else if len(args) == 1 {
+		// "checkout <commit>" - full checkout
+		commitRef = args[0]
 	} else {
-		// Try exact match
-		commit, err := r.DB.GetCommit(ctx, ref)
-		if err != nil {
-			return err
-		}
-		if commit != nil {
-			commitID = commit.ID
-		} else {
-			// Try partial match (short IDs use last 7 chars, case-insensitive)
-			commits, err := r.DB.GetAllCommits(ctx)
-			if err != nil {
-				return err
-			}
-			refUpper := strings.ToUpper(ref)
-			for _, c := range commits {
-				// Check suffix (short ID) or prefix (full ID partial)
-				if strings.HasSuffix(c.ID, refUpper) || strings.HasPrefix(c.ID, refUpper) {
-					commitID = c.ID
-					break
-				}
-			}
-			if commitID == "" {
-				return util.ErrCommitNotFound
-			}
-		}
+		// "checkout <commit> <path>" - restore file from commit (no --)
+		commitRef = args[0]
+		paths = args[1:]
 	}
 
-	// If path specified, only restore that file/directory
-	if len(args) > 1 {
-		// Handle "checkout <commit> -- <path>" by skipping the "--"
-		startIdx := 1
-		if args[1] == "--" {
-			startIdx = 2
-		}
-		for _, path := range args[startIdx:] {
+	// Resolve commit reference (supports HEAD, HEAD~N, HEAD^, short IDs, etc.)
+	commitID, err := resolveCommitRef(ctx, r, commitRef)
+	if err != nil {
+		return err
+	}
+
+	// If paths specified, only restore those files
+	if len(paths) > 0 {
+		for _, path := range paths {
 			if err := checkoutPath(ctx, r, commitID, path, force); err != nil {
 				return err
 			}

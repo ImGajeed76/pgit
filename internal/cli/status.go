@@ -287,6 +287,7 @@ func printLongStatus(staged, unstaged []repo.FileChange, head *db.Commit) error 
 			fmt.Println()
 			fmt.Println("Changes not staged for commit:")
 			fmt.Println(styles.MutedMsg("  (use \"pgit add <file>...\" to update what will be committed)"))
+			fmt.Println(styles.MutedMsg("  (use \"pgit checkout -- <file>...\" to discard changes)"))
 			fmt.Println()
 
 			for _, c := range modified {

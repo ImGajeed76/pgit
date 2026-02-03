@@ -72,6 +72,8 @@ func init() {
 		newDoctorCmd(),
 		newLocalCmd(),
 		newAddCmd(),
+		newRmCmd(),
+		newMvCmd(),
 		newResetCmd(),
 		newStatusCmd(),
 		newCommitCmd(),
@@ -89,10 +91,21 @@ func init() {
 		newSQLCmd(),
 		newStatsCmd(),
 		newSearchCmd(),
+		newGrepCmd(),
+		newCleanCmd(),
 		newCompletionCmd(),
 		newReposCmd(),
 		newUpdateCmd(),
 	)
+}
+
+// newGrepCmd creates an alias for search
+func newGrepCmd() *cobra.Command {
+	cmd := newSearchCmd()
+	cmd.Use = "grep <pattern>"
+	cmd.Short = "Search for a pattern in file contents (alias for search)"
+	cmd.Hidden = false // Show in help as an alias
+	return cmd
 }
 
 func newCompletionCmd() *cobra.Command {
