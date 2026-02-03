@@ -93,6 +93,15 @@ sudo apk add --allow-untrusted pgit_*_linux_amd64.apk
 - **Docker** or **Podman** - Required for the local database container
 - **PostgreSQL with pg-xpatch** - Optional, only needed for remote operations (push/pull/clone)
 
+<details>
+<summary><strong>Why Docker instead of embedded PostgreSQL?</strong></summary>
+
+We explored using [embedded-postgres-go](https://github.com/fergusstrange/embedded-postgres-go) to bundle PostgreSQL directly into the binary (more git-like, no container dependency). However, pg-xpatch requires custom PostgreSQL extensions, and cross-compiling these for all platforms (especially Windows and macOS amd64) proved impractical.
+
+Since pgit is primarily a demo for pg-xpatch compression, Docker/Podman provides a reliable cross-platform solution without the build complexity.
+
+</details>
+
 ## Quick Start
 
 ```bash
