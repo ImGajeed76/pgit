@@ -30,7 +30,15 @@ Examples:
   pgit search "func.*Error"       # Regex search
   pgit search -i "fixme"          # Case-insensitive
   pgit search --path "*.go" "fmt" # Search only Go files`,
-		Args: cobra.ExactArgs(1),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) < 1 {
+				return util.MissingArgumentError("pattern", `pgit search "TODO"`)
+			}
+			if len(args) > 1 {
+				return util.TooManyArgumentsError(1, len(args))
+			}
+			return nil
+		},
 		RunE: runSearch,
 	}
 

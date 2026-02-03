@@ -64,7 +64,7 @@ pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression
 ### Using Go (recommended)
 
 ```bash
-go install github.com/imgajeed76/pgit/cmd/pgit@latest
+go install github.com/imgajeed76/pgit/v2/cmd/pgit@latest
 ```
 
 ### From GitHub Releases

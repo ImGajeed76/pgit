@@ -328,30 +328,34 @@ func (r *Repository) UnstageFile(path string) error {
 	return idx.Save(r.Root)
 }
 
-// StageAll stages all changes
-func (r *Repository) StageAll(ctx context.Context) error {
+// StageAll stages all changes and returns the count of files staged
+func (r *Repository) StageAll(ctx context.Context) (int, error) {
 	changes, err := r.GetWorkingTreeChanges(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	idx, err := r.LoadIndex()
 	if err != nil {
-		return err
+		return 0, err
 	}
 
+	count := 0
 	for _, change := range changes {
 		switch change.Status {
 		case StatusNew:
 			idx.Add(change.Path, true)
+			count++
 		case StatusModified:
 			idx.Add(change.Path, false)
+			count++
 		case StatusDeleted:
 			idx.Delete(change.Path)
+			count++
 		}
 	}
 
-	return idx.Save(r.Root)
+	return count, idx.Save(r.Root)
 }
 
 // UnstageAll unstages all files

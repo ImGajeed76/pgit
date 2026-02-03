@@ -183,6 +183,20 @@ func runImport(cmd *cobra.Command, args []string) error {
 	spinner.Stop()
 
 	if err != nil {
+		// Check if the branch doesn't exist
+		if strings.Contains(err.Error(), "exit status 128") {
+			// Try to get available branches for helpful error message
+			branches, branchErr := getGitBranches(gitPath)
+			if branchErr == nil && len(branches) > 0 {
+				var branchNames []string
+				for _, b := range branches {
+					branchNames = append(branchNames, b.Name)
+				}
+				return util.NewError(fmt.Sprintf("Branch '%s' not found", selectedBranch)).
+					WithMessage(fmt.Sprintf("Available branches: %s", strings.Join(branchNames, ", "))).
+					WithSuggestion(fmt.Sprintf("pgit import %s --branch %s", gitPath, branchNames[0]))
+			}
+		}
 		return fmt.Errorf("failed to parse git history: %w", err)
 	}
 

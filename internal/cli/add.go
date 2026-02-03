@@ -63,16 +63,20 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	// Handle -A flag or "." special case
 	if addAll || (len(args) == 1 && args[0] == ".") {
-		if err := r.StageAll(ctx); err != nil {
+		count, err := r.StageAll(ctx)
+		if err != nil {
 			return err
 		}
 		if verbose {
-			fmt.Println("Added all changes to staging area")
+			fmt.Printf("Added %d file(s) to staging area\n", count)
+		} else if count > 0 {
+			fmt.Printf("Added %d file(s)\n", count)
 		}
 		return nil
 	}
 
 	// Process each path
+	addedCount := 0
 	for _, path := range args {
 		// Resolve to absolute path
 		absPath, err := filepath.Abs(path)
@@ -109,6 +113,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 				if verbose {
 					fmt.Printf("add '%s'\n", rel)
 				}
+				addedCount++
 				return r.StageFile(ctx, rel)
 			})
 			if err != nil {
@@ -122,7 +127,13 @@ func runAdd(cmd *cobra.Command, args []string) error {
 			if verbose {
 				fmt.Printf("add '%s'\n", relPath)
 			}
+			addedCount++
 		}
+	}
+
+	// Show summary if not verbose (verbose already shows per-file output)
+	if !verbose && addedCount > 0 {
+		fmt.Printf("Added %d file(s)\n", addedCount)
 	}
 
 	return nil

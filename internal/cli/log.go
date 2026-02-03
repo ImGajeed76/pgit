@@ -30,12 +30,14 @@ func newLogCmd() *cobra.Command {
 Interactive mode (default):
   Use j/k or arrows to navigate, Enter to view details, q to quit.
 
-Use --oneline for compact non-interactive output.`,
+Use --oneline for compact non-interactive output.
+Use --graph for ASCII commit graph visualization.`,
 		RunE: runLog,
 	}
 
 	cmd.Flags().IntP("max-count", "n", 0, "Limit number of commits to show")
 	cmd.Flags().Bool("oneline", false, "Show each commit on one line (non-interactive)")
+	cmd.Flags().Bool("graph", false, "Show ASCII commit graph")
 	cmd.Flags().Bool("no-pager", false, "Disable interactive pager")
 	cmd.Flags().Bool("json", false, "Output in JSON format")
 
@@ -45,6 +47,7 @@ Use --oneline for compact non-interactive output.`,
 func runLog(cmd *cobra.Command, args []string) error {
 	maxCount, _ := cmd.Flags().GetInt("max-count")
 	oneline, _ := cmd.Flags().GetBool("oneline")
+	graph, _ := cmd.Flags().GetBool("graph")
 	noPager, _ := cmd.Flags().GetBool("no-pager")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 
@@ -84,6 +87,11 @@ func runLog(cmd *cobra.Command, args []string) error {
 		return printJSONLog(commits)
 	}
 
+	// Graph mode - ASCII visualization
+	if graph {
+		return printGraphLog(commits, oneline)
+	}
+
 	// Oneline mode - simple output
 	if oneline {
 		for _, commit := range commits {
@@ -110,6 +118,53 @@ func runLog(cmd *cobra.Command, args []string) error {
 
 	// Interactive TUI mode
 	return runLogTUI(commits)
+}
+
+// printGraphLog prints commits with ASCII graph
+func printGraphLog(commits []*db.Commit, oneline bool) error {
+	for i, commit := range commits {
+		// Simple linear graph for now (pgit is typically single-branch)
+		var graphPrefix string
+		if i == 0 {
+			graphPrefix = styles.Green("*") + " "
+		} else if i == len(commits)-1 {
+			graphPrefix = styles.Green("*") + " "
+		} else {
+			graphPrefix = styles.Green("*") + " "
+		}
+
+		// Add connecting line
+		connector := styles.Mute("│ ")
+
+		if oneline {
+			fmt.Printf("%s%s %s\n",
+				graphPrefix,
+				styles.Hash(commit.ID, true),
+				firstLine(commit.Message))
+		} else {
+			// Full format with graph
+			refs := ""
+			if i == 0 {
+				refs = " " + lipgloss.NewStyle().Foreground(styles.Accent).Render("(HEAD → main)")
+			}
+
+			fmt.Printf("%s%s%s  %s\n",
+				graphPrefix,
+				styles.Hash(commit.ID, false),
+				refs,
+				styles.MutedMsg(util.RelativeTimeShort(commit.CreatedAt)))
+			fmt.Printf("%s%s - %s\n",
+				connector,
+				styles.Author(commit.AuthorName),
+				firstLine(commit.Message))
+
+			// Add spacing between commits
+			if i < len(commits)-1 {
+				fmt.Printf("%s\n", connector)
+			}
+		}
+	}
+	return nil
 }
 
 // JSONLogEntry represents a commit in JSON format

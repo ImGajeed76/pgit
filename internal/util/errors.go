@@ -202,3 +202,17 @@ func CommitNotFoundError(ref string) *PgitError {
 			"pgit log               # View commit history",
 		)
 }
+
+// MissingArgumentError returns an error for missing required argument
+func MissingArgumentError(argName, example string) *PgitError {
+	e := NewError(fmt.Sprintf("Missing required argument: <%s>", argName))
+	if example != "" {
+		e.WithSuggestion(example)
+	}
+	return e
+}
+
+// TooManyArgumentsError returns an error for too many arguments
+func TooManyArgumentsError(expected int, got int) *PgitError {
+	return NewError(fmt.Sprintf("Too many arguments: expected %d, got %d", expected, got))
+}

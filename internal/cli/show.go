@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -227,6 +228,69 @@ func countLines(s string) int {
 }
 
 func resolveCommitRef(ctx context.Context, r *repo.Repository, ref string) (string, error) {
+	// Parse ancestor notation: HEAD~N, HEAD^, commit~N, commit^
+	baseRef, ancestorCount := parseAncestorNotation(ref)
+
+	// Resolve the base reference
+	commitID, err := resolveBaseRef(ctx, r, baseRef)
+	if err != nil {
+		return "", err
+	}
+
+	// Walk back through ancestors if needed
+	for i := 0; i < ancestorCount; i++ {
+		commit, err := r.DB.GetCommit(ctx, commitID)
+		if err != nil {
+			return "", err
+		}
+		if commit == nil {
+			return "", util.ErrCommitNotFound
+		}
+		if commit.ParentID == nil {
+			return "", util.NewError("Cannot go back further").
+				WithMessage(fmt.Sprintf("Commit %s has no parent (root commit)", util.ShortID(commitID))).
+				WithSuggestion("Use a smaller ancestor number")
+		}
+		commitID = *commit.ParentID
+	}
+
+	return commitID, nil
+}
+
+// parseAncestorNotation parses ref~N, ref^, ref^^, etc.
+// Returns the base reference and the number of ancestors to traverse
+func parseAncestorNotation(ref string) (string, int) {
+	// Handle ~N notation (e.g., HEAD~3)
+	if idx := strings.LastIndex(ref, "~"); idx != -1 {
+		base := ref[:idx]
+		numStr := ref[idx+1:]
+
+		// Default to 1 if no number after ~
+		num := 1
+		if numStr != "" {
+			if n, err := strconv.Atoi(numStr); err == nil && n >= 0 {
+				num = n
+			}
+		}
+		return base, num
+	}
+
+	// Handle ^ notation (e.g., HEAD^, HEAD^^, HEAD^^^)
+	if strings.HasSuffix(ref, "^") {
+		count := 0
+		base := ref
+		for strings.HasSuffix(base, "^") {
+			base = strings.TrimSuffix(base, "^")
+			count++
+		}
+		return base, count
+	}
+
+	return ref, 0
+}
+
+// resolveBaseRef resolves a base reference (without ancestor notation) to a commit ID
+func resolveBaseRef(ctx context.Context, r *repo.Repository, ref string) (string, error) {
 	// Handle HEAD
 	if ref == "HEAD" {
 		head, err := r.DB.GetHeadCommit(ctx)

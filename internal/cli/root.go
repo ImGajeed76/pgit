@@ -30,6 +30,7 @@ container running pg-xpatch.
 For more information, see: https://github.com/imgajeed76/pgit`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	Version:       Version,
 }
 
 func Execute() error {
@@ -51,6 +52,9 @@ func init() {
 	// Global flags
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output")
 	rootCmd.PersistentFlags().Bool("no-color", false, "Disable colored output")
+
+	// Version flag template to show more info
+	rootCmd.SetVersionTemplate(fmt.Sprintf("pgit version %s\n  commit: %s\n  built:  %s\n", Version, CommitSHA, BuildDate))
 
 	// Set up pre-run to handle global flags
 	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
@@ -87,6 +91,7 @@ func init() {
 		newSearchCmd(),
 		newCompletionCmd(),
 		newReposCmd(),
+		newUpdateCmd(),
 	)
 }
 

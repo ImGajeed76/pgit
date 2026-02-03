@@ -22,7 +22,7 @@ import (
 
 func newSQLCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "sql <query>",
+		Use:   "sql [query]",
 		Short: "Execute SQL queries on the repository database",
 		Long: `Execute SQL queries directly on the repository database.
 
@@ -32,8 +32,13 @@ Use --write to enable INSERT, UPDATE, DELETE operations.
 Interactive mode shows results in a navigable table.
 Use --raw for plain output suitable for piping.
 
+Subcommands:
+  pgit sql schema [table]  Show database schema documentation
+  pgit sql tables          List all pgit tables
+  pgit sql examples        Show example SQL queries
+
 Use with caution - this can corrupt your repository!`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: runSQL,
 	}
 
@@ -43,10 +48,292 @@ Use with caution - this can corrupt your repository!`,
 	cmd.Flags().Bool("no-pager", false, "Disable interactive table view")
 	cmd.Flags().Int("timeout", 60, "Query timeout in seconds")
 
+	// Add subcommands
+	cmd.AddCommand(newSQLSchemaCmd())
+	cmd.AddCommand(newSQLTablesCmd())
+	cmd.AddCommand(newSQLExamplesCmd())
+
 	return cmd
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SQL Schema Command
+// ═══════════════════════════════════════════════════════════════════════════
+
+// schemaInfo describes a table in the pgit schema
+type schemaInfo struct {
+	Name        string
+	Description string
+	Columns     []columnInfo
+}
+
+type columnInfo struct {
+	Name        string
+	Type        string
+	Description string
+}
+
+var pgitSchema = []schemaInfo{
+	{
+		Name:        "pgit_commits",
+		Description: "Stores commit metadata (author, message, timestamp, parent relationship)",
+		Columns: []columnInfo{
+			{"id", "TEXT PRIMARY KEY", "ULID commit identifier (time-sortable)"},
+			{"parent_id", "TEXT", "Parent commit ID (NULL for root commit)"},
+			{"tree_hash", "TEXT", "Hash identifying the file tree state"},
+			{"message", "TEXT", "Commit message"},
+			{"author_name", "TEXT", "Author's name"},
+			{"author_email", "TEXT", "Author's email address"},
+			{"created_at", "TIMESTAMPTZ", "Commit timestamp"},
+		},
+	},
+	{
+		Name:        "pgit_paths",
+		Description: "File paths with group IDs for delta compression grouping",
+		Columns: []columnInfo{
+			{"group_id", "BIGINT PRIMARY KEY", "Unique group ID for this path (auto-generated)"},
+			{"path", "TEXT UNIQUE", "File path relative to repository root"},
+		},
+	},
+	{
+		Name:        "pgit_file_refs",
+		Description: "Links commits to file versions (which files exist in which commits)",
+		Columns: []columnInfo{
+			{"commit_id", "TEXT", "Reference to pgit_commits.id"},
+			{"group_id", "BIGINT", "Reference to pgit_paths.group_id"},
+			{"version_id", "BIGINT", "Version number within the path group"},
+			{"content_hash", "BYTEA", "BLAKE3 hash of file content (NULL = deleted)"},
+			{"mode", "INTEGER", "Unix file mode (permissions)"},
+		},
+	},
+	{
+		Name:        "pgit_content",
+		Description: "Actual file content, delta-compressed by pg-xpatch",
+		Columns: []columnInfo{
+			{"group_id", "BIGINT", "Reference to pgit_paths.group_id"},
+			{"version_id", "BIGINT", "Version number within the group"},
+			{"content", "BYTEA", "File content (auto delta-compressed)"},
+			{"symlink_target", "TEXT", "Symlink target path (if symlink)"},
+		},
+	},
+	{
+		Name:        "pgit_refs",
+		Description: "Named references (branches, tags) pointing to commits",
+		Columns: []columnInfo{
+			{"name", "TEXT PRIMARY KEY", "Reference name (e.g., 'HEAD', 'main')"},
+			{"commit_id", "TEXT", "Reference to pgit_commits.id"},
+		},
+	},
+	{
+		Name:        "pgit_metadata",
+		Description: "Repository metadata and configuration",
+		Columns: []columnInfo{
+			{"key", "TEXT PRIMARY KEY", "Metadata key"},
+			{"value", "TEXT", "Metadata value"},
+		},
+	},
+	{
+		Name:        "pgit_sync_state",
+		Description: "Tracks synchronization state with remote repositories",
+		Columns: []columnInfo{
+			{"remote_name", "TEXT PRIMARY KEY", "Remote repository name"},
+			{"last_commit_id", "TEXT", "Last synchronized commit ID"},
+			{"synced_at", "TIMESTAMPTZ", "Last sync timestamp"},
+		},
+	},
+}
+
+var exampleQueries = []struct {
+	Title       string
+	Description string
+	Query       string
+}{
+	{
+		Title:       "Recent commits",
+		Description: "Show the 10 most recent commits",
+		Query:       "SELECT id, author_name, message, created_at\nFROM pgit_commits\nORDER BY created_at DESC\nLIMIT 10;",
+	},
+	{
+		Title:       "Most changed files",
+		Description: "Files with the most versions (frequently changed)",
+		Query:       "SELECT p.path, COUNT(*) as versions\nFROM pgit_file_refs r\nJOIN pgit_paths p ON p.group_id = r.group_id\nGROUP BY p.path\nORDER BY versions DESC\nLIMIT 10;",
+	},
+	{
+		Title:       "Files changed together",
+		Description: "Which files are always changed in the same commits",
+		Query:       "SELECT pa.path, pb.path, COUNT(*) as times_together\nFROM pgit_file_refs a\nJOIN pgit_paths pa ON pa.group_id = a.group_id\nJOIN pgit_file_refs b ON a.commit_id = b.commit_id AND a.group_id < b.group_id\nJOIN pgit_paths pb ON pb.group_id = b.group_id\nGROUP BY pa.path, pb.path\nORDER BY times_together DESC\nLIMIT 10;",
+	},
+	{
+		Title:       "Commits by author",
+		Description: "Count commits per author",
+		Query:       "SELECT author_name, author_email, COUNT(*) as commits\nFROM pgit_commits\nGROUP BY author_name, author_email\nORDER BY commits DESC;",
+	},
+	{
+		Title:       "Commits per day",
+		Description: "Commit activity by day of week",
+		Query:       "SELECT TO_CHAR(created_at, 'Day') as day_of_week, COUNT(*) as commits\nFROM pgit_commits\nGROUP BY TO_CHAR(created_at, 'Day'), EXTRACT(DOW FROM created_at)\nORDER BY EXTRACT(DOW FROM created_at);",
+	},
+	{
+		Title:       "File size over time",
+		Description: "Average file size growth per year",
+		Query:       "SELECT EXTRACT(YEAR FROM c.created_at)::int as year,\n       pg_size_pretty(AVG(LENGTH(ct.content))::bigint) as avg_size\nFROM pgit_file_refs r\nJOIN pgit_commits c ON r.commit_id = c.id\nJOIN pgit_content ct ON ct.group_id = r.group_id AND ct.version_id = r.version_id\nGROUP BY EXTRACT(YEAR FROM c.created_at)\nORDER BY year;",
+	},
+	{
+		Title:       "Search commit messages",
+		Description: "Find commits mentioning 'fix' or 'bug'",
+		Query:       "SELECT id, author_name, message, created_at\nFROM pgit_commits\nWHERE message ILIKE '%fix%' OR message ILIKE '%bug%'\nORDER BY created_at DESC\nLIMIT 20;",
+	},
+	{
+		Title:       "Files by extension",
+		Description: "Count files grouped by extension",
+		Query:       "SELECT\n  COALESCE(NULLIF(SUBSTRING(path FROM '\\.([^.]+)$'), ''), '(no ext)') as extension,\n  COUNT(*) as file_count\nFROM pgit_paths\nGROUP BY extension\nORDER BY file_count DESC\nLIMIT 15;",
+	},
+}
+
+func newSQLSchemaCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "schema [table]",
+		Short: "Show database schema documentation",
+		Long: `Display the pgit database schema with descriptions.
+
+Without arguments, shows all tables and their purposes.
+With a table name, shows detailed column information.
+
+Examples:
+  pgit sql schema              # Show all tables
+  pgit sql schema pgit_commits # Show pgit_commits table details`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runSQLSchema,
+	}
+}
+
+func runSQLSchema(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		// Show all tables overview
+		fmt.Println(styles.SectionHeader("PGIT DATABASE SCHEMA"))
+		fmt.Println()
+		fmt.Println("Tables:")
+		fmt.Println()
+
+		for _, table := range pgitSchema {
+			fmt.Printf("  %s\n", styles.Cyan(table.Name))
+			fmt.Printf("    %s\n", styles.Mute(table.Description))
+			fmt.Println()
+		}
+
+		fmt.Println(styles.Mute("Use 'pgit sql schema <table>' for detailed column information."))
+		fmt.Println(styles.Mute("Use 'pgit sql examples' for example queries."))
+		return nil
+	}
+
+	// Show specific table
+	tableName := strings.ToLower(args[0])
+	if !strings.HasPrefix(tableName, "pgit_") {
+		tableName = "pgit_" + tableName
+	}
+
+	for _, table := range pgitSchema {
+		if table.Name == tableName {
+			fmt.Printf("%s %s\n", styles.SectionHeader("TABLE:"), styles.Cyan(table.Name))
+			fmt.Println()
+			fmt.Printf("%s\n", table.Description)
+			fmt.Println()
+			fmt.Println(styles.Boldf("Columns:"))
+			fmt.Println()
+
+			// Calculate column widths
+			maxNameLen := 0
+			maxTypeLen := 0
+			for _, col := range table.Columns {
+				if len(col.Name) > maxNameLen {
+					maxNameLen = len(col.Name)
+				}
+				if len(col.Type) > maxTypeLen {
+					maxTypeLen = len(col.Type)
+				}
+			}
+
+			for _, col := range table.Columns {
+				fmt.Printf("  %-*s  %-*s  %s\n",
+					maxNameLen, styles.Cyan(col.Name),
+					maxTypeLen, styles.Mute(col.Type),
+					col.Description)
+			}
+
+			fmt.Println()
+			fmt.Println(styles.Boldf("Example query:"))
+			fmt.Println()
+			fmt.Printf("  %s\n", styles.Mute(fmt.Sprintf("SELECT * FROM %s LIMIT 10;", table.Name)))
+			return nil
+		}
+	}
+
+	return fmt.Errorf("unknown table: %s\n\nAvailable tables: pgit_commits, pgit_paths, pgit_file_refs, pgit_content, pgit_refs, pgit_metadata, pgit_sync_state", args[0])
+}
+
+func newSQLTablesCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "tables",
+		Short: "List all pgit tables",
+		Long:  `Display a quick list of all pgit database tables.`,
+		Args:  cobra.NoArgs,
+		RunE:  runSQLTables,
+	}
+}
+
+func runSQLTables(cmd *cobra.Command, args []string) error {
+	fmt.Println(styles.SectionHeader("PGIT TABLES"))
+	fmt.Println()
+	for _, table := range pgitSchema {
+		fmt.Printf("  %s\n", table.Name)
+	}
+	fmt.Println()
+	fmt.Println(styles.Mute("Use 'pgit sql schema <table>' for details."))
+	return nil
+}
+
+func newSQLExamplesCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "examples",
+		Short: "Show example SQL queries",
+		Long:  `Display useful example SQL queries for analyzing your repository.`,
+		Args:  cobra.NoArgs,
+		RunE:  runSQLExamples,
+	}
+}
+
+func runSQLExamples(cmd *cobra.Command, args []string) error {
+	fmt.Println(styles.SectionHeader("EXAMPLE SQL QUERIES"))
+	fmt.Println()
+
+	for i, example := range exampleQueries {
+		if i > 0 {
+			fmt.Println()
+			fmt.Println(strings.Repeat("─", 60))
+			fmt.Println()
+		}
+
+		fmt.Printf("%s\n", styles.Boldf("%d. %s", i+1, example.Title))
+		fmt.Printf("%s\n", styles.Mute(example.Description))
+		fmt.Println()
+
+		// Print query with syntax highlighting-like formatting
+		for _, line := range strings.Split(example.Query, "\n") {
+			fmt.Printf("  %s\n", styles.Cyan(line))
+		}
+	}
+
+	fmt.Println()
+	fmt.Println(styles.Mute("Copy any query and run it with: pgit sql \"<query>\""))
+	return nil
+}
+
 func runSQL(cmd *cobra.Command, args []string) error {
+	// If no args, show help
+	if len(args) == 0 {
+		return cmd.Help()
+	}
+
 	query := args[0]
 	allowWrite, _ := cmd.Flags().GetBool("write")
 	raw, _ := cmd.Flags().GetBool("raw")
