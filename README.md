@@ -130,7 +130,10 @@ pgit search "TODO" --path "*.rs"
 pgit search --all "panic!" --ignore-case
 
 # Raw SQL access
-pgit sql "SELECT * FROM pgit_commits ORDER BY created_at DESC LIMIT 10"
+pgit sql "SELECT * FROM pgit_commits ORDER BY created_at DESC LIMIT
+
+---
+Built with ❤️ by [Oliver Seifert](https://oseifert.ch) 10"
 ```
 
 ### Example Queries
