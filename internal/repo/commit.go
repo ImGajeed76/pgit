@@ -167,25 +167,36 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 	// Compute tree hash
 	treeHash := util.ComputeTreeHash(treeEntries)
 
-	// Create commit
+	// Create commit (committer = author for native pgit commits)
 	commit := &db.Commit{
-		ID:          commitID,
-		ParentID:    parentID,
-		TreeHash:    treeHash,
-		Message:     opts.Message,
-		AuthorName:  authorName,
-		AuthorEmail: authorEmail,
-		CreatedAt:   commitTime,
+		ID:             commitID,
+		ParentID:       parentID,
+		TreeHash:       treeHash,
+		Message:        opts.Message,
+		AuthorName:     authorName,
+		AuthorEmail:    authorEmail,
+		AuthoredAt:     commitTime,
+		CommitterName:  authorName,
+		CommitterEmail: authorEmail,
+		CommittedAt:    commitTime,
+	}
+
+	// Detect binary for each staged blob
+	for _, blob := range blobs {
+		if blob.Content != nil && blob.ContentHash != nil {
+			blob.IsBinary = util.DetectBinary(blob.Content)
+		}
 	}
 
 	// Create everything in a single transaction
 	err = r.DB.WithTx(ctx, func(tx pgx.Tx) error {
 		// Create commit first
 		_, err := tx.Exec(ctx, `
-			INSERT INTO pgit_commits (id, parent_id, tree_hash, message, author_name, author_email, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			INSERT INTO pgit_commits (id, parent_id, tree_hash, message, author_name, author_email, authored_at, committer_name, committer_email, committed_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 			commit.ID, commit.ParentID, commit.TreeHash, commit.Message,
-			commit.AuthorName, commit.AuthorEmail, commit.CreatedAt)
+			commit.AuthorName, commit.AuthorEmail, commit.AuthoredAt,
+			commit.CommitterName, commit.CommitterEmail, commit.CommittedAt)
 		if err != nil {
 			return err
 		}

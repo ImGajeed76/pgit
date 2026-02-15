@@ -120,6 +120,21 @@ func ContentHashFromHex(s string) ([]byte, error) {
 	return hex.DecodeString(s)
 }
 
+// DetectBinary returns true if content appears to be binary.
+// Uses git's heuristic: a NUL byte in the first 8000 bytes means binary.
+func DetectBinary(content []byte) bool {
+	checkLen := len(content)
+	if checkLen > 8000 {
+		checkLen = 8000
+	}
+	for i := 0; i < checkLen; i++ {
+		if content[i] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // TreeEntry represents a file in the tree for hashing.
 type TreeEntry struct {
 	Mode        int

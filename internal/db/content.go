@@ -3,15 +3,17 @@ package db
 import (
 	"context"
 
+	"github.com/imgajeed76/pgit/v2/internal/util"
 	"github.com/jackc/pgx/v5"
 )
 
-// Content represents file content stored in the content table.
+// Content represents file content stored in text or binary content tables.
 // Content is delta-compressed by xpatch, grouped by group_id.
 type Content struct {
 	GroupID   int32
 	VersionID int32
 	Content   []byte
+	IsBinary  bool // Determines which table to use
 }
 
 // ContentKey is used for batch lookups.
@@ -20,69 +22,127 @@ type ContentKey struct {
 	VersionID int32
 }
 
-// CreateContent inserts content into the content table.
+// CreateContent inserts content into the appropriate content table.
 func (db *DB) CreateContent(ctx context.Context, c *Content) error {
-	sql := `
-	INSERT INTO pgit_content (group_id, version_id, content)
-	VALUES ($1, $2, $3)`
-
-	// Ensure content is never nil (delta columns can't be NULL)
 	content := c.Content
 	if content == nil {
 		content = []byte{}
 	}
 
-	return db.Exec(ctx, sql, c.GroupID, c.VersionID, content)
+	if c.IsBinary {
+		sql := `INSERT INTO pgit_binary_content (group_id, version_id, content) VALUES ($1, $2, $3)`
+		return db.Exec(ctx, sql, c.GroupID, c.VersionID, content)
+	}
+
+	sql := `INSERT INTO pgit_text_content (group_id, version_id, content) VALUES ($1, $2, $3)`
+	return db.Exec(ctx, sql, c.GroupID, c.VersionID, util.ToValidUTF8(string(content)))
 }
 
 // CreateContentTx inserts content within a transaction.
 func (db *DB) CreateContentTx(ctx context.Context, tx pgx.Tx, c *Content) error {
-	sql := `
-	INSERT INTO pgit_content (group_id, version_id, content)
-	VALUES ($1, $2, $3)`
-
 	content := c.Content
 	if content == nil {
 		content = []byte{}
 	}
 
-	_, err := tx.Exec(ctx, sql, c.GroupID, c.VersionID, content)
+	if c.IsBinary {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO pgit_binary_content (group_id, version_id, content) VALUES ($1, $2, $3)`,
+			c.GroupID, c.VersionID, content)
+		return err
+	}
+
+	_, err := tx.Exec(ctx,
+		`INSERT INTO pgit_text_content (group_id, version_id, content) VALUES ($1, $2, $3)`,
+		c.GroupID, c.VersionID, util.ToValidUTF8(string(content)))
 	return err
 }
 
 // CreateContentBatch inserts multiple content entries using COPY for speed.
-// This is optimized for bulk imports.
+// Splits into text and binary batches and writes to respective tables.
 func (db *DB) CreateContentBatch(ctx context.Context, contents []*Content) error {
 	if len(contents) == 0 {
 		return nil
 	}
 
-	rows := make([][]interface{}, len(contents))
-	for i, c := range contents {
-		// Ensure content is never nil (delta columns can't be NULL)
-		content := c.Content
-		if content == nil {
-			content = []byte{}
+	var textContents []*Content
+	var binaryContents []*Content
+	for _, c := range contents {
+		if c.IsBinary {
+			binaryContents = append(binaryContents, c)
+		} else {
+			textContents = append(textContents, c)
 		}
-		rows[i] = []interface{}{c.GroupID, c.VersionID, content}
 	}
 
-	_, err := db.pool.CopyFrom(
-		ctx,
-		pgx.Identifier{"pgit_content"},
-		[]string{"group_id", "version_id", "content"},
-		pgx.CopyFromRows(rows),
-	)
-	return err
+	// Insert text content
+	if len(textContents) > 0 {
+		rows := make([][]interface{}, len(textContents))
+		for i, c := range textContents {
+			content := c.Content
+			if content == nil {
+				content = []byte{}
+			}
+			rows[i] = []interface{}{c.GroupID, c.VersionID, util.ToValidUTF8(string(content))}
+		}
+
+		_, err := db.pool.CopyFrom(
+			ctx,
+			pgx.Identifier{"pgit_text_content"},
+			[]string{"group_id", "version_id", "content"},
+			pgx.CopyFromRows(rows),
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Insert binary content
+	if len(binaryContents) > 0 {
+		rows := make([][]interface{}, len(binaryContents))
+		for i, c := range binaryContents {
+			content := c.Content
+			if content == nil {
+				content = []byte{}
+			}
+			rows[i] = []interface{}{c.GroupID, c.VersionID, content}
+		}
+
+		_, err := db.pool.CopyFrom(
+			ctx,
+			pgx.Identifier{"pgit_binary_content"},
+			[]string{"group_id", "version_id", "content"},
+			pgx.CopyFromRows(rows),
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // GetContent retrieves content by (group_id, version_id).
-func (db *DB) GetContent(ctx context.Context, groupID, versionID int32) ([]byte, error) {
+// isBinary determines which table to query.
+func (db *DB) GetContent(ctx context.Context, groupID, versionID int32, isBinary bool) ([]byte, error) {
 	var content []byte
-	err := db.QueryRow(ctx,
-		"SELECT content FROM pgit_content WHERE group_id = $1 AND version_id = $2",
-		groupID, versionID,
-	).Scan(&content)
+	var err error
+
+	if isBinary {
+		err = db.QueryRow(ctx,
+			"SELECT content FROM pgit_binary_content WHERE group_id = $1 AND version_id = $2",
+			groupID, versionID,
+		).Scan(&content)
+	} else {
+		var textContent string
+		err = db.QueryRow(ctx,
+			"SELECT content FROM pgit_text_content WHERE group_id = $1 AND version_id = $2",
+			groupID, versionID,
+		).Scan(&textContent)
+		if err == nil {
+			content = []byte(textContent)
+		}
+	}
 
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -92,28 +152,71 @@ func (db *DB) GetContent(ctx context.Context, groupID, versionID int32) ([]byte,
 }
 
 // GetContentsBatch retrieves multiple contents by their keys.
-// Returns a map of ContentKey -> content bytes.
-// Uses parallel queries per group for faster xpatch decompression.
-func (db *DB) GetContentsBatch(ctx context.Context, keys []ContentKey) (map[ContentKey][]byte, error) {
+// isBinaryMap indicates which keys are binary. Keys not in the map default to text.
+func (db *DB) GetContentsBatch(ctx context.Context, keys []ContentKey, isBinaryMap map[ContentKey]bool) (map[ContentKey][]byte, error) {
+	if len(keys) == 0 {
+		return make(map[ContentKey][]byte), nil
+	}
+
+	// Split keys into text and binary
+	var textKeys []ContentKey
+	var binaryKeys []ContentKey
+	for _, k := range keys {
+		if isBinaryMap[k] {
+			binaryKeys = append(binaryKeys, k)
+		} else {
+			textKeys = append(textKeys, k)
+		}
+	}
+
+	result := make(map[ContentKey][]byte, len(keys))
+
+	// Fetch text content
+	if len(textKeys) > 0 {
+		textResult, err := db.getContentsBatchFromTable(ctx, "pgit_text_content", textKeys, false)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range textResult {
+			result[k] = v
+		}
+	}
+
+	// Fetch binary content
+	if len(binaryKeys) > 0 {
+		binResult, err := db.getContentsBatchFromTable(ctx, "pgit_binary_content", binaryKeys, true)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range binResult {
+			result[k] = v
+		}
+	}
+
+	return result, nil
+}
+
+// getContentsBatchFromTable fetches content from a specific table.
+func (db *DB) getContentsBatchFromTable(ctx context.Context, tableName string, keys []ContentKey, isBinary bool) (map[ContentKey][]byte, error) {
 	if len(keys) == 0 {
 		return make(map[ContentKey][]byte), nil
 	}
 
 	// Group keys by group_id for parallel fetching
-	keysByGroup := make(map[int32][]int32) // group_id -> []version_id
+	keysByGroup := make(map[int32][]int32)
 	for _, k := range keys {
 		keysByGroup[k.GroupID] = append(keysByGroup[k.GroupID], k.VersionID)
 	}
 
-	// For small batches or single group, use simple query
+	// For small batches, use simple query
 	if len(keysByGroup) <= 4 {
-		return db.getContentsBatchSimple(ctx, keys)
+		return db.getContentsBatchSimpleFromTable(ctx, tableName, keys, isBinary)
 	}
 
 	// Parallel fetch per group
 	type groupResult struct {
 		groupID int32
-		content map[int32][]byte // version_id -> content
+		content map[int32][]byte
 		err     error
 	}
 
@@ -121,12 +224,11 @@ func (db *DB) GetContentsBatch(ctx context.Context, keys []ContentKey) (map[Cont
 
 	for groupID, versionIDs := range keysByGroup {
 		go func(gid int32, vids []int32) {
-			content, err := db.getContentsForGroup(ctx, gid, vids)
+			content, err := db.getContentsForGroupFromTable(ctx, tableName, gid, vids, isBinary)
 			results <- groupResult{groupID: gid, content: content, err: err}
 		}(groupID, versionIDs)
 	}
 
-	// Collect results
 	result := make(map[ContentKey][]byte, len(keys))
 	var firstErr error
 	for i := 0; i < len(keysByGroup); i++ {
@@ -146,8 +248,8 @@ func (db *DB) GetContentsBatch(ctx context.Context, keys []ContentKey) (map[Cont
 	return result, nil
 }
 
-// getContentsBatchSimple uses a single query for small batches.
-func (db *DB) getContentsBatchSimple(ctx context.Context, keys []ContentKey) (map[ContentKey][]byte, error) {
+// getContentsBatchSimpleFromTable uses a single query for small batches.
+func (db *DB) getContentsBatchSimpleFromTable(ctx context.Context, tableName string, keys []ContentKey, isBinary bool) (map[ContentKey][]byte, error) {
 	result := make(map[ContentKey][]byte, len(keys))
 
 	groupIDs := make([]int32, len(keys))
@@ -159,7 +261,7 @@ func (db *DB) getContentsBatchSimple(ctx context.Context, keys []ContentKey) (ma
 
 	sql := `
 	SELECT c.group_id, c.version_id, c.content
-	FROM pgit_content c
+	FROM ` + tableName + ` c
 	JOIN unnest($1::integer[], $2::integer[]) WITH ORDINALITY AS t(gid, vid, ord)
 		ON c.group_id = t.gid AND c.version_id = t.vid`
 
@@ -171,21 +273,29 @@ func (db *DB) getContentsBatchSimple(ctx context.Context, keys []ContentKey) (ma
 
 	for rows.Next() {
 		var groupID, versionID int32
-		var content []byte
-		if err := rows.Scan(&groupID, &versionID, &content); err != nil {
-			return nil, err
+		if isBinary {
+			var content []byte
+			if err := rows.Scan(&groupID, &versionID, &content); err != nil {
+				return nil, err
+			}
+			result[ContentKey{GroupID: groupID, VersionID: versionID}] = content
+		} else {
+			var content string
+			if err := rows.Scan(&groupID, &versionID, &content); err != nil {
+				return nil, err
+			}
+			result[ContentKey{GroupID: groupID, VersionID: versionID}] = []byte(content)
 		}
-		result[ContentKey{GroupID: groupID, VersionID: versionID}] = content
 	}
 
 	return result, rows.Err()
 }
 
-// getContentsForGroup fetches content for a single group.
-func (db *DB) getContentsForGroup(ctx context.Context, groupID int32, versionIDs []int32) (map[int32][]byte, error) {
+// getContentsForGroupFromTable fetches content for a single group from a specific table.
+func (db *DB) getContentsForGroupFromTable(ctx context.Context, tableName string, groupID int32, versionIDs []int32, isBinary bool) (map[int32][]byte, error) {
 	sql := `
 	SELECT version_id, content
-	FROM pgit_content
+	FROM ` + tableName + `
 	WHERE group_id = $1 AND version_id = ANY($2)`
 
 	rows, err := db.Query(ctx, sql, groupID, versionIDs)
@@ -197,79 +307,119 @@ func (db *DB) getContentsForGroup(ctx context.Context, groupID int32, versionIDs
 	result := make(map[int32][]byte, len(versionIDs))
 	for rows.Next() {
 		var versionID int32
-		var content []byte
-		if err := rows.Scan(&versionID, &content); err != nil {
-			return nil, err
+		if isBinary {
+			var content []byte
+			if err := rows.Scan(&versionID, &content); err != nil {
+				return nil, err
+			}
+			result[versionID] = content
+		} else {
+			var content string
+			if err := rows.Scan(&versionID, &content); err != nil {
+				return nil, err
+			}
+			result[versionID] = []byte(content)
 		}
-		result[versionID] = content
 	}
 
 	return result, rows.Err()
 }
 
 // GetContentsByGroupID retrieves all content versions for a group.
-// Returns content ordered by version_id ascending.
+// Queries both tables and merges results.
 func (db *DB) GetContentsByGroupID(ctx context.Context, groupID int32) ([]*Content, error) {
-	sql := `
-	SELECT group_id, version_id, content
-	FROM pgit_content
-	WHERE group_id = $1
-	ORDER BY version_id`
+	var contents []*Content
 
-	rows, err := db.Query(ctx, sql, groupID)
+	// Query text content
+	textSQL := `SELECT group_id, version_id, content FROM pgit_text_content WHERE group_id = $1 ORDER BY version_id`
+	rows, err := db.Query(ctx, textSQL, groupID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var contents []*Content
 	for rows.Next() {
-		c := &Content{}
+		c := &Content{IsBinary: false}
+		var textContent string
+		if err := rows.Scan(&c.GroupID, &c.VersionID, &textContent); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		c.Content = []byte(textContent)
+		contents = append(contents, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Query binary content
+	binSQL := `SELECT group_id, version_id, content FROM pgit_binary_content WHERE group_id = $1 ORDER BY version_id`
+	rows, err = db.Query(ctx, binSQL, groupID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		c := &Content{IsBinary: true}
 		if err := rows.Scan(&c.GroupID, &c.VersionID, &c.Content); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		contents = append(contents, c)
 	}
+	rows.Close()
 
 	return contents, rows.Err()
 }
 
-// ContentExists checks if content exists for a specific (group_id, version_id).
+// ContentExists checks if content exists in either table.
 func (db *DB) ContentExists(ctx context.Context, groupID, versionID int32) (bool, error) {
 	var exists bool
 	err := db.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM pgit_content WHERE group_id = $1 AND version_id = $2)",
+		`SELECT EXISTS(
+			SELECT 1 FROM pgit_text_content WHERE group_id = $1 AND version_id = $2
+			UNION ALL
+			SELECT 1 FROM pgit_binary_content WHERE group_id = $1 AND version_id = $2
+		)`,
 		groupID, versionID).Scan(&exists)
 	return exists, err
 }
 
-// CountContents returns the total number of content entries.
+// CountContents returns the total number of content entries across both tables.
 func (db *DB) CountContents(ctx context.Context) (int64, error) {
 	var count int64
-	err := db.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_content").Scan(&count)
+	err := db.QueryRow(ctx, `
+		SELECT (SELECT COUNT(*) FROM pgit_text_content) + (SELECT COUNT(*) FROM pgit_binary_content)
+	`).Scan(&count)
 	return count, err
 }
 
 // GetContentForFileRef retrieves content for a file ref.
-// This is a convenience method that combines the file ref lookup with content retrieval.
+// Returns nil for deleted refs (ContentHash == nil) since they have no content row.
 func (db *DB) GetContentForFileRef(ctx context.Context, ref *FileRef) ([]byte, error) {
-	if ref == nil {
+	if ref == nil || ref.ContentHash == nil {
 		return nil, nil
 	}
-	return db.GetContent(ctx, ref.GroupID, ref.VersionID)
+	return db.GetContent(ctx, ref.GroupID, ref.VersionID, ref.IsBinary)
 }
 
 // GetContentsForFileRefs retrieves content for multiple file refs.
-// Returns a map of ContentKey -> content bytes.
+// Skips deleted refs (ContentHash == nil) since they have no content row.
 func (db *DB) GetContentsForFileRefs(ctx context.Context, refs []*FileRef) (map[ContentKey][]byte, error) {
 	if len(refs) == 0 {
 		return make(map[ContentKey][]byte), nil
 	}
 
-	keys := make([]ContentKey, len(refs))
-	for i, ref := range refs {
-		keys[i] = ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+	keys := make([]ContentKey, 0, len(refs))
+	isBinaryMap := make(map[ContentKey]bool)
+	for _, ref := range refs {
+		if ref.ContentHash == nil {
+			continue // deleted — no content row exists
+		}
+		k := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		keys = append(keys, k)
+		if ref.IsBinary {
+			isBinaryMap[k] = true
+		}
 	}
 
-	return db.GetContentsBatch(ctx, keys)
+	return db.GetContentsBatch(ctx, keys, isBinaryMap)
 }

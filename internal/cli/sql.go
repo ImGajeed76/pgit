@@ -84,7 +84,10 @@ var pgitSchema = []schemaInfo{
 			{"message", "TEXT", "Commit message"},
 			{"author_name", "TEXT", "Author's name"},
 			{"author_email", "TEXT", "Author's email address"},
-			{"created_at", "TIMESTAMPTZ", "Commit timestamp"},
+			{"authored_at", "TIMESTAMPTZ", "Author timestamp"},
+			{"committer_name", "TEXT", "Committer's name"},
+			{"committer_email", "TEXT", "Committer's email address"},
+			{"committed_at", "TIMESTAMPTZ", "Committer timestamp"},
 		},
 	},
 	{
@@ -104,16 +107,27 @@ var pgitSchema = []schemaInfo{
 			{"version_id", "BIGINT", "Version number within the path group"},
 			{"content_hash", "BYTEA", "BLAKE3 hash of file content (NULL = deleted)"},
 			{"mode", "INTEGER", "Unix file mode (permissions)"},
+			{"is_symlink", "BOOLEAN", "Whether this is a symlink"},
+			{"symlink_target", "TEXT", "Symlink target path (if symlink)"},
+			{"is_binary", "BOOLEAN", "Whether the file content is binary"},
 		},
 	},
 	{
-		Name:        "pgit_content",
-		Description: "Actual file content, delta-compressed by pg-xpatch",
+		Name:        "pgit_text_content",
+		Description: "Text file content, delta-compressed by pg-xpatch",
 		Columns: []columnInfo{
 			{"group_id", "BIGINT", "Reference to pgit_paths.group_id"},
 			{"version_id", "BIGINT", "Version number within the group"},
-			{"content", "BYTEA", "File content (auto delta-compressed)"},
-			{"symlink_target", "TEXT", "Symlink target path (if symlink)"},
+			{"content", "TEXT", "Text file content (auto delta-compressed)"},
+		},
+	},
+	{
+		Name:        "pgit_binary_content",
+		Description: "Binary file content, delta-compressed by pg-xpatch",
+		Columns: []columnInfo{
+			{"group_id", "BIGINT", "Reference to pgit_paths.group_id"},
+			{"version_id", "BIGINT", "Version number within the group"},
+			{"content", "BYTEA", "Binary file content (auto delta-compressed)"},
 		},
 	},
 	{
@@ -151,7 +165,7 @@ var exampleQueries = []struct {
 	{
 		Title:       "Recent commits",
 		Description: "Show the 10 most recent commits",
-		Query:       "SELECT id, author_name, message, created_at\nFROM pgit_commits\nORDER BY created_at DESC\nLIMIT 10;",
+		Query:       "SELECT id, author_name, message, authored_at\nFROM pgit_commits\nORDER BY authored_at DESC\nLIMIT 10;",
 	},
 	{
 		Title:       "Most changed files",
@@ -171,17 +185,17 @@ var exampleQueries = []struct {
 	{
 		Title:       "Commits per day",
 		Description: "Commit activity by day of week",
-		Query:       "SELECT TO_CHAR(created_at, 'Day') as day_of_week, COUNT(*) as commits\nFROM pgit_commits\nGROUP BY TO_CHAR(created_at, 'Day'), EXTRACT(DOW FROM created_at)\nORDER BY EXTRACT(DOW FROM created_at);",
+		Query:       "SELECT TO_CHAR(authored_at, 'Day') as day_of_week, COUNT(*) as commits\nFROM pgit_commits\nGROUP BY TO_CHAR(authored_at, 'Day'), EXTRACT(DOW FROM authored_at)\nORDER BY EXTRACT(DOW FROM authored_at);",
 	},
 	{
 		Title:       "File size over time",
 		Description: "Average file size growth per year",
-		Query:       "SELECT EXTRACT(YEAR FROM c.created_at)::int as year,\n       pg_size_pretty(AVG(LENGTH(ct.content))::bigint) as avg_size\nFROM pgit_file_refs r\nJOIN pgit_commits c ON r.commit_id = c.id\nJOIN pgit_content ct ON ct.group_id = r.group_id AND ct.version_id = r.version_id\nGROUP BY EXTRACT(YEAR FROM c.created_at)\nORDER BY year;",
+		Query:       "SELECT EXTRACT(YEAR FROM c.authored_at)::int as year,\n       pg_size_pretty(AVG(LENGTH(ct.content))::bigint) as avg_size\nFROM pgit_file_refs r\nJOIN pgit_commits c ON r.commit_id = c.id\nJOIN pgit_text_content ct ON ct.group_id = r.group_id AND ct.version_id = r.version_id\nGROUP BY EXTRACT(YEAR FROM c.authored_at)\nORDER BY year;",
 	},
 	{
 		Title:       "Search commit messages",
 		Description: "Find commits mentioning 'fix' or 'bug'",
-		Query:       "SELECT id, author_name, message, created_at\nFROM pgit_commits\nWHERE message ILIKE '%fix%' OR message ILIKE '%bug%'\nORDER BY created_at DESC\nLIMIT 20;",
+		Query:       "SELECT id, author_name, message, authored_at\nFROM pgit_commits\nWHERE message ILIKE '%fix%' OR message ILIKE '%bug%'\nORDER BY authored_at DESC\nLIMIT 20;",
 	},
 	{
 		Title:       "Files by extension",
@@ -268,7 +282,7 @@ func runSQLSchema(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	return fmt.Errorf("unknown table: %s\n\nAvailable tables: pgit_commits, pgit_paths, pgit_file_refs, pgit_content, pgit_refs, pgit_metadata, pgit_sync_state", args[0])
+	return fmt.Errorf("unknown table: %s\n\nAvailable tables: pgit_commits, pgit_paths, pgit_file_refs, pgit_text_content, pgit_binary_content, pgit_refs, pgit_metadata, pgit_sync_state", args[0])
 }
 
 func newSQLTablesCmd() *cobra.Command {
@@ -1738,19 +1752,21 @@ func runStats(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	// Calculate total for all data tables
-	totalDataStorage := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize + stats.ContentTableSize
-	fmt.Printf("  Commits table:   %s\n", formatBytes(stats.CommitsTableSize))
-	fmt.Printf("  Paths table:     %s\n", formatBytes(stats.PathsTableSize))
-	fmt.Printf("  File refs table: %s\n", formatBytes(stats.FileRefsTableSize))
-	fmt.Printf("  Content table:   %s\n", formatBytes(stats.ContentTableSize))
-	fmt.Printf("  Indexes:         %s\n", formatBytes(stats.TotalIndexSize))
+	contentTableSize := stats.TextContentTableSize + stats.BinaryContentTableSize
+	totalDataStorage := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize + contentTableSize
+	fmt.Printf("  Commits table:    %s\n", formatBytes(stats.CommitsTableSize))
+	fmt.Printf("  Paths table:      %s\n", formatBytes(stats.PathsTableSize))
+	fmt.Printf("  File refs table:  %s\n", formatBytes(stats.FileRefsTableSize))
+	fmt.Printf("  Text content:     %s\n", formatBytes(stats.TextContentTableSize))
+	fmt.Printf("  Binary content:   %s\n", formatBytes(stats.BinaryContentTableSize))
+	fmt.Printf("  Indexes:          %s\n", formatBytes(stats.TotalIndexSize))
 	fmt.Printf("  ─────────────────────\n")
-	fmt.Printf("  Total:           %s\n", styles.SuccessText(formatBytes(totalDataStorage+stats.TotalIndexSize)))
+	fmt.Printf("  Total:            %s\n", styles.SuccessText(formatBytes(totalDataStorage+stats.TotalIndexSize)))
 
 	// Show compression ratio if we have meaningful content size
-	if stats.TotalContentSize > 1024 && stats.ContentTableSize > 0 {
-		ratio := float64(stats.TotalContentSize) / float64(stats.ContentTableSize)
-		savings := (1 - float64(stats.ContentTableSize)/float64(stats.TotalContentSize)) * 100
+	if stats.TotalContentSize > 1024 && contentTableSize > 0 {
+		ratio := float64(stats.TotalContentSize) / float64(contentTableSize)
+		savings := (1 - float64(contentTableSize)/float64(stats.TotalContentSize)) * 100
 		if savings > 0 {
 			fmt.Printf("\n  %s %.1fx compression (%.0f%% space saved)\n",
 				styles.Successf("→"), ratio, savings)
@@ -1772,14 +1788,24 @@ func runStats(cmd *cobra.Command, args []string) error {
 			printXpatchStats(commitXpatch)
 		}
 
-		// Content xpatch (replaces pgit_blobs in schema v2)
+		// Text content xpatch
 		fmt.Println()
-		fmt.Printf("  %s\n", styles.Mute("pgit_content:"))
-		contentXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_content")
+		fmt.Printf("  %s\n", styles.Mute("pgit_text_content:"))
+		textXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_text_content")
 		if err != nil {
 			fmt.Printf("    Unable to get stats: %v\n", styles.Mute(err.Error()))
 		} else {
-			printXpatchStats(contentXpatch)
+			printXpatchStats(textXpatch)
+		}
+
+		// Binary content xpatch
+		fmt.Println()
+		fmt.Printf("  %s\n", styles.Mute("pgit_binary_content:"))
+		binaryXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_binary_content")
+		if err != nil {
+			fmt.Printf("    Unable to get stats: %v\n", styles.Mute(err.Error()))
+		} else {
+			printXpatchStats(binaryXpatch)
 		}
 	} else {
 		fmt.Println()
@@ -1841,19 +1867,21 @@ type JSONRepoStats struct {
 }
 
 type JSONStorageStats struct {
-	CommitsTableBytes  int64   `json:"commits_table_bytes"`
-	PathsTableBytes    int64   `json:"paths_table_bytes"`
-	FileRefsTableBytes int64   `json:"file_refs_table_bytes"`
-	ContentTableBytes  int64   `json:"content_table_bytes"`
-	IndexesBytes       int64   `json:"indexes_bytes"`
-	TotalBytes         int64   `json:"total_bytes"`
-	CompressionRatio   float64 `json:"compression_ratio,omitempty"`
-	SpaceSavedPercent  float64 `json:"space_saved_percent,omitempty"`
+	CommitsTableBytes       int64   `json:"commits_table_bytes"`
+	PathsTableBytes         int64   `json:"paths_table_bytes"`
+	FileRefsTableBytes      int64   `json:"file_refs_table_bytes"`
+	TextContentTableBytes   int64   `json:"text_content_table_bytes"`
+	BinaryContentTableBytes int64   `json:"binary_content_table_bytes"`
+	IndexesBytes            int64   `json:"indexes_bytes"`
+	TotalBytes              int64   `json:"total_bytes"`
+	CompressionRatio        float64 `json:"compression_ratio,omitempty"`
+	SpaceSavedPercent       float64 `json:"space_saved_percent,omitempty"`
 }
 
 type JSONXpatchStats struct {
-	Commits *JSONXpatchTableStats `json:"commits,omitempty"`
-	Content *JSONXpatchTableStats `json:"content,omitempty"`
+	Commits       *JSONXpatchTableStats `json:"commits,omitempty"`
+	TextContent   *JSONXpatchTableStats `json:"text_content,omitempty"`
+	BinaryContent *JSONXpatchTableStats `json:"binary_content,omitempty"`
 }
 
 type JSONXpatchTableStats struct {
@@ -1869,7 +1897,8 @@ type JSONXpatchTableStats struct {
 }
 
 func printJSONStats(ctx context.Context, r *repo.Repository, stats *db.RepoStats, showXpatch bool) error {
-	totalStorage := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize + stats.ContentTableSize + stats.TotalIndexSize
+	contentTableSize := stats.TextContentTableSize + stats.BinaryContentTableSize
+	totalStorage := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize + contentTableSize + stats.TotalIndexSize
 
 	jsonStats := JSONStats{
 		Repository: JSONRepoStats{
@@ -1879,18 +1908,19 @@ func printJSONStats(ctx context.Context, r *repo.Repository, stats *db.RepoStats
 			ContentSizeBytes: stats.TotalContentSize,
 		},
 		Storage: JSONStorageStats{
-			CommitsTableBytes:  stats.CommitsTableSize,
-			PathsTableBytes:    stats.PathsTableSize,
-			FileRefsTableBytes: stats.FileRefsTableSize,
-			ContentTableBytes:  stats.ContentTableSize,
-			IndexesBytes:       stats.TotalIndexSize,
-			TotalBytes:         totalStorage,
+			CommitsTableBytes:       stats.CommitsTableSize,
+			PathsTableBytes:         stats.PathsTableSize,
+			FileRefsTableBytes:      stats.FileRefsTableSize,
+			TextContentTableBytes:   stats.TextContentTableSize,
+			BinaryContentTableBytes: stats.BinaryContentTableSize,
+			IndexesBytes:            stats.TotalIndexSize,
+			TotalBytes:              totalStorage,
 		},
 	}
 
-	if stats.TotalContentSize > 1024 && stats.ContentTableSize > 0 {
-		ratio := float64(stats.TotalContentSize) / float64(stats.ContentTableSize)
-		savings := (1 - float64(stats.ContentTableSize)/float64(stats.TotalContentSize)) * 100
+	if stats.TotalContentSize > 1024 && contentTableSize > 0 {
+		ratio := float64(stats.TotalContentSize) / float64(contentTableSize)
+		savings := (1 - float64(contentTableSize)/float64(stats.TotalContentSize)) * 100
 		if savings > 0 {
 			jsonStats.Storage.CompressionRatio = ratio
 			jsonStats.Storage.SpaceSavedPercent = savings
@@ -1905,9 +1935,14 @@ func printJSONStats(ctx context.Context, r *repo.Repository, stats *db.RepoStats
 			jsonStats.Xpatch.Commits = xpatchToJSON(commitXpatch)
 		}
 
-		contentXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_content")
-		if err == nil && contentXpatch != nil {
-			jsonStats.Xpatch.Content = xpatchToJSON(contentXpatch)
+		textXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_text_content")
+		if err == nil && textXpatch != nil {
+			jsonStats.Xpatch.TextContent = xpatchToJSON(textXpatch)
+		}
+
+		binaryXpatch, err := r.DB.GetXpatchStats(ctx, "pgit_binary_content")
+		if err == nil && binaryXpatch != nil {
+			jsonStats.Xpatch.BinaryContent = xpatchToJSON(binaryXpatch)
 		}
 	}
 

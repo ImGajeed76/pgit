@@ -8,11 +8,12 @@ import (
 )
 
 // SchemaVersion is the current schema version.
-// Version 2 introduces the new three-table architecture:
-// - pgit_paths: path registry (group_id -> path)
-// - pgit_file_refs: file references (metadata, no content)
-// - pgit_content: delta-compressed content storage
-const SchemaVersion = 2
+// Version 3 introduces:
+// - Committer fields (committer_name, committer_email, committed_at)
+// - Renamed created_at -> authored_at
+// - Split content into pgit_text_content (TEXT) + pgit_binary_content (BYTEA)
+// - Added is_binary flag to pgit_file_refs
+const SchemaVersion = 3
 
 // InitSchema creates the pgit schema in the database
 func (db *DB) InitSchema(ctx context.Context) error {
@@ -59,7 +60,10 @@ func (db *DB) InitSchema(ctx context.Context) error {
 	if err := db.createFileRefsTable(ctx); err != nil {
 		return err
 	}
-	if err := db.createContentTable(ctx); err != nil {
+	if err := db.createTextContentTable(ctx); err != nil {
+		return err
+	}
+	if err := db.createBinaryContentTable(ctx); err != nil {
 		return err
 	}
 	if err := db.createRefsTable(ctx); err != nil {
@@ -92,9 +96,7 @@ func (db *DB) createMetadataTable(ctx context.Context) error {
 }
 
 func (db *DB) createCommitsTable(ctx context.Context) error {
-	// Create table
-	// NOTE: No self-referential FK because FK constraints don't work properly
-	// with xpatch tables. Referential integrity enforced at app level.
+	// Create table with committer fields and renamed authored_at
 	sql := `
 	CREATE TABLE IF NOT EXISTS pgit_commits (
 		id              TEXT PRIMARY KEY,
@@ -103,19 +105,22 @@ func (db *DB) createCommitsTable(ctx context.Context) error {
 		message         TEXT NOT NULL,
 		author_name     TEXT NOT NULL,
 		author_email    TEXT NOT NULL,
-		created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		authored_at     TIMESTAMPTZ NOT NULL,
+		committer_name  TEXT NOT NULL,
+		committer_email TEXT NOT NULL,
+		committed_at    TIMESTAMPTZ NOT NULL
 	) USING xpatch`
 
 	if err := db.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("failed to create pgit_commits: %w", err)
 	}
 
-	// Configure xpatch - use created_at for ordering since id is TEXT (ULID)
-	// pg-xpatch requires INT or TIMESTAMP for order_by
+	// Configure xpatch
 	configSQL := `
 	SELECT xpatch.configure('pgit_commits',
-		order_by => 'created_at',
-		delta_columns => ARRAY['message', 'author_name', 'author_email'],
+		order_by => 'authored_at',
+		delta_columns => ARRAY['message', 'author_name', 'author_email',
+		                       'committer_name', 'committer_email'],
 		keyframe_every => 100,
 		compress_depth => 50
 	)`
@@ -125,14 +130,12 @@ func (db *DB) createCommitsTable(ctx context.Context) error {
 
 	// Create indexes
 	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_parent ON pgit_commits(parent_id)")
-	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_created ON pgit_commits(created_at DESC)")
+	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_authored ON pgit_commits(authored_at DESC)")
 
 	return nil
 }
 
 // createPathsTable creates the path registry table.
-// This table maps file paths to group_ids for efficient storage.
-// One row per unique file path ever seen in the repository.
 func (db *DB) createPathsTable(ctx context.Context) error {
 	sql := `
 	CREATE TABLE IF NOT EXISTS pgit_paths (
@@ -144,15 +147,12 @@ func (db *DB) createPathsTable(ctx context.Context) error {
 		return fmt.Errorf("failed to create pgit_paths: %w", err)
 	}
 
-	// Create index for path lookups
 	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_paths_path ON pgit_paths(path)")
 
 	return nil
 }
 
-// createFileRefsTable creates the file references table.
-// This is an uncompressed lookup table that stores file metadata
-// without the actual content. Enables fast metadata queries.
+// createFileRefsTable creates the file references table with is_binary flag.
 func (db *DB) createFileRefsTable(ctx context.Context) error {
 	sql := `
 	CREATE TABLE IF NOT EXISTS pgit_file_refs (
@@ -163,6 +163,7 @@ func (db *DB) createFileRefsTable(ctx context.Context) error {
 		mode            INTEGER NOT NULL DEFAULT 33188,
 		is_symlink      BOOLEAN NOT NULL DEFAULT FALSE,
 		symlink_target  TEXT,
+		is_binary       BOOLEAN NOT NULL DEFAULT FALSE,
 		PRIMARY KEY (group_id, commit_id)
 	)`
 
@@ -170,34 +171,28 @@ func (db *DB) createFileRefsTable(ctx context.Context) error {
 		return fmt.Errorf("failed to create pgit_file_refs: %w", err)
 	}
 
-	// Create indexes for common query patterns
 	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_commit ON pgit_file_refs(commit_id)")
 	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_version ON pgit_file_refs(group_id, version_id)")
 
 	return nil
 }
 
-// createContentTable creates the content storage table.
-// This table uses xpatch for delta compression of file contents.
-// Content is grouped by group_id (file path) and ordered by version_id.
-func (db *DB) createContentTable(ctx context.Context) error {
+// createTextContentTable creates the text content storage table (TEXT column).
+func (db *DB) createTextContentTable(ctx context.Context) error {
 	sql := `
-	CREATE TABLE IF NOT EXISTS pgit_content (
+	CREATE TABLE IF NOT EXISTS pgit_text_content (
 		group_id    INTEGER NOT NULL,
 		version_id  INTEGER NOT NULL,
-		content     BYTEA NOT NULL DEFAULT ''::bytea,
+		content     TEXT NOT NULL DEFAULT '',
 		PRIMARY KEY (group_id, version_id)
 	) USING xpatch`
 
 	if err := db.Exec(ctx, sql); err != nil {
-		return fmt.Errorf("failed to create pgit_content: %w", err)
+		return fmt.Errorf("failed to create pgit_text_content: %w", err)
 	}
 
-	// Configure xpatch for optimal delta compression
-	// group_by: group_id (file path) - deltas computed within same file
-	// order_by: version_id - sequential versions for optimal deltas
 	configSQL := `
-	SELECT xpatch.configure('pgit_content',
+	SELECT xpatch.configure('pgit_text_content',
 		group_by => 'group_id',
 		order_by => 'version_id',
 		delta_columns => ARRAY['content'],
@@ -205,15 +200,40 @@ func (db *DB) createContentTable(ctx context.Context) error {
 		compress_depth => 50
 	)`
 
-	// Ignore error if already configured
+	_ = db.Exec(ctx, configSQL)
+
+	return nil
+}
+
+// createBinaryContentTable creates the binary content storage table (BYTEA column).
+func (db *DB) createBinaryContentTable(ctx context.Context) error {
+	sql := `
+	CREATE TABLE IF NOT EXISTS pgit_binary_content (
+		group_id    INTEGER NOT NULL,
+		version_id  INTEGER NOT NULL,
+		content     BYTEA NOT NULL DEFAULT ''::bytea,
+		PRIMARY KEY (group_id, version_id)
+	) USING xpatch`
+
+	if err := db.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("failed to create pgit_binary_content: %w", err)
+	}
+
+	configSQL := `
+	SELECT xpatch.configure('pgit_binary_content',
+		group_by => 'group_id',
+		order_by => 'version_id',
+		delta_columns => ARRAY['content'],
+		keyframe_every => 100,
+		compress_depth => 50
+	)`
+
 	_ = db.Exec(ctx, configSQL)
 
 	return nil
 }
 
 func (db *DB) createRefsTable(ctx context.Context) error {
-	// NOTE: No FK to pgit_commits because FK constraints don't work properly
-	// when referencing xpatch tables. Referential integrity enforced at app level.
 	sql := `
 	CREATE TABLE IF NOT EXISTS pgit_refs (
 		name        TEXT PRIMARY KEY,
@@ -228,8 +248,6 @@ func (db *DB) createRefsTable(ctx context.Context) error {
 }
 
 func (db *DB) createSyncStateTable(ctx context.Context) error {
-	// NOTE: No FK to pgit_commits because FK constraints don't work properly
-	// when referencing xpatch tables. Referential integrity enforced at app level.
 	sql := `
 	CREATE TABLE IF NOT EXISTS pgit_sync_state (
 		remote_name     TEXT PRIMARY KEY,
@@ -296,7 +314,9 @@ func (db *DB) DropSchema(ctx context.Context) error {
 		"pgit_metadata",
 		"pgit_sync_state",
 		"pgit_refs",
-		"pgit_content",
+		"pgit_text_content",
+		"pgit_binary_content",
+		"pgit_content", // Legacy v2 table
 		"pgit_file_refs",
 		"pgit_paths",
 		"pgit_commits",
@@ -313,12 +333,11 @@ func (db *DB) DropSchema(ctx context.Context) error {
 	return nil
 }
 
-// IsSchemaV2 checks if the database uses the new v2 schema.
-// This is useful for code that needs to handle both schemas during migration.
-func (db *DB) IsSchemaV2(ctx context.Context) (bool, error) {
+// IsSchemaAtLeast checks if the database schema is at least the given version.
+func (db *DB) IsSchemaAtLeast(ctx context.Context, minVersion int) (bool, error) {
 	version, err := db.GetSchemaVersion(ctx)
 	if err != nil {
 		return false, err
 	}
-	return version >= 2, nil
+	return version >= minVersion, nil
 }

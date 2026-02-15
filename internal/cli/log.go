@@ -152,7 +152,7 @@ func printGraphLog(commits []*db.Commit, oneline bool) error {
 				graphPrefix,
 				styles.Hash(commit.ID, false),
 				refs,
-				styles.MutedMsg(util.RelativeTimeShort(commit.CreatedAt)))
+				styles.MutedMsg(util.RelativeTimeShort(commit.AuthoredAt)))
 			fmt.Printf("%s%s - %s\n",
 				connector,
 				styles.Author(commit.AuthorName),
@@ -169,26 +169,32 @@ func printGraphLog(commits []*db.Commit, oneline bool) error {
 
 // JSONLogEntry represents a commit in JSON format
 type JSONLogEntry struct {
-	ID          string  `json:"id"`
-	ShortID     string  `json:"short_id"`
-	ParentID    *string `json:"parent_id,omitempty"`
-	Message     string  `json:"message"`
-	AuthorName  string  `json:"author_name"`
-	AuthorEmail string  `json:"author_email"`
-	Timestamp   string  `json:"timestamp"`
+	ID             string  `json:"id"`
+	ShortID        string  `json:"short_id"`
+	ParentID       *string `json:"parent_id,omitempty"`
+	Message        string  `json:"message"`
+	AuthorName     string  `json:"author_name"`
+	AuthorEmail    string  `json:"author_email"`
+	Timestamp      string  `json:"timestamp"`
+	CommitterName  string  `json:"committer_name"`
+	CommitterEmail string  `json:"committer_email"`
+	CommittedAt    string  `json:"committed_at"`
 }
 
 func printJSONLog(commits []*db.Commit) error {
 	entries := make([]JSONLogEntry, len(commits))
 	for i, c := range commits {
 		entries[i] = JSONLogEntry{
-			ID:          c.ID,
-			ShortID:     util.ShortID(c.ID),
-			ParentID:    c.ParentID,
-			Message:     c.Message,
-			AuthorName:  c.AuthorName,
-			AuthorEmail: c.AuthorEmail,
-			Timestamp:   c.CreatedAt.Format(time.RFC3339),
+			ID:             c.ID,
+			ShortID:        util.ShortID(c.ID),
+			ParentID:       c.ParentID,
+			Message:        c.Message,
+			AuthorName:     c.AuthorName,
+			AuthorEmail:    c.AuthorEmail,
+			Timestamp:      c.AuthoredAt.Format(time.RFC3339),
+			CommitterName:  c.CommitterName,
+			CommitterEmail: c.CommitterEmail,
+			CommittedAt:    c.CommittedAt.Format(time.RFC3339),
 		}
 	}
 
@@ -541,7 +547,7 @@ func (m logModel) renderCommits() string {
 			symbolStyle.Render(symbol),
 			hash,
 			refs,
-			styles.MutedMsg(util.RelativeTimeShort(commit.CreatedAt))))
+			styles.MutedMsg(util.RelativeTimeShort(commit.AuthoredAt))))
 
 		// Second line: author and message
 		author := styles.Author(commit.AuthorName)
@@ -603,7 +609,14 @@ func printCommitFull(commit *db.Commit, isHead bool) {
 	fmt.Printf("Author: %s <%s>\n", commit.AuthorName, commit.AuthorEmail)
 
 	// Date
-	fmt.Printf("Date:   %s\n", commit.CreatedAt.Format("Mon Jan 2 15:04:05 2006 -0700"))
+	fmt.Printf("Date:   %s\n", commit.AuthoredAt.Format("Mon Jan 2 15:04:05 2006 -0700"))
+
+	// Committer (only shown when different from author, like git log --format=full)
+	committerDiffers := commit.CommitterName != commit.AuthorName || commit.CommitterEmail != commit.AuthorEmail
+	if committerDiffers {
+		fmt.Printf("Committer: %s <%s>\n", commit.CommitterName, commit.CommitterEmail)
+		fmt.Printf("CommitDate: %s\n", commit.CommittedAt.Format("Mon Jan 2 15:04:05 2006 -0700"))
+	}
 
 	// Message (indented)
 	fmt.Println()

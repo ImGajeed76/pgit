@@ -39,8 +39,9 @@ repository and stores them in the pgit database with delta compression.
 By default, imports the current branch. Use --branch to specify a different
 branch, or an interactive picker will be shown if multiple branches exist.
 
-The import uses a streaming architecture with progress visualization
-showing git extraction and pgit import rates separately.
+The import uses git fast-export for correct handling of merges, renames,
+and full commit messages. A parallel worker pool imports blob content
+with progress visualization.
 
 The current directory must be a pgit repository (run 'pgit init' first).`,
 		Args: cobra.MaximumNArgs(1),
@@ -56,36 +57,50 @@ The current directory must be a pgit repository (run 'pgit init' first).`,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Data structures
+// Data structures for fast-export parsing
 // ═══════════════════════════════════════════════════════════════════════════
 
-// gitCommitInfo contains commit metadata from git log --raw
-type gitCommitInfo struct {
-	Hash        string
-	ParentHash  string
-	AuthorName  string
-	AuthorEmail string
-	AuthorDate  time.Time
-	Message     string
+// blobEntry records where a blob's content lives in the temp file.
+type blobEntry struct {
+	Mark       int    // :N mark number
+	Offset     int64  // byte offset in temp file where content starts (after "data <size>\n")
+	Size       int    // byte size of content
+	OriginalID string // git SHA (from original-oid line), empty if not present
 }
 
-// gitFileChange represents a file change in a commit
-type gitFileChange struct {
-	CommitHash string
-	Path       string
-	BlobHash   string
-	Mode       int
-	ChangeType byte // 'A'dd, 'M'odify, 'D'elete
+// commitEntry records parsed commit metadata from fast-export.
+type commitEntry struct {
+	Mark               int
+	OriginalID         string // git SHA
+	AuthorName         string
+	AuthorEmail        string
+	AuthorTimestamp    int64 // unix seconds
+	AuthorTZ           string
+	CommitterName      string
+	CommitterEmail     string
+	CommitterTimestamp int64
+	CommitterTZ        string
+	MessageOffset      int64 // byte offset of message in temp file
+	MessageSize        int   // message byte count
+	FromMark           int   // parent commit mark (0 = root commit)
+	MergeMark          int   // merge parent mark (0 = not a merge, only first merge tracked)
+	FileOps            []fileOp
 }
 
-// blobWork represents work for the blob importer
-type blobWork struct {
-	Path      string
-	CommitID  string // pgit ULID
-	BlobHash  string
-	Mode      int
-	IsSymlink bool
-	IsDeleted bool // true for deletions (no content to fetch)
+// fileOp represents a file operation in a commit.
+type fileOp struct {
+	Type     byte   // 'M' (modify/add), 'D' (delete)
+	Mode     int    // file mode (100644, 100755, 120000)
+	BlobMark int    // mark reference for M ops (0 for D ops)
+	Path     string // file path (unquoted)
+}
+
+// pathOp groups a commit's operation on a specific path.
+type pathOp struct {
+	CommitID string // pgit ULID
+	BlobMark int    // mark -> can get offset+size from blobIndex
+	Mode     int
+	IsDelete bool
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -173,19 +188,22 @@ func runImport(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Branch: %s\n", styles.Branch(selectedBranch))
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 1: Parse git history with single command
+	// Step 1: Export to temp file via git fast-export
 	// ═══════════════════════════════════════════════════════════════════════
 
-	spinner := ui.NewSpinner("Parsing git history")
+	spinner := ui.NewSpinner("Exporting git history")
 	spinner.Start()
 
-	commits, fileChanges, err := parseGitHistory(gitPath, selectedBranch)
+	tmpPath, exportSize, err := exportToFile(gitPath, selectedBranch)
 	spinner.Stop()
 
 	if err != nil {
+		// Clean up temp file if it was created
+		if tmpPath != "" {
+			os.Remove(tmpPath)
+		}
 		// Check if the branch doesn't exist
 		if strings.Contains(err.Error(), "exit status 128") {
-			// Try to get available branches for helpful error message
 			branches, branchErr := getGitBranches(gitPath)
 			if branchErr == nil && len(branches) > 0 {
 				var branchNames []string
@@ -197,14 +215,38 @@ func runImport(cmd *cobra.Command, args []string) error {
 					WithSuggestion(fmt.Sprintf("pgit import %s --branch %s", gitPath, branchNames[0]))
 			}
 		}
-		return fmt.Errorf("failed to parse git history: %w", err)
+		return fmt.Errorf("failed to export git history: %w", err)
+	}
+	defer os.Remove(tmpPath)
+
+	fmt.Printf("Exported %s fast-export stream\n", formatBytes(exportSize))
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Step 2: Index the fast-export stream (single pass)
+	// ═══════════════════════════════════════════════════════════════════════
+
+	spinner = ui.NewSpinner("Indexing fast-export stream")
+	spinner.Start()
+
+	commitEntries, blobIndex, err := indexFastExport(tmpPath)
+	spinner.Stop()
+
+	if err != nil {
+		return fmt.Errorf("failed to index fast-export: %w", err)
 	}
 
-	fmt.Printf("Found %s commits, %s file changes\n",
-		ui.FormatCount(len(commits)),
-		ui.FormatCount(len(fileChanges)))
+	// Count total file ops
+	totalFileOps := 0
+	for _, ce := range commitEntries {
+		totalFileOps += len(ce.FileOps)
+	}
 
-	if len(commits) == 0 {
+	fmt.Printf("Found %s commits, %s file changes, %s blobs\n",
+		ui.FormatCount(len(commitEntries)),
+		ui.FormatCount(totalFileOps),
+		ui.FormatCount(len(blobIndex)))
+
+	if len(commitEntries) == 0 {
 		fmt.Println("No commits to import")
 		return nil
 	}
@@ -226,50 +268,25 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 2: Create commit mapping and prepare pgit commits
+	// Step 3: Prepare commits (ULID assignment, commit objects, path grouping)
 	// ═══════════════════════════════════════════════════════════════════════
 
 	fmt.Println("\nPreparing commits...")
 
-	commitMap := make(map[string]string) // git hash -> pgit ULID
-	pgitCommits := make([]*db.Commit, len(commits))
-
-	var lastTime time.Time
-	for i, gc := range commits {
-		commitTime := gc.AuthorDate
-		if !commitTime.After(lastTime) {
-			commitTime = lastTime.Add(time.Millisecond)
-		}
-		lastTime = commitTime
-
-		ulid := util.NewULIDWithTime(commitTime)
-		commitMap[gc.Hash] = ulid
-
-		var parentID *string
-		if gc.ParentHash != "" {
-			if pid, ok := commitMap[gc.ParentHash]; ok {
-				parentID = &pid
-			}
-		}
-
-		pgitCommits[i] = &db.Commit{
-			ID:          ulid,
-			ParentID:    parentID,
-			TreeHash:    gc.Hash[:8],
-			Message:     util.ToValidUTF8(gc.Message),
-			AuthorName:  util.ToValidUTF8(gc.AuthorName),
-			AuthorEmail: util.ToValidUTF8(gc.AuthorEmail),
-			CreatedAt:   commitTime,
-		}
+	tmpFile, err := os.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("failed to reopen temp file: %w", err)
 	}
+	defer tmpFile.Close()
+
+	pgitCommits, markToULID, pathOps := prepareCommits(commitEntries, blobIndex, tmpFile)
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 3: Insert commits (batch for speed)
+	// Step 4: Insert commits (batch for speed)
 	// ═══════════════════════════════════════════════════════════════════════
 
 	fmt.Println("\nImporting commits...")
 
-	// Use batch insert with COPY for speed
 	batchSize := 1000
 	commitProgress := ui.NewProgress("Commits", len(pgitCommits))
 
@@ -289,55 +306,21 @@ func runImport(cmd *cobra.Command, args []string) error {
 	commitProgress.Done()
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 4: Import blobs with dual progress
+	// Step 5: Parallel blob import via ReadAt on temp file
 	// ═══════════════════════════════════════════════════════════════════════
 
-	// Collect all file changes (additions, modifications, AND deletions)
-	var blobsToImport []blobWork
-	for _, fc := range fileChanges {
-		pgitCommitID, ok := commitMap[fc.CommitHash]
-		if !ok {
-			continue
-		}
+	fmt.Printf("\nImporting %s file versions across %s paths...\n",
+		ui.FormatCount(totalFileOps), ui.FormatCount(len(pathOps)))
 
-		if fc.ChangeType == 'D' {
-			// Deletion - no content to fetch, will be handled in importBlobsOptimized
-			blobsToImport = append(blobsToImport, blobWork{
-				Path:      fc.Path,
-				CommitID:  pgitCommitID,
-				BlobHash:  "",
-				Mode:      0,
-				IsSymlink: false,
-				IsDeleted: true,
-			})
-			continue
-		}
-
-		if fc.BlobHash == "" || fc.BlobHash == "0000000000000000000000000000000000000000" {
-			continue
-		}
-
-		blobsToImport = append(blobsToImport, blobWork{
-			Path:      fc.Path,
-			CommitID:  pgitCommitID,
-			BlobHash:  fc.BlobHash,
-			Mode:      fc.Mode,
-			IsSymlink: fc.Mode == 0120000,
-			IsDeleted: false,
-		})
-	}
-
-	fmt.Printf("\nImporting %s file versions...\n", ui.FormatCount(len(blobsToImport)))
-
-	if len(blobsToImport) > 0 {
-		err = importBlobsOptimized(ctx, r.DB, gitPath, blobsToImport, workers)
+	if totalFileOps > 0 {
+		err = importBlobsParallel(ctx, r.DB, tmpPath, pathOps, blobIndex, markToULID, workers)
 		if err != nil {
 			return err
 		}
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 5: Set HEAD
+	// Step 6: Set HEAD
 	// ═══════════════════════════════════════════════════════════════════════
 
 	latestCommit := pgitCommits[len(pgitCommits)-1]
@@ -346,7 +329,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 6: Checkout working tree
+	// Step 7: Checkout working tree
 	// ═══════════════════════════════════════════════════════════════════════
 
 	fmt.Printf("\nChecking out files...\n")
@@ -374,7 +357,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("\n%s Imported %s commits from git repository\n",
 		styles.Green("Success!"),
-		ui.FormatCount(len(commits)))
+		ui.FormatCount(len(commitEntries)))
 	fmt.Printf("HEAD is now at %s %s\n",
 		styles.Hash(latestCommit.ID, true),
 		firstLine(latestCommit.Message))
@@ -383,180 +366,479 @@ func runImport(cmd *cobra.Command, args []string) error {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Git history parsing (single command)
+// Phase 1: Export to temp file
 // ═══════════════════════════════════════════════════════════════════════════
 
-func parseGitHistory(gitPath, branch string) ([]gitCommitInfo, []gitFileChange, error) {
-	// git log --raw --reverse gives us commits with their file changes
-	// Format: hash|parent|author|email|date|subject
-	// Then raw diff lines: :oldmode newmode oldhash newhash status\tpath
-	cmd := exec.Command("git", "log", "--raw", "--reverse",
-		"--format=%H|%P|%an|%ae|%aI|%s", branch)
+// exportToFile runs git fast-export and writes the stream to a temp file.
+// Returns the temp file path, total bytes written, and error.
+func exportToFile(gitPath, branch string) (string, int64, error) {
+	cmd := exec.Command("git", "fast-export", "--reencode=yes", "--show-original-ids", branch)
 	cmd.Dir = gitPath
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, nil, err
+		return "", 0, err
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, nil, err
+		return "", 0, err
 	}
 
-	var commits []gitCommitInfo
-	var fileChanges []gitFileChange
-	seenChanges := make(map[string]bool) // Dedupe merge commit duplicates
+	tmpFile, err := os.CreateTemp("", "pgit-import-*.fastexport")
+	if err != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+		return "", 0, err
+	}
+	tmpPath := tmpFile.Name()
 
-	scanner := bufio.NewScanner(stdout)
-	// Increase buffer size for long lines
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	n, copyErr := io.Copy(tmpFile, stdout)
+	tmpFile.Close()
 
-	var currentCommit *gitCommitInfo
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if line == "" {
-			continue
+	if waitErr := cmd.Wait(); waitErr != nil {
+		if copyErr != nil {
+			return tmpPath, n, fmt.Errorf("git fast-export failed: %w (copy error: %v)", waitErr, copyErr)
 		}
-
-		// Check if it's a commit line (starts with hash)
-		if len(line) >= 40 && !strings.HasPrefix(line, ":") {
-			parts := strings.SplitN(line, "|", 6)
-			if len(parts) >= 6 && len(parts[0]) == 40 {
-				// Parse commit
-				parentHash := ""
-				if parts[1] != "" {
-					parents := strings.Fields(parts[1])
-					if len(parents) > 0 {
-						parentHash = parents[0]
-					}
-				}
-
-				authorDate, _ := time.Parse(time.RFC3339, parts[4])
-
-				commit := gitCommitInfo{
-					Hash:        parts[0],
-					ParentHash:  parentHash,
-					AuthorName:  parts[2],
-					AuthorEmail: parts[3],
-					AuthorDate:  authorDate,
-					Message:     parts[5],
-				}
-				commits = append(commits, commit)
-				currentCommit = &commits[len(commits)-1]
-				continue
-			}
-		}
-
-		// Check if it's a raw diff line
-		if strings.HasPrefix(line, ":") && currentCommit != nil {
-			// Format: :oldmode newmode oldhash newhash status\tpath
-			// Example: :100644 100644 abc123 def456 M	path/to/file
-			tabIdx := strings.Index(line, "\t")
-			if tabIdx == -1 {
-				continue
-			}
-
-			path := line[tabIdx+1:]
-			fields := strings.Fields(line[1:tabIdx])
-			if len(fields) < 5 {
-				continue
-			}
-
-			newMode, _ := strconv.ParseInt(fields[1], 8, 32)
-			newHash := fields[3]
-			status := fields[4][0] // First char: A, M, D, R, C, etc.
-
-			// For renames (R) and copies (C), the path might have two parts
-			if status == 'R' || status == 'C' {
-				pathParts := strings.Split(path, "\t")
-				if len(pathParts) == 2 {
-					path = pathParts[1] // Use destination path
-				}
-			}
-
-			// Deduplicate: merge commits can list the same file change multiple times
-			// (once for each parent). We only want the first one.
-			changeKey := currentCommit.Hash + "\x00" + path
-			if seenChanges[changeKey] {
-				continue
-			}
-			seenChanges[changeKey] = true
-
-			fc := gitFileChange{
-				CommitHash: currentCommit.Hash,
-				Path:       path,
-				BlobHash:   newHash,
-				Mode:       int(newMode),
-				ChangeType: status,
-			}
-			fileChanges = append(fileChanges, fc)
-		}
+		return tmpPath, n, fmt.Errorf("git fast-export failed: %w", waitErr)
+	}
+	if copyErr != nil {
+		return tmpPath, n, fmt.Errorf("failed to write export stream: %w", copyErr)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, nil, fmt.Errorf("error reading git output: %w", err)
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return nil, nil, fmt.Errorf("git log failed: %w", err)
-	}
-
-	return commits, fileChanges, nil
+	return tmpPath, n, nil
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Blob import - optimized for pg-xpatch delta compression
+// Phase 2: Index the fast-export stream
 // ═══════════════════════════════════════════════════════════════════════════
 
-// importBlobsOptimized imports blobs grouped by path for optimal delta compression.
-// pg-xpatch compresses blobs within the same path, so we:
-// 1. Group all blobs by path
-// 2. Sort each path's blobs by commit_id (chronological order)
-// 3. Process paths in parallel (different paths are independent)
-// 4. Insert all versions of a path together in order
-//
-// Each worker gets its own `git cat-file --batch` process for true parallelism.
-func importBlobsOptimized(
-	ctx context.Context,
-	database *db.DB,
-	gitPath string,
-	blobs []blobWork,
-	workers int,
-) error {
-	// ───────────────────────────────────────────────────────────────────────
-	// Step 1: Group blobs by path and sort by commit_id
-	// ───────────────────────────────────────────────────────────────────────
+// indexFastExport does a single-pass scan of the temp file and builds
+// the blob index and commit entry list.
+func indexFastExport(tmpPath string) ([]commitEntry, map[int]*blobEntry, error) {
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
 
-	pathGroups := make(map[string][]blobWork)
-	for _, b := range blobs {
-		pathGroups[b.Path] = append(pathGroups[b.Path], b)
+	reader := bufio.NewReaderSize(f, 4*1024*1024) // 4MB buffer
+
+	var commits []commitEntry
+	blobIdx := make(map[int]*blobEntry)
+
+	// Track byte offset in the stream
+	var offset int64
+
+	// readLine reads a line and tracks offset. Returns line without trailing \n.
+	readLine := func() (string, error) {
+		line, err := reader.ReadString('\n')
+		offset += int64(len(line))
+		if err != nil {
+			return strings.TrimSuffix(line, "\n"), err
+		}
+		return strings.TrimSuffix(line, "\n"), nil
 	}
 
-	// Sort each group by commit_id (ULID = chronological)
-	for path := range pathGroups {
-		group := pathGroups[path]
-		sort.Slice(group, func(i, j int) bool {
-			return group[i].CommitID < group[j].CommitID
+	// skipData reads and skips exactly n bytes of data content plus optional trailing LF.
+	// Returns the byte offset where the data starts.
+	skipData := func(n int) (int64, error) {
+		dataOffset := offset
+		// Skip n bytes
+		remaining := n
+		for remaining > 0 {
+			skipped, err := reader.Discard(min(remaining, 4*1024*1024))
+			offset += int64(skipped)
+			remaining -= skipped
+			if err != nil {
+				return dataOffset, err
+			}
+		}
+		// Skip optional trailing LF
+		b, err := reader.ReadByte()
+		if err == nil {
+			offset++
+			if b != '\n' {
+				reader.UnreadByte()
+				offset--
+			}
+		}
+		return dataOffset, nil
+	}
+
+	for {
+		line, err := readLine()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("read error at offset %d: %w", offset, err)
+		}
+
+		switch {
+		case line == "blob":
+			be := &blobEntry{}
+			// Read blob metadata lines until data
+			for {
+				bline, err := readLine()
+				if err != nil {
+					return nil, nil, fmt.Errorf("unexpected EOF in blob at offset %d", offset)
+				}
+				if strings.HasPrefix(bline, "mark :") {
+					be.Mark, _ = strconv.Atoi(bline[6:])
+				} else if strings.HasPrefix(bline, "original-oid ") {
+					be.OriginalID = bline[13:]
+				} else if strings.HasPrefix(bline, "data ") {
+					size, _ := strconv.Atoi(bline[5:])
+					be.Size = size
+					dataOffset, err := skipData(size)
+					if err != nil {
+						return nil, nil, fmt.Errorf("error skipping blob data at offset %d: %w", offset, err)
+					}
+					be.Offset = dataOffset
+					break
+				}
+			}
+			if be.Mark > 0 {
+				blobIdx[be.Mark] = be
+			}
+
+		case strings.HasPrefix(line, "commit "):
+			ce := commitEntry{}
+			// Read commit metadata
+			for {
+				cline, err := readLine()
+				if err != nil {
+					return nil, nil, fmt.Errorf("unexpected EOF in commit at offset %d", offset)
+				}
+
+				if strings.HasPrefix(cline, "mark :") {
+					ce.Mark, _ = strconv.Atoi(cline[6:])
+				} else if strings.HasPrefix(cline, "original-oid ") {
+					ce.OriginalID = cline[13:]
+				} else if strings.HasPrefix(cline, "author ") {
+					ce.AuthorName, ce.AuthorEmail, ce.AuthorTimestamp, ce.AuthorTZ = parseIdentity(cline[7:])
+				} else if strings.HasPrefix(cline, "committer ") {
+					ce.CommitterName, ce.CommitterEmail, ce.CommitterTimestamp, ce.CommitterTZ = parseIdentity(cline[10:])
+				} else if strings.HasPrefix(cline, "data ") {
+					size, _ := strconv.Atoi(cline[5:])
+					ce.MessageSize = size
+					dataOffset, err := skipData(size)
+					if err != nil {
+						return nil, nil, fmt.Errorf("error skipping commit message at offset %d: %w", offset, err)
+					}
+					ce.MessageOffset = dataOffset
+					// After commit message, read file ops and from/merge
+					break
+				}
+			}
+
+			// Read from, merge, and file ops
+			for {
+				cline, err := readLine()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return nil, nil, fmt.Errorf("error reading commit ops at offset %d: %w", offset, err)
+				}
+
+				if cline == "" {
+					// Empty line signals end of commit
+					break
+				}
+
+				if strings.HasPrefix(cline, "from :") {
+					ce.FromMark, _ = strconv.Atoi(cline[6:])
+				} else if strings.HasPrefix(cline, "merge :") {
+					if ce.MergeMark == 0 {
+						ce.MergeMark, _ = strconv.Atoi(cline[7:])
+					}
+					// Additional merge parents are ignored (pgit tracks single parent)
+				} else if strings.HasPrefix(cline, "M ") {
+					op := parseFileModify(cline)
+					if op.Path != "" {
+						ce.FileOps = append(ce.FileOps, op)
+					}
+				} else if strings.HasPrefix(cline, "D ") {
+					path := unquotePath(cline[2:])
+					if path != "" {
+						ce.FileOps = append(ce.FileOps, fileOp{
+							Type: 'D',
+							Path: path,
+						})
+					}
+				} else if strings.HasPrefix(cline, "R ") {
+					// Rename: decompose to D old + M new
+					// Shouldn't appear without -M flag, but handle gracefully
+					parts := strings.SplitN(cline[2:], " ", 2)
+					if len(parts) == 2 {
+						oldPath := unquotePath(parts[0])
+						newPath := unquotePath(parts[1])
+						ce.FileOps = append(ce.FileOps, fileOp{Type: 'D', Path: oldPath})
+						// Note: R doesn't carry a blob mark — the new path gets the old blob
+						// This shouldn't happen without -M, but if it does we can't resolve it here
+						_ = newPath
+					}
+				} else if cline == "deleteall" {
+					// deleteall: marks all files as deleted — rare, skip for now
+				}
+			}
+
+			commits = append(commits, ce)
+
+		case strings.HasPrefix(line, "reset "):
+			// reset line — skip
+			continue
+
+		case strings.HasPrefix(line, "progress "):
+			// progress line — skip
+			continue
+
+		case line == "done":
+			break
+
+		case line == "":
+			continue
+		}
+	}
+
+	return commits, blobIdx, nil
+}
+
+// parseIdentity parses a fast-export author/committer line.
+// Format: "Name <email> timestamp tz"
+// Example: "John Doe <john@example.com> 1234567890 +0100"
+func parseIdentity(s string) (name, email string, timestamp int64, tz string) {
+	// Find < and >
+	ltIdx := strings.LastIndex(s, " <")
+	gtIdx := strings.LastIndex(s, "> ")
+	if ltIdx < 0 || gtIdx < 0 || gtIdx <= ltIdx {
+		return s, "", 0, ""
+	}
+
+	name = s[:ltIdx]
+	email = s[ltIdx+2 : gtIdx]
+
+	rest := s[gtIdx+2:]
+	parts := strings.Fields(rest)
+	if len(parts) >= 1 {
+		timestamp, _ = strconv.ParseInt(parts[0], 10, 64)
+	}
+	if len(parts) >= 2 {
+		tz = parts[1]
+	}
+
+	return name, email, timestamp, tz
+}
+
+// parseFileModify parses "M <mode> :<mark> <path>" line.
+func parseFileModify(line string) fileOp {
+	// "M 100644 :5 path/to/file"
+	// "M 100644 :5 "quoted path""
+	parts := strings.SplitN(line, " ", 4)
+	if len(parts) < 4 {
+		return fileOp{}
+	}
+
+	mode, _ := strconv.ParseInt(parts[1], 8, 32)
+	markStr := parts[2]
+	mark := 0
+	if strings.HasPrefix(markStr, ":") {
+		mark, _ = strconv.Atoi(markStr[1:])
+	}
+	path := unquotePath(parts[3])
+
+	return fileOp{
+		Type:     'M',
+		Mode:     int(mode),
+		BlobMark: mark,
+		Path:     path,
+	}
+}
+
+// unquotePath handles C-style quoted paths from fast-export.
+// If the path starts with ", parse escape sequences.
+func unquotePath(s string) string {
+	if len(s) < 2 || s[0] != '"' {
+		return s // unquoted path
+	}
+	// Strip outer quotes
+	if s[len(s)-1] != '"' {
+		return s // malformed, return as-is
+	}
+	inner := s[1 : len(s)-1]
+
+	var buf strings.Builder
+	buf.Grow(len(inner))
+
+	i := 0
+	for i < len(inner) {
+		if inner[i] == '\\' && i+1 < len(inner) {
+			i++
+			switch inner[i] {
+			case '\\':
+				buf.WriteByte('\\')
+			case '"':
+				buf.WriteByte('"')
+			case 'n':
+				buf.WriteByte('\n')
+			case 't':
+				buf.WriteByte('\t')
+			case 'a':
+				buf.WriteByte('\a')
+			case 'b':
+				buf.WriteByte('\b')
+			case 'f':
+				buf.WriteByte('\f')
+			case 'r':
+				buf.WriteByte('\r')
+			case 'v':
+				buf.WriteByte('\v')
+			default:
+				// Octal: \NNN (1-3 digits)
+				if inner[i] >= '0' && inner[i] <= '7' {
+					oct := string(inner[i])
+					for j := 1; j < 3 && i+j < len(inner) && inner[i+j] >= '0' && inner[i+j] <= '7'; j++ {
+						oct += string(inner[i+j])
+					}
+					val, _ := strconv.ParseInt(oct, 8, 32)
+					buf.WriteByte(byte(val))
+					i += len(oct) - 1 // -1 because the loop will i++
+				} else {
+					buf.WriteByte('\\')
+					buf.WriteByte(inner[i])
+				}
+			}
+		} else {
+			buf.WriteByte(inner[i])
+		}
+		i++
+	}
+
+	return buf.String()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3: Prepare commits
+// ═══════════════════════════════════════════════════════════════════════════
+
+// prepareCommits assigns ULIDs, builds db.Commit objects, and groups file ops by path.
+func prepareCommits(
+	commitEntries []commitEntry,
+	blobIndex map[int]*blobEntry,
+	tmpFile *os.File,
+) ([]*db.Commit, map[int]string, map[string][]pathOp) {
+
+	markToULID := make(map[int]string, len(commitEntries))
+	pgitCommits := make([]*db.Commit, 0, len(commitEntries))
+
+	var lastTime time.Time
+
+	for _, ce := range commitEntries {
+		authorTime := time.Unix(ce.AuthorTimestamp, 0)
+		if !authorTime.After(lastTime) {
+			authorTime = lastTime.Add(time.Millisecond)
+		}
+		lastTime = authorTime
+
+		ulid := util.NewULIDWithTime(authorTime)
+		markToULID[ce.Mark] = ulid
+
+		var parentID *string
+		if ce.FromMark > 0 {
+			if pid, ok := markToULID[ce.FromMark]; ok {
+				parentID = &pid
+			}
+		}
+
+		// Read message from temp file
+		message := readBytesAt(tmpFile, ce.MessageOffset, ce.MessageSize)
+
+		committedTime := time.Unix(ce.CommitterTimestamp, 0)
+
+		pgitCommits = append(pgitCommits, &db.Commit{
+			ID:             ulid,
+			ParentID:       parentID,
+			TreeHash:       ce.OriginalID[:min(8, len(ce.OriginalID))],
+			Message:        util.ToValidUTF8(string(message)),
+			AuthorName:     util.ToValidUTF8(ce.AuthorName),
+			AuthorEmail:    util.ToValidUTF8(ce.AuthorEmail),
+			AuthoredAt:     authorTime,
+			CommitterName:  util.ToValidUTF8(ce.CommitterName),
+			CommitterEmail: util.ToValidUTF8(ce.CommitterEmail),
+			CommittedAt:    committedTime,
 		})
 	}
 
-	// Create list of paths to process
-	paths := make([]string, 0, len(pathGroups))
-	for path := range pathGroups {
+	// Group file ops by path (ops are already in correct order since we iterate in stream order)
+	pathOpsMap := make(map[string][]pathOp)
+	for _, ce := range commitEntries {
+		ulid := markToULID[ce.Mark]
+		for _, op := range ce.FileOps {
+			po := pathOp{
+				CommitID: ulid,
+				BlobMark: op.BlobMark,
+				Mode:     op.Mode,
+				IsDelete: op.Type == 'D',
+			}
+			pathOpsMap[op.Path] = append(pathOpsMap[op.Path], po)
+		}
+	}
+
+	return pgitCommits, markToULID, pathOpsMap
+}
+
+// readBytesAt reads exactly n bytes from f at the given offset.
+func readBytesAt(f *os.File, offset int64, n int) []byte {
+	if n <= 0 {
+		return nil
+	}
+	buf := make([]byte, n)
+	_, err := f.ReadAt(buf, offset)
+	if err != nil {
+		return nil
+	}
+	return buf
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 5: Parallel blob import
+// ═══════════════════════════════════════════════════════════════════════════
+
+// importBlobsParallel imports blobs grouped by path using parallel workers.
+// Each worker processes entire paths (all versions) for optimal delta compression.
+// Content is read from the temp file via ReadAt (safe for concurrent access).
+func importBlobsParallel(
+	ctx context.Context,
+	database *db.DB,
+	tmpFilePath string,
+	pathOpsMap map[string][]pathOp,
+	blobIndex map[int]*blobEntry,
+	markToULID map[int]string,
+	workers int,
+) error {
+	// Open temp file for concurrent reads
+	tmpFile, err := os.Open(tmpFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to open temp file for reading: %w", err)
+	}
+	defer tmpFile.Close()
+
+	// Create path channel
+	paths := make([]string, 0, len(pathOpsMap))
+	for path := range pathOpsMap {
 		paths = append(paths, path)
 	}
 
-	// ───────────────────────────────────────────────────────────────────────
-	// Step 2: Process paths with worker pool (each worker has own git process)
-	// ───────────────────────────────────────────────────────────────────────
+	// Count total ops for progress
+	totalOps := 0
+	for _, ops := range pathOpsMap {
+		totalOps += len(ops)
+	}
 
-	totalBlobs := len(blobs)
-	progress := ui.NewProgress("Blobs", totalBlobs)
+	progress := ui.NewProgress("Blobs", totalOps)
 	var imported atomic.Int64
 
-	// Path work channel
 	pathChan := make(chan string, len(paths))
 	for _, p := range paths {
 		pathChan <- p
@@ -567,116 +849,67 @@ func importBlobsOptimized(
 	var firstErr atomic.Value
 	var wg sync.WaitGroup
 
-	// Start workers - each with its own git cat-file process
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			// Start this worker's git cat-file --batch process
-			catFile := exec.CommandContext(ctx, "git", "cat-file", "--batch")
-			catFile.Dir = gitPath
-
-			catStdin, err := catFile.StdinPipe()
-			if err != nil {
-				firstErr.CompareAndSwap(nil, fmt.Errorf("failed to create cat-file stdin: %w", err))
-				return
-			}
-
-			catStdout, err := catFile.StdoutPipe()
-			if err != nil {
-				firstErr.CompareAndSwap(nil, fmt.Errorf("failed to create cat-file stdout: %w", err))
-				return
-			}
-
-			if err := catFile.Start(); err != nil {
-				firstErr.CompareAndSwap(nil, fmt.Errorf("failed to start cat-file: %w", err))
-				return
-			}
-			defer func() { _ = catFile.Wait() }()
-			defer catStdin.Close()
-
-			catReader := bufio.NewReaderSize(catStdout, 1024*1024)
-
-			// fetchBlobContent fetches content for a single blob from this worker's git process
-			fetchBlobContent := func(blobHash string) ([]byte, error) {
-				// Request blob
-				if _, err := fmt.Fprintf(catStdin, "%s\n", blobHash); err != nil {
-					return nil, err
-				}
-
-				// Read header
-				header, err := catReader.ReadString('\n')
-				if err != nil {
-					return nil, err
-				}
-
-				parts := strings.Fields(header)
-				if len(parts) < 3 || parts[1] == "missing" {
-					return nil, fmt.Errorf("blob not found: %s", blobHash)
-				}
-
-				size, err := strconv.Atoi(parts[2])
-				if err != nil {
-					return nil, err
-				}
-
-				// Read content
-				content := make([]byte, size)
-				if _, err := io.ReadFull(catReader, content); err != nil {
-					return nil, err
-				}
-
-				// Read trailing newline
-				_, _ = catReader.ReadByte()
-
-				return content, nil
-			}
-
-			// Process paths assigned to this worker
 			for path := range pathChan {
 				// Check for previous errors
 				if firstErr.Load() != nil {
 					return
 				}
 
-				group := pathGroups[path]
-				dbBlobs := make([]*db.Blob, 0, len(group))
+				ops := pathOpsMap[path]
+				dbBlobs := make([]*db.Blob, 0, len(ops))
 
-				// Fetch content for all blobs in this path (in order)
-				for _, bw := range group {
-					if bw.IsDeleted {
-						// Deletion - no content to fetch
+				for _, op := range ops {
+					if op.IsDelete {
 						dbBlobs = append(dbBlobs, &db.Blob{
-							Path:        bw.Path,
-							CommitID:    bw.CommitID,
+							Path:        path,
+							CommitID:    op.CommitID,
 							Content:     []byte{},
 							ContentHash: nil, // nil = deleted
 							Mode:        0,
 							IsSymlink:   false,
+							IsBinary:    false,
 						})
 						continue
 					}
 
-					content, err := fetchBlobContent(bw.BlobHash)
-					if err != nil {
-						// Skip missing blobs (may have been garbage collected)
+					be, ok := blobIndex[op.BlobMark]
+					if !ok {
+						// Missing blob reference — skip
 						continue
 					}
+
+					// Read blob content from temp file
+					content := make([]byte, be.Size)
+					if be.Size > 0 {
+						_, err := tmpFile.ReadAt(content, be.Offset)
+						if err != nil {
+							firstErr.CompareAndSwap(nil, fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err))
+							return
+						}
+					}
+
+					// Detect binary (NUL byte in first 8000 bytes)
+					isBinary := util.DetectBinary(content)
 
 					// Compute BLAKE3 hash (16 bytes)
 					contentHash := util.HashBytesBlake3(content)
 
 					blob := &db.Blob{
-						Path:        bw.Path,
-						CommitID:    bw.CommitID,
+						Path:        path,
+						CommitID:    op.CommitID,
 						Content:     content,
 						ContentHash: contentHash,
-						Mode:        bw.Mode,
-						IsSymlink:   bw.IsSymlink,
+						Mode:        op.Mode,
+						IsSymlink:   op.Mode == 0120000,
+						IsBinary:    isBinary,
 					}
 
-					if bw.IsSymlink {
+					if blob.IsSymlink {
 						target := string(content)
 						blob.SymlinkTarget = &target
 					}

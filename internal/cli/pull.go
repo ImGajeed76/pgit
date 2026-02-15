@@ -576,13 +576,16 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 			}
 
 			newCommit := &db.Commit{
-				ID:          newCommitID,
-				ParentID:    parentID,
-				TreeHash:    oldCommit.TreeHash,
-				Message:     oldCommit.Message,
-				AuthorName:  oldCommit.AuthorName,
-				AuthorEmail: oldCommit.AuthorEmail,
-				CreatedAt:   time.Now(), // New timestamp
+				ID:             newCommitID,
+				ParentID:       parentID,
+				TreeHash:       oldCommit.TreeHash,
+				Message:        oldCommit.Message,
+				AuthorName:     oldCommit.AuthorName,
+				AuthorEmail:    oldCommit.AuthorEmail,
+				AuthoredAt:     oldCommit.AuthoredAt,
+				CommitterName:  oldCommit.CommitterName,
+				CommitterEmail: oldCommit.CommitterEmail,
+				CommittedAt:    time.Now(), // New timestamp for replay
 			}
 
 			if err := r.DB.CreateCommit(ctx, newCommit); err != nil {
@@ -597,6 +600,7 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 					Content:       blob.Content,
 					ContentHash:   blob.ContentHash,
 					Mode:          blob.Mode,
+					IsBinary:      blob.IsBinary,
 					IsSymlink:     blob.IsSymlink,
 					SymlinkTarget: blob.SymlinkTarget,
 				}

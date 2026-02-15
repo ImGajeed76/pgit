@@ -86,7 +86,11 @@ func showCommitDetails(ctx context.Context, r *repo.Repository, ref string, show
 		styles.Author(commit.AuthorName),
 		commit.AuthorEmail)
 	fmt.Printf("Date:   %s\n",
-		styles.Date(commit.CreatedAt.Format("Mon Jan 2 15:04:05 2006 -0700")))
+		styles.Date(commit.AuthoredAt.Format("Mon Jan 2 15:04:05 2006 -0700")))
+	if commit.CommitterName != commit.AuthorName || commit.CommitterEmail != commit.AuthorEmail {
+		fmt.Printf("Committer: %s <%s>\n", commit.CommitterName, commit.CommitterEmail)
+		fmt.Printf("CommitDate: %s\n", commit.CommittedAt.Format("Mon Jan 2 15:04:05 2006 -0700"))
+	}
 	fmt.Println()
 
 	// Print message (indented)

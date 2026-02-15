@@ -157,7 +157,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 
 	getCommitTime := func(cid string) time.Time {
 		if c, ok := commitMap[cid]; ok {
-			return c.CreatedAt
+			return c.AuthoredAt
 		}
 		return time.Time{}
 	}

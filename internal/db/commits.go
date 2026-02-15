@@ -10,22 +10,27 @@ import (
 
 // Commit represents a commit in the database
 type Commit struct {
-	ID          string
-	ParentID    *string
-	TreeHash    string
-	Message     string
-	AuthorName  string
-	AuthorEmail string
-	CreatedAt   time.Time
+	ID             string
+	ParentID       *string
+	TreeHash       string
+	Message        string
+	AuthorName     string
+	AuthorEmail    string
+	AuthoredAt     time.Time
+	CommitterName  string
+	CommitterEmail string
+	CommittedAt    time.Time
 }
 
 // CreateCommit inserts a new commit into the database
 func (db *DB) CreateCommit(ctx context.Context, c *Commit) error {
 	sql := `
-	INSERT INTO pgit_commits (id, parent_id, tree_hash, message, author_name, author_email, created_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	INSERT INTO pgit_commits (id, parent_id, tree_hash, message, author_name, author_email, authored_at, committer_name, committer_email, committed_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
-	return db.Exec(ctx, sql, c.ID, c.ParentID, c.TreeHash, c.Message, c.AuthorName, c.AuthorEmail, c.CreatedAt)
+	return db.Exec(ctx, sql, c.ID, c.ParentID, c.TreeHash, c.Message,
+		c.AuthorName, c.AuthorEmail, c.AuthoredAt,
+		c.CommitterName, c.CommitterEmail, c.CommittedAt)
 }
 
 // CreateCommitsBatch inserts multiple commits using pgx.CopyFrom for speed
@@ -39,14 +44,17 @@ func (db *DB) CreateCommitsBatch(ctx context.Context, commits []*Commit) error {
 	for i, c := range commits {
 		rows[i] = []interface{}{
 			c.ID, c.ParentID, c.TreeHash, c.Message,
-			c.AuthorName, c.AuthorEmail, c.CreatedAt,
+			c.AuthorName, c.AuthorEmail, c.AuthoredAt,
+			c.CommitterName, c.CommitterEmail, c.CommittedAt,
 		}
 	}
 
 	_, err := db.pool.CopyFrom(
 		ctx,
 		pgx.Identifier{"pgit_commits"},
-		[]string{"id", "parent_id", "tree_hash", "message", "author_name", "author_email", "created_at"},
+		[]string{"id", "parent_id", "tree_hash", "message",
+			"author_name", "author_email", "authored_at",
+			"committer_name", "committer_email", "committed_at"},
 		pgx.CopyFromRows(rows),
 	)
 	return err
@@ -55,14 +63,16 @@ func (db *DB) CreateCommitsBatch(ctx context.Context, commits []*Commit) error {
 // GetCommit retrieves a commit by ID
 func (db *DB) GetCommit(ctx context.Context, id string) (*Commit, error) {
 	sql := `
-	SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+	       committer_name, committer_email, committed_at
 	FROM pgit_commits
 	WHERE id = $1`
 
 	c := &Commit{}
 	err := db.QueryRow(ctx, sql, id).Scan(
 		&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-		&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+		&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+		&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -76,7 +86,8 @@ func (db *DB) GetCommit(ctx context.Context, id string) (*Commit, error) {
 // GetHeadCommit retrieves the commit that HEAD points to
 func (db *DB) GetHeadCommit(ctx context.Context) (*Commit, error) {
 	sql := `
-	SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.created_at
+	SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.authored_at,
+	       c.committer_name, c.committer_email, c.committed_at
 	FROM pgit_commits c
 	JOIN pgit_refs r ON r.commit_id = c.id
 	WHERE r.name = 'HEAD'`
@@ -84,7 +95,8 @@ func (db *DB) GetHeadCommit(ctx context.Context) (*Commit, error) {
 	c := &Commit{}
 	err := db.QueryRow(ctx, sql).Scan(
 		&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-		&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+		&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+		&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -99,19 +111,22 @@ func (db *DB) GetHeadCommit(ctx context.Context) (*Commit, error) {
 func (db *DB) GetCommitLog(ctx context.Context, limit int) ([]*Commit, error) {
 	sql := `
 	WITH RECURSIVE ancestors AS (
-		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.created_at, 1 as depth
+		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.authored_at,
+		       c.committer_name, c.committer_email, c.committed_at, 1 as depth
 		FROM pgit_commits c
 		JOIN pgit_refs r ON r.commit_id = c.id
 		WHERE r.name = 'HEAD'
 		
 		UNION ALL
 		
-		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.created_at, a.depth + 1
+		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.authored_at,
+		       c.committer_name, c.committer_email, c.committed_at, a.depth + 1
 		FROM pgit_commits c
 		JOIN ancestors a ON c.id = a.parent_id
 		WHERE a.depth < $1
 	)
-	SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+	       committer_name, committer_email, committed_at
 	FROM ancestors
 	ORDER BY depth`
 
@@ -126,7 +141,8 @@ func (db *DB) GetCommitLog(ctx context.Context, limit int) ([]*Commit, error) {
 		c := &Commit{}
 		if err := rows.Scan(
 			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-			&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -140,18 +156,21 @@ func (db *DB) GetCommitLog(ctx context.Context, limit int) ([]*Commit, error) {
 func (db *DB) GetCommitLogFrom(ctx context.Context, commitID string, limit int) ([]*Commit, error) {
 	sql := `
 	WITH RECURSIVE ancestors AS (
-		SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at, 1 as depth
+		SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+		       committer_name, committer_email, committed_at, 1 as depth
 		FROM pgit_commits
 		WHERE id = $1
 		
 		UNION ALL
 		
-		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.created_at, a.depth + 1
+		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.authored_at,
+		       c.committer_name, c.committer_email, c.committed_at, a.depth + 1
 		FROM pgit_commits c
 		JOIN ancestors a ON c.id = a.parent_id
 		WHERE a.depth < $2
 	)
-	SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+	       committer_name, committer_email, committed_at
 	FROM ancestors
 	ORDER BY depth`
 
@@ -166,7 +185,8 @@ func (db *DB) GetCommitLogFrom(ctx context.Context, commitID string, limit int) 
 		c := &Commit{}
 		if err := rows.Scan(
 			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-			&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -179,7 +199,8 @@ func (db *DB) GetCommitLogFrom(ctx context.Context, commitID string, limit int) 
 // GetAllCommits retrieves all commits ordered by ID (ULID = time order)
 func (db *DB) GetAllCommits(ctx context.Context) ([]*Commit, error) {
 	sql := `
-	SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+	       committer_name, committer_email, committed_at
 	FROM pgit_commits
 	ORDER BY id`
 
@@ -194,7 +215,8 @@ func (db *DB) GetAllCommits(ctx context.Context) ([]*Commit, error) {
 		c := &Commit{}
 		if err := rows.Scan(
 			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-			&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -214,7 +236,6 @@ func (db *DB) CountCommits(ctx context.Context) (int, error) {
 // DeleteCommitsAfter deletes all commits after (and including) the given commit ID
 // This is used during the "rebuild on divergence" process
 func (db *DB) DeleteCommitsAfter(ctx context.Context, commitID string) error {
-	// Due to ON DELETE CASCADE, this will also delete blobs
 	sql := `DELETE FROM pgit_commits WHERE id >= $1`
 	return db.Exec(ctx, sql, commitID)
 }
@@ -262,14 +283,10 @@ func (db *DB) FindCommonAncestor(ctx context.Context, commitA, commitB string) (
 }
 
 // FindCommitByPartialID finds a commit by partial ID match.
-// Returns the commit if exactly one match is found.
-// Returns nil if no match is found.
-// Returns an error if multiple matches are found (ambiguous).
 func (db *DB) FindCommitByPartialID(ctx context.Context, partialID string) (*Commit, error) {
-	// Try prefix match first (more common), then suffix match
-	// ULID IDs are uppercase, so normalize the input
 	sql := `
-	SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+	       committer_name, committer_email, committed_at
 	FROM pgit_commits
 	WHERE id LIKE $1 || '%' OR id LIKE '%' || $1
 	LIMIT 2`
@@ -285,7 +302,8 @@ func (db *DB) FindCommitByPartialID(ctx context.Context, partialID string) (*Com
 		c := &Commit{}
 		if err := rows.Scan(
 			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-			&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -307,14 +325,14 @@ func (db *DB) FindCommitByPartialID(ctx context.Context, partialID string) (*Com
 }
 
 // GetCommitsBatch retrieves multiple commits by their IDs in a single query.
-// Returns a map of commit ID to Commit. Missing commits are not included in the map.
 func (db *DB) GetCommitsBatch(ctx context.Context, ids []string) (map[string]*Commit, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Commit), nil
 	}
 
 	sql := `
-	SELECT id, parent_id, tree_hash, message, author_name, author_email, created_at
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+	       committer_name, committer_email, committed_at
 	FROM pgit_commits
 	WHERE id = ANY($1)`
 
@@ -329,7 +347,8 @@ func (db *DB) GetCommitsBatch(ctx context.Context, ids []string) (map[string]*Co
 		c := &Commit{}
 		if err := rows.Scan(
 			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-			&c.AuthorName, &c.AuthorEmail, &c.CreatedAt,
+			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
 		); err != nil {
 			return nil, err
 		}

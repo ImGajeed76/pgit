@@ -122,7 +122,7 @@ func runBlame(cmd *cobra.Command, args []string) error {
 			if lineIdx < len(commitLines) && commitLines[lineIdx] == blameLines[lineIdx].lineContent {
 				blameLines[lineIdx].commitID = commit.ID
 				blameLines[lineIdx].authorName = commit.AuthorName
-				blameLines[lineIdx].date = commit.CreatedAt
+				blameLines[lineIdx].date = commit.AuthoredAt
 			}
 		}
 	}

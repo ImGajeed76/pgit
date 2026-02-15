@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/imgajeed76/pgit/v2/internal/util"
 	"github.com/jackc/pgx/v5"
 )
 
 // Blob represents a file at a specific commit.
 // This is the compatibility layer that combines data from pgit_paths,
-// pgit_file_refs, and pgit_content tables in schema v2.
+// pgit_file_refs, and pgit_text_content/pgit_binary_content tables in schema v3.
 type Blob struct {
 	Path          string
 	CommitID      string
@@ -19,6 +20,7 @@ type Blob struct {
 	Mode          int
 	IsSymlink     bool
 	SymlinkTarget *string
+	IsBinary      bool
 }
 
 // IsDeleted returns true if this blob represents a deletion.
@@ -27,7 +29,7 @@ func (b *Blob) IsDeleted() bool {
 }
 
 // CreateBlob inserts a new blob into the database.
-// This writes to pgit_paths, pgit_file_refs, and pgit_content tables.
+// This writes to pgit_paths, pgit_file_refs, and pgit_text_content or pgit_binary_content.
 func (db *DB) CreateBlob(ctx context.Context, b *Blob) error {
 	return db.WithTx(ctx, func(tx pgx.Tx) error {
 		return db.createBlobTx(ctx, tx, b)
@@ -57,19 +59,23 @@ func (db *DB) createBlobTx(ctx context.Context, tx pgx.Tx, b *Blob) error {
 		Mode:          b.Mode,
 		IsSymlink:     b.IsSymlink,
 		SymlinkTarget: b.SymlinkTarget,
+		IsBinary:      b.IsBinary,
 	}
 	if err := db.CreateFileRefTx(ctx, tx, ref); err != nil {
 		return err
 	}
 
-	// 4. Create content (even for deletions, we store empty content)
-	content := &Content{
-		GroupID:   groupID,
-		VersionID: versionID,
-		Content:   b.Content,
-	}
-	if err := db.CreateContentTx(ctx, tx, content); err != nil {
-		return err
+	// 4. Create content (skip for deletions — only file ref needed)
+	if b.ContentHash != nil {
+		content := &Content{
+			GroupID:   groupID,
+			VersionID: versionID,
+			Content:   b.Content,
+			IsBinary:  b.IsBinary,
+		}
+		if err := db.CreateContentTx(ctx, tx, content); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -134,13 +140,19 @@ func (db *DB) CreateBlobs(ctx context.Context, blobs []*Blob) error {
 					Mode:          b.Mode,
 					IsSymlink:     b.IsSymlink,
 					SymlinkTarget: b.SymlinkTarget,
+					IsBinary:      b.IsBinary,
 				})
 
-				contents = append(contents, &Content{
-					GroupID:   groupID,
-					VersionID: versionID,
-					Content:   b.Content,
-				})
+				// Only create content entries for non-deleted files.
+				// Deleted files (ContentHash == nil) only need a file ref.
+				if b.ContentHash != nil {
+					contents = append(contents, &Content{
+						GroupID:   groupID,
+						VersionID: versionID,
+						Content:   b.Content,
+						IsBinary:  b.IsBinary,
+					})
+				}
 			}
 		}
 
@@ -149,7 +161,7 @@ func (db *DB) CreateBlobs(ctx context.Context, blobs []*Blob) error {
 			return err
 		}
 
-		// Batch insert contents
+		// Batch insert contents (splits into text/binary internally)
 		if err := db.createContentsBatchTx(ctx, tx, contents); err != nil {
 			return err
 		}
@@ -255,41 +267,82 @@ func (db *DB) createFileRefsBatchTx(ctx context.Context, tx pgx.Tx, refs []*File
 	for i, ref := range refs {
 		rows[i] = []interface{}{
 			ref.GroupID, ref.CommitID, ref.VersionID, ref.ContentHash,
-			ref.Mode, ref.IsSymlink, ref.SymlinkTarget,
+			ref.Mode, ref.IsSymlink, ref.SymlinkTarget, ref.IsBinary,
 		}
 	}
 
 	_, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"pgit_file_refs"},
-		[]string{"group_id", "commit_id", "version_id", "content_hash", "mode", "is_symlink", "symlink_target"},
+		[]string{"group_id", "commit_id", "version_id", "content_hash", "mode", "is_symlink", "symlink_target", "is_binary"},
 		pgx.CopyFromRows(rows),
 	)
 	return err
 }
 
 // createContentsBatchTx inserts contents using COPY within a transaction.
+// Splits into text and binary batches and writes to respective tables.
 func (db *DB) createContentsBatchTx(ctx context.Context, tx pgx.Tx, contents []*Content) error {
 	if len(contents) == 0 {
 		return nil
 	}
 
-	rows := make([][]interface{}, len(contents))
-	for i, c := range contents {
-		content := c.Content
-		if content == nil {
-			content = []byte{}
+	// Split into text and binary
+	var textContents []*Content
+	var binaryContents []*Content
+	for _, c := range contents {
+		if c.IsBinary {
+			binaryContents = append(binaryContents, c)
+		} else {
+			textContents = append(textContents, c)
 		}
-		rows[i] = []interface{}{c.GroupID, c.VersionID, content}
 	}
 
-	_, err := tx.CopyFrom(
-		ctx,
-		pgx.Identifier{"pgit_content"},
-		[]string{"group_id", "version_id", "content"},
-		pgx.CopyFromRows(rows),
-	)
-	return err
+	// Insert text content
+	if len(textContents) > 0 {
+		rows := make([][]interface{}, len(textContents))
+		for i, c := range textContents {
+			content := c.Content
+			if content == nil {
+				content = []byte{}
+			}
+			rows[i] = []interface{}{c.GroupID, c.VersionID, util.ToValidUTF8(string(content))}
+		}
+
+		_, err := tx.CopyFrom(
+			ctx,
+			pgx.Identifier{"pgit_text_content"},
+			[]string{"group_id", "version_id", "content"},
+			pgx.CopyFromRows(rows),
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Insert binary content
+	if len(binaryContents) > 0 {
+		rows := make([][]interface{}, len(binaryContents))
+		for i, c := range binaryContents {
+			content := c.Content
+			if content == nil {
+				content = []byte{}
+			}
+			rows[i] = []interface{}{c.GroupID, c.VersionID, content}
+		}
+
+		_, err := tx.CopyFrom(
+			ctx,
+			pgx.Identifier{"pgit_binary_content"},
+			[]string{"group_id", "version_id", "content"},
+			pgx.CopyFromRows(rows),
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // GetBlob retrieves a specific blob by path and commit.
@@ -312,8 +365,8 @@ func (db *DB) GetBlob(ctx context.Context, path, commitID string) (*Blob, error)
 		return nil, nil
 	}
 
-	// Get content
-	content, err := db.GetContent(ctx, ref.GroupID, ref.VersionID)
+	// Get content from the correct table based on is_binary
+	content, err := db.GetContent(ctx, ref.GroupID, ref.VersionID, ref.IsBinary)
 	if err != nil {
 		return nil, err
 	}
@@ -326,49 +379,70 @@ func (db *DB) GetBlob(ctx context.Context, path, commitID string) (*Blob, error)
 		Mode:          ref.Mode,
 		IsSymlink:     ref.IsSymlink,
 		SymlinkTarget: ref.SymlinkTarget,
+		IsBinary:      ref.IsBinary,
 	}, nil
 }
 
 // GetBlobsAtCommit retrieves all blobs at a specific commit.
 // This returns only files that were changed in that specific commit.
-// Uses a single query joining file_refs -> paths -> content.
+// Uses a two-step approach: get refs, then batch-fetch content from both tables.
 func (db *DB) GetBlobsAtCommit(ctx context.Context, commitID string) ([]*Blob, error) {
-	sql := `
-	SELECT p.path, r.commit_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, c.content
-	FROM pgit_file_refs r
-	JOIN pgit_paths p ON p.group_id = r.group_id
-	JOIN pgit_content c ON c.group_id = r.group_id AND c.version_id = r.version_id
-	WHERE r.commit_id = $1
-	ORDER BY r.group_id, r.version_id`
-
-	rows, err := db.Query(ctx, sql, commitID)
+	// Step 1: Get file refs with paths
+	refs, err := db.GetFileRefsAtCommitWithPaths(ctx, commitID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var blobs []*Blob
-	for rows.Next() {
-		b := &Blob{}
-		if err := rows.Scan(
-			&b.Path, &b.CommitID, &b.ContentHash, &b.Mode,
-			&b.IsSymlink, &b.SymlinkTarget, &b.Content,
-		); err != nil {
-			return nil, err
-		}
-		blobs = append(blobs, b)
+	if len(refs) == 0 {
+		return nil, nil
 	}
 
-	return blobs, rows.Err()
+	// Step 2: Batch fetch content (only for non-deleted refs)
+	keys := make([]ContentKey, 0, len(refs))
+	isBinaryMap := make(map[ContentKey]bool)
+	for _, ref := range refs {
+		if ref.ContentHash == nil {
+			continue // deleted — no content row exists
+		}
+		k := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		keys = append(keys, k)
+		if ref.IsBinary {
+			isBinaryMap[k] = true
+		}
+	}
+
+	contentMap, err := db.GetContentsBatch(ctx, keys, isBinaryMap)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 3: Build blobs
+	blobs := make([]*Blob, len(refs))
+	for i, ref := range refs {
+		key := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		blobs[i] = &Blob{
+			Path:          ref.Path,
+			CommitID:      ref.CommitID,
+			Content:       contentMap[key],
+			ContentHash:   ref.ContentHash,
+			Mode:          ref.Mode,
+			IsSymlink:     ref.IsSymlink,
+			SymlinkTarget: ref.SymlinkTarget,
+			IsBinary:      ref.IsBinary,
+		}
+	}
+
+	return blobs, nil
 }
 
 // GetTreeAtCommit retrieves the full tree (all files) at a commit.
-// Uses a single query with DISTINCT ON to get latest version of each file.
+// Uses a two-step approach: get refs with DISTINCT ON, then batch-fetch content.
 func (db *DB) GetTreeAtCommit(ctx context.Context, commitID string) ([]*Blob, error) {
+	// Step 1: Get tree refs with paths and is_binary
 	sql := `
 	SELECT DISTINCT ON (r.group_id)
 		p.path, r.commit_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target,
-		r.group_id, r.version_id
+		r.group_id, r.version_id, r.is_binary
 	FROM pgit_file_refs r
 	JOIN pgit_paths p ON p.group_id = r.group_id
 	WHERE r.commit_id <= $1
@@ -380,7 +454,6 @@ func (db *DB) GetTreeAtCommit(ctx context.Context, commitID string) ([]*Blob, er
 	}
 	defer rows.Close()
 
-	// Collect refs first (without content), then batch fetch content
 	type treeEntry struct {
 		blob      *Blob
 		groupID   int32
@@ -394,7 +467,7 @@ func (db *DB) GetTreeAtCommit(ctx context.Context, commitID string) ([]*Blob, er
 		if err := rows.Scan(
 			&e.blob.Path, &e.blob.CommitID, &e.blob.ContentHash,
 			&e.blob.Mode, &e.blob.IsSymlink, &e.blob.SymlinkTarget,
-			&e.groupID, &e.versionID,
+			&e.groupID, &e.versionID, &e.blob.IsBinary,
 		); err != nil {
 			return nil, err
 		}
@@ -412,18 +485,23 @@ func (db *DB) GetTreeAtCommit(ctx context.Context, commitID string) ([]*Blob, er
 		return nil, nil
 	}
 
-	// Batch fetch content in one query
+	// Step 2: Batch fetch content from both tables
 	keys := make([]ContentKey, len(entries))
+	isBinaryMap := make(map[ContentKey]bool)
 	for i, e := range entries {
-		keys[i] = ContentKey{GroupID: e.groupID, VersionID: e.versionID}
+		k := ContentKey{GroupID: e.groupID, VersionID: e.versionID}
+		keys[i] = k
+		if e.blob.IsBinary {
+			isBinaryMap[k] = true
+		}
 	}
 
-	contentMap, err := db.GetContentsBatch(ctx, keys)
+	contentMap, err := db.GetContentsBatch(ctx, keys, isBinaryMap)
 	if err != nil {
 		return nil, err
 	}
 
-	// Attach content to blobs
+	// Step 3: Attach content to blobs
 	blobs := make([]*Blob, len(entries))
 	for i, e := range entries {
 		key := ContentKey{GroupID: e.groupID, VersionID: e.versionID}
@@ -471,6 +549,7 @@ func (db *DB) GetTreeMetadataAtCommit(ctx context.Context, commitID string) ([]*
 			Mode:          ref.Mode,
 			IsSymlink:     ref.IsSymlink,
 			SymlinkTarget: ref.SymlinkTarget,
+			IsBinary:      ref.IsBinary,
 		}
 	}
 
@@ -491,62 +570,102 @@ func (db *DB) GetCurrentTreeMetadata(ctx context.Context) ([]*Blob, error) {
 }
 
 // GetFileHistory retrieves all versions of a file.
-// Uses a single query joining paths -> file_refs -> content.
+// Uses a two-step approach: get refs, then batch-fetch content from both tables.
 func (db *DB) GetFileHistory(ctx context.Context, path string) ([]*Blob, error) {
-	sql := `
-	SELECT r.commit_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, c.content
-	FROM pgit_paths p
-	JOIN pgit_file_refs r ON r.group_id = p.group_id
-	JOIN pgit_content c ON c.group_id = r.group_id AND c.version_id = r.version_id
-	WHERE p.path = $1
-	ORDER BY r.group_id, r.version_id`
-
-	rows, err := db.Query(ctx, sql, path)
+	// Get group_id for path
+	groupID, err := db.GetGroupIDByPath(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var blobs []*Blob
-	for rows.Next() {
-		b := &Blob{Path: path}
-		if err := rows.Scan(
-			&b.CommitID, &b.ContentHash, &b.Mode,
-			&b.IsSymlink, &b.SymlinkTarget, &b.Content,
-		); err != nil {
-			return nil, err
-		}
-		blobs = append(blobs, b)
+	if groupID == 0 {
+		return nil, nil
 	}
 
-	return blobs, rows.Err()
+	// Get all file refs for this group
+	refs, err := db.GetFileRefHistory(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	// Batch fetch content (only for non-deleted refs)
+	keys := make([]ContentKey, 0, len(refs))
+	isBinaryMap := make(map[ContentKey]bool)
+	for _, ref := range refs {
+		if ref.ContentHash == nil {
+			continue // deleted — no content row exists
+		}
+		k := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		keys = append(keys, k)
+		if ref.IsBinary {
+			isBinaryMap[k] = true
+		}
+	}
+
+	contentMap, err := db.GetContentsBatch(ctx, keys, isBinaryMap)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build blobs
+	blobs := make([]*Blob, len(refs))
+	for i, ref := range refs {
+		key := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		blobs[i] = &Blob{
+			Path:          path,
+			CommitID:      ref.CommitID,
+			Content:       contentMap[key],
+			ContentHash:   ref.ContentHash,
+			Mode:          ref.Mode,
+			IsSymlink:     ref.IsSymlink,
+			SymlinkTarget: ref.SymlinkTarget,
+			IsBinary:      ref.IsBinary,
+		}
+	}
+
+	return blobs, nil
 }
 
 // GetFileAtCommit retrieves a file at a specific commit (or the latest version before it).
-// Uses a single query joining paths -> file_refs -> content.
+// Uses file ref lookup + content fetch from the correct table.
 func (db *DB) GetFileAtCommit(ctx context.Context, path, commitID string) (*Blob, error) {
-	sql := `
-	SELECT r.commit_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, c.content
-	FROM pgit_paths p
-	JOIN pgit_file_refs r ON r.group_id = p.group_id
-	JOIN pgit_content c ON c.group_id = r.group_id AND c.version_id = r.version_id
-	WHERE p.path = $1 AND r.commit_id <= $2 AND r.content_hash IS NOT NULL
-	ORDER BY r.commit_id DESC
-	LIMIT 1`
-
-	b := &Blob{Path: path}
-	err := db.QueryRow(ctx, sql, path, commitID).Scan(
-		&b.CommitID, &b.ContentHash, &b.Mode,
-		&b.IsSymlink, &b.SymlinkTarget, &b.Content,
-	)
-	if err == pgx.ErrNoRows {
+	// Get group_id for path
+	groupID, err := db.GetGroupIDByPath(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if groupID == 0 {
 		return nil, nil
 	}
+
+	// Get file ref at or before this commit
+	ref, err := db.GetFileRefAtCommit(ctx, groupID, commitID)
+	if err != nil {
+		return nil, err
+	}
+	if ref == nil {
+		return nil, nil // File doesn't exist or was deleted
+	}
+
+	// Get content from the correct table
+	content, err := db.GetContent(ctx, ref.GroupID, ref.VersionID, ref.IsBinary)
 	if err != nil {
 		return nil, err
 	}
 
-	return b, nil
+	return &Blob{
+		Path:          path,
+		CommitID:      ref.CommitID,
+		Content:       content,
+		ContentHash:   ref.ContentHash,
+		Mode:          ref.Mode,
+		IsSymlink:     ref.IsSymlink,
+		SymlinkTarget: ref.SymlinkTarget,
+		IsBinary:      ref.IsBinary,
+	}, nil
 }
 
 // GetChangedFiles returns files that changed between two commits.
@@ -561,13 +680,21 @@ func (db *DB) GetChangedFiles(ctx context.Context, fromCommit, toCommit string) 
 		return nil, nil
 	}
 
-	// Get content for all refs
-	keys := make([]ContentKey, len(refs))
-	for i, ref := range refs {
-		keys[i] = ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+	// Get content for non-deleted refs only
+	keys := make([]ContentKey, 0, len(refs))
+	isBinaryMap := make(map[ContentKey]bool)
+	for _, ref := range refs {
+		if ref.ContentHash == nil {
+			continue // deleted — no content row exists
+		}
+		k := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		keys = append(keys, k)
+		if ref.IsBinary {
+			isBinaryMap[k] = true
+		}
 	}
 
-	contentMap, err := db.GetContentsBatch(ctx, keys)
+	contentMap, err := db.GetContentsBatch(ctx, keys, isBinaryMap)
 	if err != nil {
 		return nil, err
 	}
@@ -584,6 +711,7 @@ func (db *DB) GetChangedFiles(ctx context.Context, fromCommit, toCommit string) 
 			Mode:          ref.Mode,
 			IsSymlink:     ref.IsSymlink,
 			SymlinkTarget: ref.SymlinkTarget,
+			IsBinary:      ref.IsBinary,
 		}
 	}
 
@@ -613,6 +741,7 @@ func (db *DB) GetChangedFilesMetadata(ctx context.Context, fromCommit, toCommit 
 			Mode:          ref.Mode,
 			IsSymlink:     ref.IsSymlink,
 			SymlinkTarget: ref.SymlinkTarget,
+			IsBinary:      ref.IsBinary,
 		}
 	}
 
@@ -642,6 +771,7 @@ func (db *DB) GetBlobsAtCommitMetadata(ctx context.Context, commitID string) ([]
 			Mode:          ref.Mode,
 			IsSymlink:     ref.IsSymlink,
 			SymlinkTarget: ref.SymlinkTarget,
+			IsBinary:      ref.IsBinary,
 		}
 	}
 
@@ -688,91 +818,6 @@ func (db *DB) FileExistsInTree(ctx context.Context, path, commitID string) (bool
 	return ref != nil, nil
 }
 
-// SearchAllBlobs retrieves all blobs, optionally filtered by path pattern.
-// DEPRECATED: Use SearchContent instead for better performance.
-// This function loads ALL content into memory which doesn't scale.
-func (db *DB) SearchAllBlobs(ctx context.Context, pathPattern string) ([]*Blob, error) {
-	var sql string
-	var args []interface{}
-
-	if pathPattern != "" {
-		// Convert glob to SQL LIKE pattern
-		likePattern := pathPattern
-		likePattern = strings.ReplaceAll(likePattern, "*", "%")
-		likePattern = strings.ReplaceAll(likePattern, "?", "_")
-
-		sql = `
-		SELECT p.path, r.group_id, r.commit_id, r.version_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target
-		FROM pgit_file_refs r
-		JOIN pgit_paths p ON p.group_id = r.group_id
-		WHERE r.content_hash IS NOT NULL AND p.path LIKE $1
-		ORDER BY p.path, r.commit_id DESC`
-		args = []interface{}{likePattern}
-	} else {
-		sql = `
-		SELECT p.path, r.group_id, r.commit_id, r.version_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target
-		FROM pgit_file_refs r
-		JOIN pgit_paths p ON p.group_id = r.group_id
-		WHERE r.content_hash IS NOT NULL
-		ORDER BY p.path, r.commit_id DESC`
-	}
-
-	rows, err := db.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	// Collect refs first
-	var refs []*FileRefWithPath
-	for rows.Next() {
-		ref := &FileRefWithPath{}
-		if err := rows.Scan(
-			&ref.Path, &ref.GroupID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
-			&ref.Mode, &ref.IsSymlink, &ref.SymlinkTarget,
-		); err != nil {
-			return nil, err
-		}
-		refs = append(refs, ref)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	if len(refs) == 0 {
-		return nil, nil
-	}
-
-	// Get content for all refs
-	keys := make([]ContentKey, len(refs))
-	for i, ref := range refs {
-		keys[i] = ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
-	}
-
-	contentMap, err := db.GetContentsBatch(ctx, keys)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build blobs
-	blobs := make([]*Blob, len(refs))
-	for i, ref := range refs {
-		key := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
-		blobs[i] = &Blob{
-			Path:          ref.Path,
-			CommitID:      ref.CommitID,
-			Content:       contentMap[key],
-			ContentHash:   ref.ContentHash,
-			Mode:          ref.Mode,
-			IsSymlink:     ref.IsSymlink,
-			SymlinkTarget: ref.SymlinkTarget,
-		}
-	}
-
-	return blobs, nil
-}
-
 // SearchContentOptions configures content search behavior.
 type SearchContentOptions struct {
 	// Pattern is the regex pattern to search for (PostgreSQL regex syntax).
@@ -798,20 +843,20 @@ type SearchContentResult struct {
 	Content   []byte
 }
 
-// SearchContent searches file contents.
+// SearchContent searches text file contents using server-side regex on pgit_text_content.
+// Binary files are excluded from search results.
 // Strategy:
-// 1. Get candidate file refs from refs table (fast, no content)
-// 2. Load content in group_id, version_id order (optimal for xpatch cache)
-// 3. Return results for Go-side regex matching
-// Results are ordered by group_id, version_id for optimal xpatch decompression.
+// 1. Query pgit_text_content with WHERE content ~ pattern (server-side regex)
+// 2. Join with file_refs and paths for metadata
+// 3. Return matching files with content for Go-side line extraction
 func (db *DB) SearchContent(ctx context.Context, opts SearchContentOptions) ([]*SearchContentResult, error) {
-	// Phase 1: Get candidate files from refs table (fast, metadata only)
 	var whereClauses []string
 	var args []interface{}
 	argNum := 1
 
-	// Content must exist (not deleted)
+	// Content must exist (not deleted) and must be text
 	whereClauses = append(whereClauses, "r.content_hash IS NOT NULL")
+	whereClauses = append(whereClauses, "r.is_binary = FALSE")
 
 	// Path filter
 	if opts.PathPattern != "" {
@@ -827,17 +872,33 @@ func (db *DB) SearchContent(ctx context.Context, opts SearchContentOptions) ([]*
 	if opts.CommitID != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("r.commit_id <= $%d", argNum))
 		args = append(args, opts.CommitID)
+		argNum++
 	}
+
+	// Regex pattern (server-side)
+	regexOp := "~"
+	if opts.IgnoreCase {
+		regexOp = "~*"
+	}
+	whereClauses = append(whereClauses, fmt.Sprintf("c.content %s $%d", regexOp, argNum))
+	args = append(args, opts.Pattern)
+	argNum++
 
 	whereClause := strings.Join(whereClauses, " AND ")
 
-	// Get candidate refs ordered by group_id, version_id for optimal content loading
+	limitClause := ""
+	if opts.Limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT $%d", argNum)
+		args = append(args, opts.Limit)
+	}
+
 	sql := fmt.Sprintf(`
-		SELECT p.path, r.group_id, r.commit_id, r.version_id
+		SELECT p.path, r.group_id, r.commit_id, r.version_id, c.content
 		FROM pgit_file_refs r
 		JOIN pgit_paths p ON p.group_id = r.group_id
+		JOIN pgit_text_content c ON c.group_id = r.group_id AND c.version_id = r.version_id
 		WHERE %s
-		ORDER BY r.group_id, r.version_id`, whereClause)
+		ORDER BY r.group_id, r.version_id%s`, whereClause, limitClause)
 
 	rows, err := db.Query(ctx, sql, args...)
 	if err != nil {
@@ -845,58 +906,24 @@ func (db *DB) SearchContent(ctx context.Context, opts SearchContentOptions) ([]*
 	}
 	defer rows.Close()
 
-	// Collect candidate refs
-	var candidates []searchCandidate
+	var results []*SearchContentResult
 	for rows.Next() {
-		var c searchCandidate
-		if err := rows.Scan(&c.Path, &c.GroupID, &c.CommitID, &c.VersionID); err != nil {
+		r := &SearchContentResult{}
+		var textContent string
+		if err := rows.Scan(&r.Path, &r.GroupID, &r.CommitID, &r.VersionID, &textContent); err != nil {
 			return nil, err
 		}
-		candidates = append(candidates, c)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+		r.Content = []byte(textContent)
+		results = append(results, r)
 	}
 
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-
-	// Phase 2: Load content in batch (already ordered by group_id, version_id)
-	keys := make([]ContentKey, len(candidates))
-	for i, c := range candidates {
-		keys[i] = ContentKey{GroupID: c.GroupID, VersionID: c.VersionID}
-	}
-
-	contentMap, err := db.GetContentsBatch(ctx, keys)
-	if err != nil {
-		return nil, err
-	}
-
-	// Phase 3: Build results with content
-	results := make([]*SearchContentResult, 0, len(candidates))
-	for _, c := range candidates {
-		key := ContentKey{GroupID: c.GroupID, VersionID: c.VersionID}
-		results = append(results, &SearchContentResult{
-			Path:      c.Path,
-			GroupID:   c.GroupID,
-			CommitID:  c.CommitID,
-			VersionID: c.VersionID,
-			Content:   contentMap[key],
-		})
-	}
-
-	return results, nil
+	return results, rows.Err()
 }
 
-// SearchContentAtCommit searches file contents at a specific commit.
+// SearchContentAtCommit searches text file contents at a specific commit using server-side regex.
 // This searches the tree state at that commit (latest version of each file <= commitID).
-// Strategy:
-// 1. Get tree state at commit from refs table (fast, DISTINCT ON)
-// 2. Load content in group_id, version_id order (optimal for xpatch cache)
-// 3. Return results for Go-side regex matching
+// Binary files are excluded from search results.
 func (db *DB) SearchContentAtCommit(ctx context.Context, commitID string, opts SearchContentOptions) ([]*SearchContentResult, error) {
-	// Phase 1: Get tree state at commit (metadata only, fast)
 	var args []interface{}
 	argNum := 1
 
@@ -910,16 +937,43 @@ func (db *DB) SearchContentAtCommit(ctx context.Context, commitID string, opts S
 		likePattern = strings.ReplaceAll(likePattern, "?", "_")
 		pathFilter = fmt.Sprintf("AND p.path LIKE $%d", argNum)
 		args = append(args, likePattern)
+		argNum++
 	}
 
-	// Get tree at commit: latest version of each file at or before commitID
+	// Regex operator
+	regexOp := "~"
+	if opts.IgnoreCase {
+		regexOp = "~*"
+	}
+
+	// Build CTE: get tree state, then join with text content and filter by regex
+	limitClause := ""
+	if opts.Limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT $%d", argNum+1) // +1 because pattern is argNum
+		// We'll add the limit arg after the pattern arg
+	}
+
 	sql := fmt.Sprintf(`
-		SELECT DISTINCT ON (r.group_id)
-			p.path, r.group_id, r.commit_id, r.version_id
-		FROM pgit_file_refs r
-		JOIN pgit_paths p ON p.group_id = r.group_id
-		WHERE r.commit_id <= $1 AND r.content_hash IS NOT NULL %s
-		ORDER BY r.group_id, r.commit_id DESC`, pathFilter)
+		WITH tree AS (
+			SELECT DISTINCT ON (r.group_id)
+				r.group_id, r.version_id, r.commit_id
+			FROM pgit_file_refs r
+			WHERE r.commit_id <= $1 AND r.content_hash IS NOT NULL AND r.is_binary = FALSE
+			ORDER BY r.group_id, r.commit_id DESC
+		)
+		SELECT p.path, t.group_id, t.commit_id, t.version_id, c.content
+		FROM tree t
+		JOIN pgit_paths p ON p.group_id = t.group_id
+		JOIN pgit_text_content c ON c.group_id = t.group_id AND c.version_id = t.version_id
+		WHERE c.content %s $%d %s
+		ORDER BY t.group_id, t.version_id%s`, regexOp, argNum, pathFilter, limitClause)
+
+	args = append(args, opts.Pattern)
+	argNum++
+
+	if opts.Limit > 0 {
+		args = append(args, opts.Limit)
+	}
 
 	rows, err := db.Query(ctx, sql, args...)
 	if err != nil {
@@ -927,73 +981,18 @@ func (db *DB) SearchContentAtCommit(ctx context.Context, commitID string, opts S
 	}
 	defer rows.Close()
 
-	// Collect candidates
-	var candidates []searchCandidate
+	var results []*SearchContentResult
 	for rows.Next() {
-		var c searchCandidate
-		if err := rows.Scan(&c.Path, &c.GroupID, &c.CommitID, &c.VersionID); err != nil {
+		r := &SearchContentResult{}
+		var textContent string
+		if err := rows.Scan(&r.Path, &r.GroupID, &r.CommitID, &r.VersionID, &textContent); err != nil {
 			return nil, err
 		}
-		candidates = append(candidates, c)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+		r.Content = []byte(textContent)
+		results = append(results, r)
 	}
 
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-
-	// Sort by group_id, version_id for optimal xpatch cache when loading content
-	// (DISTINCT ON doesn't guarantee this order in output)
-	sortCandidatesByGroupVersion(candidates)
-
-	// Phase 2: Load content in batch
-	keys := make([]ContentKey, len(candidates))
-	for i, c := range candidates {
-		keys[i] = ContentKey{GroupID: c.GroupID, VersionID: c.VersionID}
-	}
-
-	contentMap, err := db.GetContentsBatch(ctx, keys)
-	if err != nil {
-		return nil, err
-	}
-
-	// Phase 3: Build results
-	results := make([]*SearchContentResult, 0, len(candidates))
-	for _, c := range candidates {
-		key := ContentKey{GroupID: c.GroupID, VersionID: c.VersionID}
-		results = append(results, &SearchContentResult{
-			Path:      c.Path,
-			GroupID:   c.GroupID,
-			CommitID:  c.CommitID,
-			VersionID: c.VersionID,
-			Content:   contentMap[key],
-		})
-	}
-
-	return results, nil
-}
-
-// searchCandidate holds metadata for a file to search
-type searchCandidate struct {
-	Path      string
-	GroupID   int32
-	CommitID  string
-	VersionID int32
-}
-
-// sortCandidatesByGroupVersion sorts candidates for optimal xpatch cache efficiency
-func sortCandidatesByGroupVersion(candidates []searchCandidate) {
-	// Simple insertion sort - slice is already mostly ordered from DB
-	for i := 1; i < len(candidates); i++ {
-		j := i
-		for j > 0 && (candidates[j-1].GroupID > candidates[j].GroupID ||
-			(candidates[j-1].GroupID == candidates[j].GroupID && candidates[j-1].VersionID > candidates[j].VersionID)) {
-			candidates[j-1], candidates[j] = candidates[j], candidates[j-1]
-			j--
-		}
-	}
+	return results, rows.Err()
 }
 
 // CountBlobs returns the total number of blob versions (file refs).

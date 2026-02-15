@@ -19,32 +19,33 @@ type XpatchStats struct {
 	AvgChainLength   float64
 }
 
-// RepoStats contains all repository statistics for schema v2.
+// RepoStats contains all repository statistics for schema v3.
 type RepoStats struct {
 	// Commit stats
 	TotalCommits  int64
 	FirstCommitID *string
 	LastCommitID  *string
 
-	// File stats (from new tables)
+	// File stats
 	TotalBlobs       int64 // Total file refs (from pgit_file_refs)
 	UniqueFiles      int64 // Unique paths (from pgit_paths)
-	TotalContentSize int64 // Raw content size (from pgit_content via xpatch.stats)
+	TotalContentSize int64 // Raw content size (sum from both content tables via xpatch.stats)
 	DeletedEntries   int64
 
 	// Table sizes from PostgreSQL (actual disk usage)
-	CommitsTableSize  int64
-	PathsTableSize    int64 // New in v2
-	FileRefsTableSize int64 // New in v2
-	ContentTableSize  int64 // New in v2 (replaces BlobsTableSize)
-	TotalIndexSize    int64
+	CommitsTableSize       int64
+	PathsTableSize         int64
+	FileRefsTableSize      int64
+	TextContentTableSize   int64
+	BinaryContentTableSize int64
+	TotalIndexSize         int64
 
-	// Legacy field for compatibility (sum of paths + file_refs + content)
+	// Legacy field for compatibility (sum of paths + file_refs + both content tables)
 	BlobsTableSize int64
 }
 
 // GetRepoStatsFast returns repository statistics using xpatch.stats() for O(1) performance.
-// This version supports the new schema v2 with separate tables.
+// This version supports the v3 schema with split text/binary content tables.
 func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 	stats := &RepoStats{}
 	var wg sync.WaitGroup
@@ -70,18 +71,16 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 		}
 	}()
 
-	// Query 2: Content stats from xpatch.stats() - O(1)
-	// In v2, content is in pgit_content table
+	// Query 2: Content stats from xpatch.stats() - sum both tables - O(1) each
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := db.QueryRow(ctx, `
-			SELECT total_rows, total_groups, raw_size_bytes 
-			FROM xpatch.stats('pgit_content')
-		`).Scan(&stats.TotalBlobs, &stats.UniqueFiles, &stats.TotalContentSize)
-		if err != nil {
-			setErr(err)
-		}
+		var textSize, binarySize int64
+		_ = db.QueryRow(ctx, "SELECT raw_size_bytes FROM xpatch.stats('pgit_text_content')").Scan(&textSize)
+		_ = db.QueryRow(ctx, "SELECT raw_size_bytes FROM xpatch.stats('pgit_binary_content')").Scan(&binarySize)
+		mu.Lock()
+		stats.TotalContentSize = textSize + binarySize
+		mu.Unlock()
 	}()
 
 	// Query 3: Unique files count from pgit_paths (fast, small table)
@@ -98,10 +97,11 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_commits')").Scan(&stats.CommitsTableSize)
 		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_paths')").Scan(&stats.PathsTableSize)
 		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_file_refs')").Scan(&stats.FileRefsTableSize)
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_content')").Scan(&stats.ContentTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_text_content')").Scan(&stats.TextContentTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_binary_content')").Scan(&stats.BinaryContentTableSize)
 
 		// Calculate legacy BlobsTableSize as sum
-		stats.BlobsTableSize = stats.PathsTableSize + stats.FileRefsTableSize + stats.ContentTableSize
+		stats.BlobsTableSize = stats.PathsTableSize + stats.FileRefsTableSize + stats.TextContentTableSize + stats.BinaryContentTableSize
 
 		_ = db.QueryRow(ctx, `
 			SELECT COALESCE(SUM(pg_relation_size(indexrelid)), 0)
@@ -110,7 +110,8 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 				'pgit_commits'::regclass,
 				'pgit_paths'::regclass,
 				'pgit_file_refs'::regclass,
-				'pgit_content'::regclass,
+				'pgit_text_content'::regclass,
+				'pgit_binary_content'::regclass,
 				'pgit_refs'::regclass,
 				'pgit_sync_state'::regclass
 			)
@@ -180,14 +181,15 @@ func (db *DB) GetXpatchStats(ctx context.Context, tableName string) (*XpatchStat
 
 // GetDetailedTableSizes returns detailed size information for each table.
 type DetailedTableSizes struct {
-	Commits   int64
-	Paths     int64
-	FileRefs  int64
-	Content   int64
-	Refs      int64
-	SyncState int64
-	Metadata  int64
-	Indexes   int64
+	Commits       int64
+	Paths         int64
+	FileRefs      int64
+	TextContent   int64
+	BinaryContent int64
+	Refs          int64
+	SyncState     int64
+	Metadata      int64
+	Indexes       int64
 }
 
 // GetDetailedTableSizes returns sizes for all pgit tables.
@@ -196,7 +198,7 @@ func (db *DB) GetDetailedTableSizes(ctx context.Context) (*DetailedTableSizes, e
 
 	// Get all table sizes in parallel
 	var wg sync.WaitGroup
-	wg.Add(7)
+	wg.Add(8)
 
 	go func() {
 		defer wg.Done()
@@ -212,7 +214,11 @@ func (db *DB) GetDetailedTableSizes(ctx context.Context) (*DetailedTableSizes, e
 	}()
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_content')").Scan(&sizes.Content)
+		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_text_content')").Scan(&sizes.TextContent)
+	}()
+	go func() {
+		defer wg.Done()
+		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_binary_content')").Scan(&sizes.BinaryContent)
 	}()
 	go func() {
 		defer wg.Done()
@@ -237,7 +243,8 @@ func (db *DB) GetDetailedTableSizes(ctx context.Context) (*DetailedTableSizes, e
 			'pgit_commits'::regclass,
 			'pgit_paths'::regclass,
 			'pgit_file_refs'::regclass,
-			'pgit_content'::regclass,
+			'pgit_text_content'::regclass,
+			'pgit_binary_content'::regclass,
 			'pgit_refs'::regclass,
 			'pgit_sync_state'::regclass,
 			'pgit_metadata'::regclass
@@ -262,16 +269,26 @@ func (db *DB) GetCommitStats(ctx context.Context) (map[string]interface{}, error
 	return stats, nil
 }
 
-// GetBlobStats returns statistics about blobs using the new schema.
+// GetBlobStats returns statistics about blobs using the v3 schema.
+// Sums stats from both pgit_text_content and pgit_binary_content.
 func (db *DB) GetBlobStats(ctx context.Context) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 
-	// Get content stats from xpatch
-	var totalContent, uniqueGroups, totalSize int64
+	// Get content stats from both xpatch tables
+	var textRows, textGroups, textSize int64
 	err := db.QueryRow(ctx, `
 		SELECT total_rows, total_groups, raw_size_bytes 
-		FROM xpatch.stats('pgit_content')
-	`).Scan(&totalContent, &uniqueGroups, &totalSize)
+		FROM xpatch.stats('pgit_text_content')
+	`).Scan(&textRows, &textGroups, &textSize)
+	if err != nil {
+		return nil, err
+	}
+
+	var binaryRows, binaryGroups, binarySize int64
+	err = db.QueryRow(ctx, `
+		SELECT total_rows, total_groups, raw_size_bytes 
+		FROM xpatch.stats('pgit_binary_content')
+	`).Scan(&binaryRows, &binaryGroups, &binarySize)
 	if err != nil {
 		return nil, err
 	}
@@ -292,7 +309,9 @@ func (db *DB) GetBlobStats(ctx context.Context) (map[string]interface{}, error) 
 
 	stats["total_blobs"] = totalRefs
 	stats["unique_paths"] = uniquePaths
-	stats["total_content_size"] = totalSize
+	stats["total_content_size"] = textSize + binarySize
+	stats["text_content_rows"] = textRows
+	stats["binary_content_rows"] = binaryRows
 
 	return stats, nil
 }

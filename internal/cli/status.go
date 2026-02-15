@@ -125,7 +125,7 @@ func printJSONStatus(staged, unstaged []repo.FileChange, conflicts []string, hea
 			ShortID:   util.ShortID(head.ID),
 			Message:   firstLine(head.Message),
 			Author:    head.AuthorName,
-			Timestamp: head.CreatedAt.Format(time.RFC3339),
+			Timestamp: head.AuthoredAt.Format(time.RFC3339),
 		}
 	}
 
@@ -228,7 +228,7 @@ func printLongStatus(staged, unstaged []repo.FileChange, head *db.Commit) error 
 
 	// Show HEAD info if exists
 	if head != nil {
-		fmt.Printf("HEAD: %s %s\n", styles.Hash(head.ID, true), styles.MutedMsg(util.RelativeTime(head.CreatedAt)))
+		fmt.Printf("HEAD: %s %s\n", styles.Hash(head.ID, true), styles.MutedMsg(util.RelativeTime(head.AuthoredAt)))
 	} else {
 		fmt.Println()
 		fmt.Println("No commits yet")
