@@ -3,7 +3,11 @@ package db
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/imgajeed76/pgit/v2/internal/util"
 	"github.com/jackc/pgx/v5"
@@ -843,24 +847,65 @@ type SearchContentResult struct {
 	Content   []byte
 }
 
-// SearchContent searches text file contents using server-side regex on pgit_text_content.
+// SearchContent searches text file contents using parallel-by-group fetching.
 // Binary files are excluded from search results.
 // Strategy:
-// 1. Query pgit_text_content with WHERE content ~ pattern (server-side regex)
-// 2. Join with file_refs and paths for metadata
-// 3. Return matching files with content for Go-side line extraction
+//  1. Load all matching file refs into memory
+//  2. Group by group_id, build version→ref lookup
+//  3. Worker goroutines process groups in parallel, each issuing a single
+//     server-side regex query per group for optimal xpatch delta-chain access
 func (db *DB) SearchContent(ctx context.Context, opts SearchContentOptions) ([]*SearchContentResult, error) {
+	// Step 1: Load file refs
+	refs, err := db.getSearchFileRefs(ctx, opts.PathPattern, opts.CommitID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	// Step 2 & 3: Batch search (one query per group with server-side regex)
+	return db.searchBatchParallel(ctx, refs, opts)
+}
+
+// SearchContentAtCommit searches text file contents at a specific commit.
+// This searches the tree state at that commit (latest version of each file <= commitID).
+// Binary files are excluded from search results.
+func (db *DB) SearchContentAtCommit(ctx context.Context, commitID string, opts SearchContentOptions) ([]*SearchContentResult, error) {
+	// Step 1: Load tree refs at commit
+	refs, err := db.getTreeSearchRefs(ctx, commitID, opts.PathPattern)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	// Step 2 & 3: Per-version search (only 1 ref per group at a specific commit)
+	return db.searchPerVersion(ctx, refs, opts)
+}
+
+// searchRef is a lightweight file ref for search operations.
+type searchRef struct {
+	groupID   int32
+	versionID int32
+	commitID  string
+	path      string
+}
+
+// getSearchFileRefs loads all text file refs matching the search filters.
+func (db *DB) getSearchFileRefs(ctx context.Context, pathPattern, commitID string) ([]searchRef, error) {
 	var whereClauses []string
 	var args []interface{}
 	argNum := 1
 
-	// Content must exist (not deleted) and must be text
 	whereClauses = append(whereClauses, "r.content_hash IS NOT NULL")
 	whereClauses = append(whereClauses, "r.is_binary = FALSE")
 
-	// Path filter
-	if opts.PathPattern != "" {
-		likePattern := opts.PathPattern
+	if pathPattern != "" {
+		likePattern := pathPattern
 		likePattern = strings.ReplaceAll(likePattern, "*", "%")
 		likePattern = strings.ReplaceAll(likePattern, "?", "_")
 		whereClauses = append(whereClauses, fmt.Sprintf("p.path LIKE $%d", argNum))
@@ -868,62 +913,39 @@ func (db *DB) SearchContent(ctx context.Context, opts SearchContentOptions) ([]*
 		argNum++
 	}
 
-	// Commit filter (search at or before this commit)
-	if opts.CommitID != "" {
+	if commitID != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("r.commit_id <= $%d", argNum))
-		args = append(args, opts.CommitID)
+		args = append(args, commitID)
 		argNum++
 	}
 
-	// Regex pattern (server-side)
-	regexOp := "~"
-	if opts.IgnoreCase {
-		regexOp = "~*"
-	}
-	whereClauses = append(whereClauses, fmt.Sprintf("c.content %s $%d", regexOp, argNum))
-	args = append(args, opts.Pattern)
-	argNum++
-
 	whereClause := strings.Join(whereClauses, " AND ")
 
-	limitClause := ""
-	if opts.Limit > 0 {
-		limitClause = fmt.Sprintf(" LIMIT $%d", argNum)
-		args = append(args, opts.Limit)
-	}
-
 	sql := fmt.Sprintf(`
-		SELECT p.path, r.group_id, r.commit_id, r.version_id, c.content
+		SELECT r.group_id, r.version_id, r.commit_id, p.path
 		FROM pgit_file_refs r
 		JOIN pgit_paths p ON p.group_id = r.group_id
-		JOIN pgit_text_content c ON c.group_id = r.group_id AND c.version_id = r.version_id
-		WHERE %s
-		ORDER BY r.group_id, r.version_id%s`, whereClause, limitClause)
+		WHERE %s`, whereClause)
 
 	rows, err := db.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("search query failed: %w", err)
+		return nil, fmt.Errorf("failed to load file refs: %w", err)
 	}
 	defer rows.Close()
 
-	var results []*SearchContentResult
+	var refs []searchRef
 	for rows.Next() {
-		r := &SearchContentResult{}
-		var textContent string
-		if err := rows.Scan(&r.Path, &r.GroupID, &r.CommitID, &r.VersionID, &textContent); err != nil {
+		var r searchRef
+		if err := rows.Scan(&r.groupID, &r.versionID, &r.commitID, &r.path); err != nil {
 			return nil, err
 		}
-		r.Content = []byte(textContent)
-		results = append(results, r)
+		refs = append(refs, r)
 	}
-
-	return results, rows.Err()
+	return refs, rows.Err()
 }
 
-// SearchContentAtCommit searches text file contents at a specific commit using server-side regex.
-// This searches the tree state at that commit (latest version of each file <= commitID).
-// Binary files are excluded from search results.
-func (db *DB) SearchContentAtCommit(ctx context.Context, commitID string, opts SearchContentOptions) ([]*SearchContentResult, error) {
+// getTreeSearchRefs loads the tree state at a commit (latest version per file).
+func (db *DB) getTreeSearchRefs(ctx context.Context, commitID, pathPattern string) ([]searchRef, error) {
 	var args []interface{}
 	argNum := 1
 
@@ -931,68 +953,276 @@ func (db *DB) SearchContentAtCommit(ctx context.Context, commitID string, opts S
 	argNum++
 
 	pathFilter := ""
-	if opts.PathPattern != "" {
-		likePattern := opts.PathPattern
+	if pathPattern != "" {
+		likePattern := pathPattern
 		likePattern = strings.ReplaceAll(likePattern, "*", "%")
 		likePattern = strings.ReplaceAll(likePattern, "?", "_")
 		pathFilter = fmt.Sprintf("AND p.path LIKE $%d", argNum)
 		args = append(args, likePattern)
-		argNum++
 	}
 
-	// Regex operator
+	sql := fmt.Sprintf(`
+		SELECT DISTINCT ON (r.group_id)
+			r.group_id, r.version_id, r.commit_id, p.path
+		FROM pgit_file_refs r
+		JOIN pgit_paths p ON p.group_id = r.group_id
+		WHERE r.commit_id <= $1 AND r.content_hash IS NOT NULL AND r.is_binary = FALSE %s
+		ORDER BY r.group_id, r.commit_id DESC`, pathFilter)
+
+	rows, err := db.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load tree refs: %w", err)
+	}
+	defer rows.Close()
+
+	var refs []searchRef
+	for rows.Next() {
+		var r searchRef
+		if err := rows.Scan(&r.groupID, &r.versionID, &r.commitID, &r.path); err != nil {
+			return nil, err
+		}
+		refs = append(refs, r)
+	}
+	return refs, rows.Err()
+}
+
+// searchBatchParallel runs parallel search with one server-side regex query per group.
+// This is optimal for --all mode where many versions per group need checking.
+// xpatch decompresses the delta chain once per group, and the regex filter runs
+// server-side so non-matching content never crosses the wire.
+func (db *DB) searchBatchParallel(ctx context.Context, refs []searchRef, opts SearchContentOptions) ([]*SearchContentResult, error) {
+	// Build version→ref lookup per group
+	type groupInfo struct {
+		refs    map[int32]searchRef // version_id → ref
+		path    string
+		groupID int32
+	}
+	groups := make(map[int32]*groupInfo)
+	for _, r := range refs {
+		g, ok := groups[r.groupID]
+		if !ok {
+			g = &groupInfo{
+				refs:    make(map[int32]searchRef),
+				path:    r.path,
+				groupID: r.groupID,
+			}
+			groups[r.groupID] = g
+		}
+		g.refs[r.versionID] = r
+	}
+
+	// Sort groups by version count ascending — fewest versions first.
+	// Groups with fewer versions have shorter delta chains, so they decompress faster.
+	// This lets early termination kick in before we hit the expensive groups.
+	groupIDs := make([]int32, 0, len(groups))
+	for gid := range groups {
+		groupIDs = append(groupIDs, gid)
+	}
+	sort.Slice(groupIDs, func(i, j int) bool {
+		return len(groups[groupIDs[i]].refs) < len(groups[groupIDs[j]].refs)
+	})
+
+	// Dispatch groups to workers
+	groupChan := make(chan int32, len(groupIDs))
+	for _, gid := range groupIDs {
+		groupChan <- gid
+	}
+	close(groupChan)
+
+	// Build the PG regex operator
 	regexOp := "~"
 	if opts.IgnoreCase {
 		regexOp = "~*"
 	}
+	query := fmt.Sprintf(
+		"SELECT version_id, content FROM pgit_text_content WHERE group_id = $1 AND content %s $2 ORDER BY version_id",
+		regexOp)
 
-	// Build CTE: get tree state, then join with text content and filter by regex
-	limitClause := ""
-	if opts.Limit > 0 {
-		limitClause = fmt.Sprintf(" LIMIT $%d", argNum+1) // +1 because pattern is argNum
-		// We'll add the limit arg after the pattern arg
+	var allResults []*SearchContentResult
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var resultCount atomic.Int64
+	var firstErr atomic.Value
+
+	limit := int64(opts.Limit)
+	if limit <= 0 {
+		limit = int64(^uint64(0) >> 1) // effectively unlimited
 	}
 
-	sql := fmt.Sprintf(`
-		WITH tree AS (
-			SELECT DISTINCT ON (r.group_id)
-				r.group_id, r.version_id, r.commit_id
-			FROM pgit_file_refs r
-			WHERE r.commit_id <= $1 AND r.content_hash IS NOT NULL AND r.is_binary = FALSE
-			ORDER BY r.group_id, r.commit_id DESC
-		)
-		SELECT p.path, t.group_id, t.commit_id, t.version_id, c.content
-		FROM tree t
-		JOIN pgit_paths p ON p.group_id = t.group_id
-		JOIN pgit_text_content c ON c.group_id = t.group_id AND c.version_id = t.version_id
-		WHERE c.content %s $%d %s
-		ORDER BY t.group_id, t.version_id%s`, regexOp, argNum, pathFilter, limitClause)
+	workers := 8
 
-	args = append(args, opts.Pattern)
-	argNum++
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 
-	if opts.Limit > 0 {
-		args = append(args, opts.Limit)
+			for gid := range groupChan {
+				if firstErr.Load() != nil {
+					return
+				}
+				if resultCount.Load() >= limit {
+					return
+				}
+
+				g := groups[gid]
+
+				// Single query per group: server-side regex on all versions
+				rows, err := db.Query(ctx, query, gid, opts.Pattern)
+				if err != nil {
+					firstErr.CompareAndSwap(nil, err)
+					return
+				}
+
+				for rows.Next() {
+					if resultCount.Load() >= limit {
+						rows.Close()
+						return
+					}
+
+					var versionID int32
+					var content []byte
+					if err := rows.Scan(&versionID, &content); err != nil {
+						rows.Close()
+						firstErr.CompareAndSwap(nil, err)
+						return
+					}
+
+					ref, ok := g.refs[versionID]
+					if !ok {
+						continue // version not in our search set
+					}
+
+					mu.Lock()
+					allResults = append(allResults, &SearchContentResult{
+						Path:      ref.path,
+						GroupID:   ref.groupID,
+						CommitID:  ref.commitID,
+						VersionID: ref.versionID,
+						Content:   content,
+					})
+					mu.Unlock()
+					resultCount.Add(1)
+				}
+				rows.Close()
+			}
+		}()
 	}
 
-	rows, err := db.Query(ctx, sql, args...)
+	wg.Wait()
+
+	if errVal := firstErr.Load(); errVal != nil {
+		return nil, errVal.(error)
+	}
+
+	return allResults, nil
+}
+
+// searchPerVersion runs parallel search with individual PK lookups per version.
+// This is optimal for single-commit search where each group has ~1 ref,
+// avoiding unnecessary decompression of the full delta chain.
+func (db *DB) searchPerVersion(ctx context.Context, refs []searchRef, opts SearchContentOptions) ([]*SearchContentResult, error) {
+	// Compile Go regex
+	goPattern := opts.Pattern
+	if opts.IgnoreCase {
+		goPattern = "(?i)" + goPattern
+	}
+	re, err := regexp.Compile(goPattern)
 	if err != nil {
-		return nil, fmt.Errorf("search query failed: %w", err)
+		return nil, fmt.Errorf("invalid regex: %w", err)
 	}
-	defer rows.Close()
 
-	var results []*SearchContentResult
-	for rows.Next() {
-		r := &SearchContentResult{}
-		var textContent string
-		if err := rows.Scan(&r.Path, &r.GroupID, &r.CommitID, &r.VersionID, &textContent); err != nil {
-			return nil, err
+	// Group by group_id, track the version_id we need to reconstruct (= chain depth cost)
+	groups := make(map[int32][]searchRef)
+	maxVersion := make(map[int32]int32) // group_id → max version_id (= chain depth)
+	for _, r := range refs {
+		groups[r.groupID] = append(groups[r.groupID], r)
+		if r.versionID > maxVersion[r.groupID] {
+			maxVersion[r.groupID] = r.versionID
 		}
-		r.Content = []byte(textContent)
-		results = append(results, r)
 	}
 
-	return results, rows.Err()
+	// Sort groups by chain depth ascending — cheapest to decompress first.
+	// This lets early termination kick in quickly by searching shallow-chain files first.
+	groupIDs := make([]int32, 0, len(groups))
+	for gid := range groups {
+		groupIDs = append(groupIDs, gid)
+	}
+	sort.Slice(groupIDs, func(i, j int) bool {
+		return maxVersion[groupIDs[i]] < maxVersion[groupIDs[j]]
+	})
+
+	// Dispatch groups to workers
+	groupChan := make(chan int32, len(groupIDs))
+	for _, gid := range groupIDs {
+		groupChan <- gid
+	}
+	close(groupChan)
+
+	var allResults []*SearchContentResult
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var resultCount atomic.Int64
+	var firstErr atomic.Value
+
+	limit := int64(opts.Limit)
+	if limit <= 0 {
+		limit = int64(^uint64(0) >> 1) // effectively unlimited
+	}
+
+	workers := 8
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for gid := range groupChan {
+				if firstErr.Load() != nil {
+					return
+				}
+				if resultCount.Load() >= limit {
+					return
+				}
+
+				refsInGroup := groups[gid]
+
+				for _, ref := range refsInGroup {
+					if resultCount.Load() >= limit {
+						return
+					}
+
+					var content []byte
+					err := db.QueryRow(ctx,
+						"SELECT content FROM pgit_text_content WHERE group_id = $1 AND version_id = $2",
+						ref.groupID, ref.versionID).Scan(&content)
+					if err != nil {
+						continue
+					}
+
+					if re.Match(content) {
+						mu.Lock()
+						allResults = append(allResults, &SearchContentResult{
+							Path:      ref.path,
+							GroupID:   ref.groupID,
+							CommitID:  ref.commitID,
+							VersionID: ref.versionID,
+							Content:   content,
+						})
+						mu.Unlock()
+						resultCount.Add(1)
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if errVal := firstErr.Load(); errVal != nil {
+		return nil, errVal.(error)
+	}
+
+	return allResults, nil
 }
 
 // CountBlobs returns the total number of blob versions (file refs).

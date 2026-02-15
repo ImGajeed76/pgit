@@ -36,6 +36,9 @@ type ContainerConfig struct {
 	MaxParallelWorkers   int    `toml:"max_parallel_workers" config:"container.max_parallel_workers" default:"4" min:"0" max:"64" desc:"Max parallel workers"`
 	MaxWorkerProcesses   int    `toml:"max_worker_processes" config:"container.max_worker_processes" default:"4" min:"1" max:"64" desc:"Max worker processes"`
 	MaxParallelPerGather int    `toml:"max_parallel_per_gather" config:"container.max_parallel_per_gather" default:"2" min:"0" max:"16" desc:"Workers per gather"`
+
+	// pg-xpatch extension settings
+	XpatchCacheSizeMB int `toml:"xpatch_cache_size_mb" config:"container.xpatch_cache_size_mb" default:"256" min:"16" max:"4096" desc:"xpatch content cache size in MB"`
 }
 
 // ImportConfig contains default import settings
@@ -65,6 +68,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 			MaxParallelWorkers:   4,
 			MaxWorkerProcesses:   4,
 			MaxParallelPerGather: 2,
+			XpatchCacheSizeMB:    256,
 		},
 		Import: ImportConfig{
 			Workers: workers,
@@ -138,6 +142,9 @@ func LoadGlobal() (*GlobalConfig, error) {
 	}
 	if cfg.Container.MaxParallelPerGather == 0 {
 		cfg.Container.MaxParallelPerGather = defaults.Container.MaxParallelPerGather
+	}
+	if cfg.Container.XpatchCacheSizeMB == 0 {
+		cfg.Container.XpatchCacheSizeMB = defaults.Container.XpatchCacheSizeMB
 	}
 	if cfg.Import.Workers == 0 {
 		cfg.Import.Workers = defaults.Import.Workers

@@ -228,6 +228,9 @@ func StartContainer(runtime Runtime, port int) error {
 		if globalCfg.Container.MaxParallelPerGather > 0 {
 			args = append(args, "-c", fmt.Sprintf("max_parallel_workers_per_gather=%d", globalCfg.Container.MaxParallelPerGather))
 		}
+		if globalCfg.Container.XpatchCacheSizeMB > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_size_mb=%d", globalCfg.Container.XpatchCacheSizeMB))
+		}
 	}
 
 	cmd := exec.Command(string(runtime), args...)
