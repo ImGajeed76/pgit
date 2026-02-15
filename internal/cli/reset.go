@@ -97,15 +97,15 @@ func runReset(cmd *cobra.Command, args []string) error {
 
 	if len(args) == 0 {
 		// No args: reset to HEAD (unstage all in mixed mode)
-		head, err := r.DB.GetHeadCommit(ctx)
+		headID, err := r.DB.GetHead(ctx)
 		if err != nil {
 			return err
 		}
-		if head == nil {
+		if headID == "" {
 			// No commits yet, just unstage
 			return unstageAll(r)
 		}
-		targetCommit = head.ID
+		targetCommit = headID
 	} else {
 		// Check if first arg looks like a commit ref
 		commitID, refResult := tryResolveCommit(ctx, r, args[0])
@@ -134,14 +134,14 @@ func runReset(cmd *cobra.Command, args []string) error {
 				targetCommit = commitID
 			} else {
 				// No commit before --, use HEAD
-				head, err := r.DB.GetHeadCommit(ctx)
+				headID, err := r.DB.GetHead(ctx)
 				if err != nil {
 					return err
 				}
-				if head == nil {
+				if headID == "" {
 					return util.ErrNoCommits
 				}
-				targetCommit = head.ID
+				targetCommit = headID
 			}
 			paths = args[dashDashIdx+1:]
 		} else if refResult == commitRefResolved {
@@ -156,15 +156,15 @@ func runReset(cmd *cobra.Command, args []string) error {
 				WithSuggestion("pgit log --oneline  # View available commits")
 		} else {
 			// First arg is not a commit, treat all as paths (unstage mode)
-			head, err := r.DB.GetHeadCommit(ctx)
+			headID, err := r.DB.GetHead(ctx)
 			if err != nil {
 				return err
 			}
-			if head == nil {
+			if headID == "" {
 				// No commits, can still unstage
 				return unstageFiles(r, args)
 			}
-			targetCommit = head.ID
+			targetCommit = headID
 			paths = args
 		}
 	}
@@ -199,11 +199,11 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 
 	// Special refs
 	if ref == "HEAD" {
-		head, err := r.DB.GetHeadCommit(ctx)
-		if err != nil || head == nil {
+		headID, err := r.DB.GetHead(ctx)
+		if err != nil || headID == "" {
 			return "", commitRefInvalid
 		}
-		return head.ID, commitRefResolved
+		return headID, commitRefResolved
 	}
 
 	// HEAD~N syntax
@@ -212,12 +212,12 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 		if len(ref) > 5 {
 			_, _ = fmt.Sscanf(ref[5:], "%d", &n)
 		}
-		head, err := r.DB.GetHeadCommit(ctx)
-		if err != nil || head == nil {
+		headID, err := r.DB.GetHead(ctx)
+		if err != nil || headID == "" {
 			return "", commitRefInvalid
 		}
 		// Walk back n commits
-		commits, err := r.DB.GetCommitLogFrom(ctx, head.ID, n+1)
+		commits, err := r.DB.GetCommitLogFrom(ctx, headID, n+1)
 		if err != nil || len(commits) <= n {
 			// This looks like a commit ref but we can't go back that far
 			return "", commitRefInvalid
@@ -228,11 +228,11 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 	// HEAD^ syntax
 	if strings.HasPrefix(ref, "HEAD^") {
 		n := strings.Count(ref, "^")
-		head, err := r.DB.GetHeadCommit(ctx)
-		if err != nil || head == nil {
+		headID, err := r.DB.GetHead(ctx)
+		if err != nil || headID == "" {
 			return "", commitRefInvalid
 		}
-		commits, err := r.DB.GetCommitLogFrom(ctx, head.ID, n+1)
+		commits, err := r.DB.GetCommitLogFrom(ctx, headID, n+1)
 		if err != nil || len(commits) <= n {
 			return "", commitRefInvalid
 		}
@@ -245,21 +245,10 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 		return commit.ID, commitRefResolved
 	}
 
-	// Try partial match (short ID)
-	commits, err := r.DB.GetAllCommits(ctx)
-	if err != nil {
-		if looksLikeCommitRef {
-			return "", commitRefInvalid
-		}
-		return "", commitRefNotARef
-	}
-
-	refUpper := strings.ToUpper(ref)
-	for _, c := range commits {
-		// Match suffix (short ID uses last 7 chars) or prefix
-		if strings.HasSuffix(c.ID, refUpper) || strings.HasPrefix(c.ID, refUpper) {
-			return c.ID, commitRefResolved
-		}
+	// Try partial match (short ID) using prefix/suffix search
+	partialCommit, err := r.DB.FindCommitByPartialID(ctx, strings.ToUpper(ref))
+	if err == nil && partialCommit != nil {
+		return partialCommit.ID, commitRefResolved
 	}
 
 	// If it doesn't look like a path (no / or . extension), treat as invalid ref
@@ -321,7 +310,7 @@ func unstageFiles(r *repo.Repository, paths []string) error {
 // resetToCommit performs the actual reset operation
 func resetToCommit(ctx context.Context, r *repo.Repository, commitID string, mode resetMode) error {
 	// Get current HEAD for display
-	currentHead, err := r.DB.GetHeadCommit(ctx)
+	currentHeadID, err := r.DB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
@@ -336,7 +325,7 @@ func resetToCommit(ctx context.Context, r *repo.Repository, commitID string, mod
 	}
 
 	// Check if we're already at this commit
-	if currentHead != nil && currentHead.ID == commitID {
+	if currentHeadID != "" && currentHeadID == commitID {
 		// Still need to reset index/working tree depending on mode
 		if mode == resetMixed || mode == resetHard {
 			if err := r.UnstageAll(); err != nil {
@@ -399,10 +388,10 @@ func resetWorkingTree(ctx context.Context, r *repo.Repository, commitID string) 
 	}
 
 	// Get current HEAD tree to know what files to delete
-	currentHead, _ := r.DB.GetHeadCommit(ctx)
+	currentHeadID, _ := r.DB.GetHead(ctx)
 	var currentTree map[string]bool
-	if currentHead != nil {
-		blobs, _ := r.DB.GetTreeAtCommit(ctx, currentHead.ID)
+	if currentHeadID != "" {
+		blobs, _ := r.DB.GetTreeAtCommit(ctx, currentHeadID)
 		currentTree = make(map[string]bool)
 		for _, b := range blobs {
 			currentTree[b.Path] = true

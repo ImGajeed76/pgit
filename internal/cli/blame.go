@@ -46,25 +46,16 @@ func runBlame(cmd *cobra.Command, args []string) error {
 	}
 	defer r.Close()
 
-	// Get file history
-	history, err := r.DB.GetFileHistory(ctx, path)
+	// Get current file content at HEAD
+	headID, err := r.DB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
-	if len(history) == 0 {
-		return util.ErrFileNotFound
-	}
-
-	// Get current file content
-	head, err := r.DB.GetHeadCommit(ctx)
-	if err != nil {
-		return err
-	}
-	if head == nil {
+	if headID == "" {
 		return util.ErrNoCommits
 	}
 
-	currentBlob, err := r.DB.GetFileAtCommit(ctx, path, head.ID)
+	currentBlob, err := r.DB.GetFileAtCommit(ctx, path, headID)
 	if err != nil {
 		return err
 	}
@@ -72,11 +63,27 @@ func runBlame(cmd *cobra.Command, args []string) error {
 		return util.ErrFileNotFound
 	}
 
+	// Get file ref history (metadata only, from pgit_file_refs — normal table, fast).
+	// Ordered by commit_id DESC (newest first).
+	groupID, err := r.DB.GetGroupIDByPath(ctx, path)
+	if err != nil {
+		return err
+	}
+	if groupID == 0 {
+		return util.ErrFileNotFound
+	}
+	refs, err := r.DB.GetFileRefHistory(ctx, groupID)
+	if err != nil {
+		return err
+	}
+	if len(refs) == 0 {
+		return util.ErrFileNotFound
+	}
+
 	// Split content into lines
 	lines := strings.Split(string(currentBlob.Content), "\n")
 
 	// Build blame info for each line
-	// This is a simplified implementation - tracks the last commit that changed each line
 	type blameInfo struct {
 		commitID    string
 		authorName  string
@@ -85,45 +92,106 @@ func runBlame(cmd *cobra.Command, args []string) error {
 	}
 
 	blameLines := make([]blameInfo, len(lines))
+	pinned := make([]bool, len(lines))
+	pinnedCount := 0
 
-	// Initialize all lines to the oldest commit
 	for i, line := range lines {
 		blameLines[i] = blameInfo{lineContent: line}
 	}
 
-	// Batch fetch all commits for the history (avoid N+1 queries)
-	commitIDs := make([]string, len(history))
-	for i, blob := range history {
-		commitIDs[i] = blob.CommitID
+	// Check if the file is binary (determines which content table to query).
+	isBinary := false
+	for _, ref := range refs {
+		if ref.IsBinary {
+			isBinary = true
+			break
+		}
 	}
-	commitMap, err := r.DB.GetCommitsBatch(ctx, commitIDs)
+
+	// Fetch all content versions in a single query, front-to-back (ASC).
+	// This is the fastest xpatch access pattern: one Index Scan through the
+	// delta chain, decompressing sequentially. We then iterate in reverse in
+	// Go for the blame algorithm (newest→oldest, pinning lines as they diverge).
+	allContent, err := r.DB.GetAllContentForGroup(ctx, groupID, isBinary)
 	if err != nil {
 		return err
 	}
 
-	// Process history from oldest to newest
-	for i := len(history) - 1; i >= 0; i-- {
-		blob := history[i]
+	// Build version_id → content lookup
+	contentByVersion := make(map[int32][]byte, len(allContent))
+	for _, cv := range allContent {
+		contentByVersion[cv.VersionID] = cv.Content
+	}
 
-		// Get commit info from batch map
-		commit, ok := commitMap[blob.CommitID]
-		if !ok || commit == nil {
+	// Iterate refs newest→oldest (refs are already ordered by commit_id DESC).
+	// Algorithm:
+	//   - Start at the newest version: attribute all matching lines to it.
+	//   - Move to the previous (older) version: lines that still match get
+	//     re-attributed (they existed earlier). Lines that differ get "pinned"
+	//     to the newer version (that's where they were introduced).
+	//   - Repeat until all lines are pinned or history is exhausted.
+	for _, ref := range refs {
+		if pinnedCount >= len(lines) {
+			break
+		}
+
+		if ref.ContentHash == nil {
+			// File was deleted at this point — all remaining unpinned lines
+			// were introduced after this deletion, pin them.
+			for i := range lines {
+				if !pinned[i] {
+					pinned[i] = true
+					pinnedCount++
+				}
+			}
+			break
+		}
+
+		content, ok := contentByVersion[ref.VersionID]
+		if !ok || content == nil {
 			continue
 		}
+		commitLines := strings.Split(string(content), "\n")
 
-		// Get lines at this commit
-		var commitLines []string
-		if blob.Content != nil {
-			commitLines = strings.Split(string(blob.Content), "\n")
-		}
-
-		// Simple attribution: if a line exists at this commit, attribute it
-		for lineIdx := range blameLines {
-			if lineIdx < len(commitLines) && commitLines[lineIdx] == blameLines[lineIdx].lineContent {
-				blameLines[lineIdx].commitID = commit.ID
-				blameLines[lineIdx].authorName = commit.AuthorName
-				blameLines[lineIdx].date = commit.AuthoredAt
+		for i := range lines {
+			if pinned[i] {
+				continue
 			}
+			if i < len(commitLines) && commitLines[i] == blameLines[i].lineContent {
+				// Line exists at this version — (re-)attribute to this commit
+				blameLines[i].commitID = ref.CommitID
+			} else {
+				// Line doesn't exist at this version — pin to the previously
+				// attributed commit (the newer version that introduced it)
+				pinned[i] = true
+				pinnedCount++
+			}
+		}
+	}
+
+	// Collect unique commit IDs that were attributed, then batch-fetch metadata.
+	// This is a small set (typically < 100 unique commits in a blame output).
+	commitIDSet := make(map[string]bool)
+	for _, bl := range blameLines {
+		if bl.commitID != "" {
+			commitIDSet[bl.commitID] = true
+		}
+	}
+	uniqueIDs := make([]string, 0, len(commitIDSet))
+	for id := range commitIDSet {
+		uniqueIDs = append(uniqueIDs, id)
+	}
+
+	commitMap, err := r.DB.GetCommitsBatchByRange(ctx, uniqueIDs)
+	if err != nil {
+		return err
+	}
+
+	// Fill in author/date from commit metadata
+	for i := range blameLines {
+		if c, ok := commitMap[blameLines[i].commitID]; ok && c != nil {
+			blameLines[i].authorName = c.AuthorName
+			blameLines[i].date = c.AuthoredAt
 		}
 	}
 

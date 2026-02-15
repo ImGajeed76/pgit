@@ -370,6 +370,54 @@ func (db *DB) GetContentsByGroupID(ctx context.Context, groupID int32) ([]*Conte
 	return contents, rows.Err()
 }
 
+// GetAllContentForGroup retrieves all content versions for a single group,
+// ordered by version_id ASC (front-to-back). This is the fastest access pattern
+// for xpatch: a single Index Scan through the delta chain, decompressing
+// sequentially. The caller can reverse the slice in Go for newest-first iteration.
+func (db *DB) GetAllContentForGroup(ctx context.Context, groupID int32, isBinary bool) ([]ContentVersionPair, error) {
+	var rows pgx.Rows
+	var err error
+
+	if isBinary {
+		rows, err = db.Query(ctx,
+			"SELECT version_id, content FROM pgit_binary_content WHERE group_id = $1 ORDER BY version_id ASC",
+			groupID)
+	} else {
+		rows, err = db.Query(ctx,
+			"SELECT version_id, content FROM pgit_text_content WHERE group_id = $1 ORDER BY version_id ASC",
+			groupID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []ContentVersionPair
+	for rows.Next() {
+		var p ContentVersionPair
+		if isBinary {
+			if err := rows.Scan(&p.VersionID, &p.Content); err != nil {
+				return nil, err
+			}
+		} else {
+			var text string
+			if err := rows.Scan(&p.VersionID, &text); err != nil {
+				return nil, err
+			}
+			p.Content = []byte(text)
+		}
+		result = append(result, p)
+	}
+
+	return result, rows.Err()
+}
+
+// ContentVersionPair holds a version_id and its content.
+type ContentVersionPair struct {
+	VersionID int32
+	Content   []byte
+}
+
 // ContentExists checks if content exists in either table.
 func (db *DB) ContentExists(ctx context.Context, groupID, versionID int32) (bool, error) {
 	var exists bool

@@ -107,72 +107,32 @@ func (db *DB) GetHeadCommit(ctx context.Context) (*Commit, error) {
 	return c, nil
 }
 
-// GetCommitLog retrieves commits starting from HEAD, walking up the parent chain
+// GetCommitLog retrieves commits starting from HEAD in reverse chronological order.
+// Uses a range query on ULID-ordered IDs instead of a recursive CTE,
+// which is much faster on xpatch tables (sequential scan vs random PK lookups).
 func (db *DB) GetCommitLog(ctx context.Context, limit int) ([]*Commit, error) {
-	sql := `
-	WITH RECURSIVE ancestors AS (
-		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.authored_at,
-		       c.committer_name, c.committer_email, c.committed_at, 1 as depth
-		FROM pgit_commits c
-		JOIN pgit_refs r ON r.commit_id = c.id
-		WHERE r.name = 'HEAD'
-		
-		UNION ALL
-		
-		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.authored_at,
-		       c.committer_name, c.committer_email, c.committed_at, a.depth + 1
-		FROM pgit_commits c
-		JOIN ancestors a ON c.id = a.parent_id
-		WHERE a.depth < $1
-	)
-	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
-	       committer_name, committer_email, committed_at
-	FROM ancestors
-	ORDER BY depth`
-
-	rows, err := db.Query(ctx, sql, limit)
+	// Get HEAD from pgit_refs (normal table, instant)
+	headID, err := db.GetHead(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var commits []*Commit
-	for rows.Next() {
-		c := &Commit{}
-		if err := rows.Scan(
-			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
-			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
-		); err != nil {
-			return nil, err
-		}
-		commits = append(commits, c)
+	if headID == "" {
+		return nil, nil
 	}
-
-	return commits, rows.Err()
+	return db.GetCommitLogFrom(ctx, headID, limit)
 }
 
-// GetCommitLogFrom retrieves commits starting from a specific commit
+// GetCommitLogFrom retrieves commits in reverse chronological order starting from a commit.
+// Since commit IDs are ULIDs (lexicographically = chronologically ordered),
+// we use a simple range query instead of walking parent_id chains.
 func (db *DB) GetCommitLogFrom(ctx context.Context, commitID string, limit int) ([]*Commit, error) {
 	sql := `
-	WITH RECURSIVE ancestors AS (
-		SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
-		       committer_name, committer_email, committed_at, 1 as depth
-		FROM pgit_commits
-		WHERE id = $1
-		
-		UNION ALL
-		
-		SELECT c.id, c.parent_id, c.tree_hash, c.message, c.author_name, c.author_email, c.authored_at,
-		       c.committer_name, c.committer_email, c.committed_at, a.depth + 1
-		FROM pgit_commits c
-		JOIN ancestors a ON c.id = a.parent_id
-		WHERE a.depth < $2
-	)
 	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
 	       committer_name, committer_email, committed_at
-	FROM ancestors
-	ORDER BY depth`
+	FROM pgit_commits
+	WHERE id <= $1
+	ORDER BY id DESC
+	LIMIT $2`
 
 	rows, err := db.Query(ctx, sql, commitID, limit)
 	if err != nil {
@@ -283,42 +243,65 @@ func (db *DB) FindCommonAncestor(ctx context.Context, commitA, commitB string) (
 }
 
 // FindCommitByPartialID finds a commit by partial ID match.
+// Uses prefix range scan first (fast, uses xpatch PK index), then falls back
+// to suffix match on pgit_file_refs (normal table) if no prefix match found.
 func (db *DB) FindCommitByPartialID(ctx context.Context, partialID string) (*Commit, error) {
-	sql := `
-	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
-	       committer_name, committer_email, committed_at
-	FROM pgit_commits
-	WHERE id LIKE $1 || '%' OR id LIKE '%' || $1
+	// Step 1: Try prefix match using range scan (fast on xpatch PK index)
+	upperBound := partialID[:len(partialID)-1] + string(partialID[len(partialID)-1]+1)
+	prefixSQL := `
+	SELECT id FROM pgit_commits
+	WHERE id >= $1 AND id < $2
 	LIMIT 2`
 
-	rows, err := db.Query(ctx, sql, partialID)
+	rows, err := db.Query(ctx, prefixSQL, partialID, upperBound)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var commits []*Commit
+	var matchIDs []string
 	for rows.Next() {
-		c := &Commit{}
-		if err := rows.Scan(
-			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
-			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
-			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
-		); err != nil {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		commits = append(commits, c)
+		matchIDs = append(matchIDs, id)
 	}
-
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	switch len(commits) {
+	// Step 2: If no prefix match, try suffix match on pgit_file_refs (normal table)
+	if len(matchIDs) == 0 {
+		suffixSQL := `
+		SELECT DISTINCT commit_id FROM pgit_file_refs
+		WHERE commit_id LIKE '%' || $1
+		LIMIT 2`
+
+		rows, err := db.Query(ctx, suffixSQL, partialID)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			matchIDs = append(matchIDs, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	switch len(matchIDs) {
 	case 0:
 		return nil, nil
 	case 1:
-		return commits[0], nil
+		return db.GetCommit(ctx, matchIDs[0])
 	default:
 		return nil, fmt.Errorf("ambiguous commit reference '%s' matches multiple commits", partialID)
 	}
@@ -353,6 +336,63 @@ func (db *DB) GetCommitsBatch(ctx context.Context, ids []string) (map[string]*Co
 			return nil, err
 		}
 		result[c.ID] = c
+	}
+
+	return result, rows.Err()
+}
+
+// GetCommitsBatchByRange retrieves multiple commits using a range scan instead
+// of ANY(). This is much faster on xpatch tables because it scans a contiguous
+// range of the delta chain instead of doing random-access per ID.
+// The ids slice is used to filter results in Go after the range scan.
+func (db *DB) GetCommitsBatchByRange(ctx context.Context, ids []string) (map[string]*Commit, error) {
+	if len(ids) == 0 {
+		return make(map[string]*Commit), nil
+	}
+
+	// Build a set for fast lookup
+	idSet := make(map[string]bool, len(ids))
+	minID := ids[0]
+	maxID := ids[0]
+	for _, id := range ids {
+		idSet[id] = true
+		if id < minID {
+			minID = id
+		}
+		if id > maxID {
+			maxID = id
+		}
+	}
+
+	// Range scan: sequential read of the xpatch delta chain from min to max.
+	// This decompresses the chain segment once vs random-access per ID.
+	sql := `
+	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+	       committer_name, committer_email, committed_at
+	FROM pgit_commits
+	WHERE id >= $1 AND id <= $2
+	ORDER BY id`
+
+	rows, err := db.Query(ctx, sql, minID, maxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]*Commit, len(ids))
+	for rows.Next() {
+		c := &Commit{}
+		if err := rows.Scan(
+			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
+			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
+		); err != nil {
+			return nil, err
+		}
+		// Filter: only keep commits we actually asked for
+		if idSet[c.ID] {
+			result[c.ID] = c
+		}
 	}
 
 	return result, rows.Err()

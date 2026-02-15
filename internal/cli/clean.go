@@ -61,12 +61,12 @@ func runClean(cmd *cobra.Command, args []string) error {
 
 	// Get all tracked files
 	tracked := make(map[string]bool)
-	head, err := r.DB.GetHeadCommit(ctx)
+	headID, err := r.DB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
-	if head != nil {
-		tree, err := r.DB.GetTreeAtCommit(ctx, head.ID)
+	if headID != "" {
+		tree, err := r.DB.GetTreeAtCommit(ctx, headID)
 		if err != nil {
 			return err
 		}

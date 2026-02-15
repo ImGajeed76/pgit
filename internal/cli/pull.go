@@ -101,37 +101,37 @@ func runPull(cmd *cobra.Command, args []string) error {
 	defer remoteDB.Close()
 
 	// Get remote HEAD
-	remoteHead, err := remoteDB.GetHeadCommit(ctx)
+	remoteHeadID, err := remoteDB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
-	if remoteHead == nil {
+	if remoteHeadID == "" {
 		fmt.Println("Remote has no commits")
 		return nil
 	}
 
 	// Get local HEAD
-	localHead, err := r.DB.GetHeadCommit(ctx)
+	localHeadID, err := r.DB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
 
 	// Check if already up to date
-	if localHead != nil && localHead.ID == remoteHead.ID {
+	if localHeadID != "" && localHeadID == remoteHeadID {
 		fmt.Println("Already up to date")
 		return nil
 	}
 
 	// Get all remote commits
-	remoteCommits, err := remoteDB.GetCommitLogFrom(ctx, remoteHead.ID, 10000)
+	remoteCommits, err := remoteDB.GetCommitLogFrom(ctx, remoteHeadID, 10000)
 	if err != nil {
 		return err
 	}
 
 	// Check for divergence
 	var localCommits []*db.Commit
-	if localHead != nil {
-		localCommits, err = r.DB.GetCommitLogFrom(ctx, localHead.ID, 10000)
+	if localHeadID != "" {
+		localCommits, err = r.DB.GetCommitLogFrom(ctx, localHeadID, 10000)
 		if err != nil {
 			return err
 		}
@@ -164,7 +164,7 @@ func runPull(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check if this is a fast-forward
-	isFF := localHead == nil || commonAncestor == localHead.ID
+	isFF := localHeadID == "" || commonAncestor == localHeadID
 
 	if isFF {
 		// Fast-forward: just add commits
@@ -177,10 +177,10 @@ func runPull(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Common ancestor: %s\n", styles.Yellow(util.ShortID(commonAncestor)))
 
 	if useRebase {
-		return pullRebase(ctx, r, remoteDB, localHead, localCommits, newCommits, commonAncestor, remoteName)
+		return pullRebase(ctx, r, remoteDB, localHeadID, localCommits, newCommits, commonAncestor, remoteName)
 	}
 
-	return pullDiverged(ctx, r, remoteDB, localHead, localCommits, newCommits, commonAncestor, remoteName)
+	return pullDiverged(ctx, r, remoteDB, localHeadID, localCommits, newCommits, commonAncestor, remoteName)
 }
 
 func pullFastForward(ctx context.Context, r *repo.Repository, remoteDB *db.DB, commits []*db.Commit, remoteName string) error {
@@ -240,7 +240,7 @@ func pullFastForward(ctx context.Context, r *repo.Repository, remoteDB *db.DB, c
 	return nil
 }
 
-func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localHead *db.Commit, localCommits, remoteCommits []*db.Commit, commonAncestor, remoteName string) error {
+func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localHeadID string, localCommits, remoteCommits []*db.Commit, commonAncestor, remoteName string) error {
 	// Find local commits after common ancestor
 	var localToReapply []*db.Commit
 	for _, c := range localCommits {
@@ -254,7 +254,7 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 	fmt.Printf("Remote commits to pull: %d\n", len(remoteCommits))
 
 	// Get trees for conflict detection
-	localTree, err := r.DB.GetTreeAtCommit(ctx, localHead.ID)
+	localTree, err := r.DB.GetTreeAtCommit(ctx, localHeadID)
 	if err != nil {
 		return err
 	}
@@ -389,7 +389,7 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 		InProgress:     len(conflicts) > 0,
 		RemoteName:     remoteName,
 		RemoteCommitID: remoteHeadCommit.ID,
-		LocalCommitID:  localHead.ID,
+		LocalCommitID:  localHeadID,
 		CommonAncestor: commonAncestor,
 	}
 
@@ -494,7 +494,7 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 }
 
 // pullRebase rebases local commits on top of remote
-func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localHead *db.Commit, localCommits, remoteCommits []*db.Commit, commonAncestor, remoteName string) error {
+func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localHeadID string, localCommits, remoteCommits []*db.Commit, commonAncestor, remoteName string) error {
 	// Find local commits after common ancestor (in reverse order - oldest first for replay)
 	var localToReplay []*db.Commit
 	for _, c := range localCommits {
@@ -569,10 +569,10 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 
 			// Create new commit with new ID but same message/author
 			newCommitID := util.NewULID()
-			currentHead, _ := r.DB.GetHeadCommit(ctx)
+			currentHeadID, _ := r.DB.GetHead(ctx)
 			var parentID *string
-			if currentHead != nil {
-				parentID = &currentHead.ID
+			if currentHeadID != "" {
+				parentID = &currentHeadID
 			}
 
 			newCommit := &db.Commit{
@@ -623,9 +623,9 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 	// Update working directory
 	fmt.Println()
 	fmt.Println("Updating working directory...")
-	head, _ := r.DB.GetHeadCommit(ctx)
-	if head != nil {
-		tree, err := r.DB.GetTreeAtCommit(ctx, head.ID)
+	headID, _ := r.DB.GetHead(ctx)
+	if headID != "" {
+		tree, err := r.DB.GetTreeAtCommit(ctx, headID)
 		if err != nil {
 			return err
 		}
@@ -646,8 +646,8 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 
 	fmt.Println()
 	fmt.Printf("%s Rebased %d commit(s)\n", styles.Successf("Successfully"), len(localToReplay))
-	if head != nil {
-		fmt.Printf("HEAD is now at %s\n", styles.Yellow(util.ShortID(head.ID)))
+	if headID != "" {
+		fmt.Printf("HEAD is now at %s\n", styles.Yellow(util.ShortID(headID)))
 	}
 
 	return nil

@@ -118,11 +118,11 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 		`).Scan(&stats.TotalIndexSize)
 	}()
 
-	// Query 5: Min/max commit IDs (fast with index)
+	// Query 5: Min/max commit IDs from pgit_file_refs (normal table, avoids xpatch decompression)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT MIN(id), MAX(id) FROM pgit_commits").Scan(
+		_ = db.QueryRow(ctx, "SELECT MIN(commit_id), MAX(commit_id) FROM pgit_file_refs").Scan(
 			&stats.FirstCommitID, &stats.LastCommitID)
 	}()
 

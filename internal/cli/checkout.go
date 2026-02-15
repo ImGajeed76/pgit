@@ -202,9 +202,9 @@ func checkoutFull(ctx context.Context, r *repo.Repository, commitID string, forc
 
 	// Remove files that shouldn't exist at this commit
 	// Get current tree
-	head, _ := r.DB.GetHeadCommit(ctx)
-	if head != nil {
-		currentTree, _ := r.DB.GetTreeAtCommit(ctx, head.ID)
+	headID, _ := r.DB.GetHead(ctx)
+	if headID != "" {
+		currentTree, _ := r.DB.GetTreeAtCommit(ctx, headID)
 		for _, blob := range currentTree {
 			if !keepFiles[blob.Path] {
 				absPath := r.AbsPath(blob.Path)

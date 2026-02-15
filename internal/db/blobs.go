@@ -518,14 +518,14 @@ func (db *DB) GetTreeAtCommit(ctx context.Context, commitID string) ([]*Blob, er
 
 // GetCurrentTree retrieves the tree at HEAD.
 func (db *DB) GetCurrentTree(ctx context.Context) ([]*Blob, error) {
-	head, err := db.GetHeadCommit(ctx)
+	headID, err := db.GetHead(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if head == nil {
+	if headID == "" {
 		return nil, nil // No commits yet
 	}
-	return db.GetTreeAtCommit(ctx, head.ID)
+	return db.GetTreeAtCommit(ctx, headID)
 }
 
 // GetTreeMetadataAtCommit retrieves the full tree metadata (all files) at a commit
@@ -563,14 +563,14 @@ func (db *DB) GetTreeMetadataAtCommit(ctx context.Context, commitID string) ([]*
 // GetCurrentTreeMetadata retrieves the tree metadata at HEAD without content.
 // Use this for operations that only need paths and hashes.
 func (db *DB) GetCurrentTreeMetadata(ctx context.Context) ([]*Blob, error) {
-	head, err := db.GetHeadCommit(ctx)
+	headID, err := db.GetHead(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if head == nil {
+	if headID == "" {
 		return nil, nil // No commits yet
 	}
-	return db.GetTreeMetadataAtCommit(ctx, head.ID)
+	return db.GetTreeMetadataAtCommit(ctx, headID)
 }
 
 // GetFileHistory retrieves all versions of a file.

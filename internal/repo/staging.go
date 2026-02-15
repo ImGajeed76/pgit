@@ -290,13 +290,13 @@ func (r *Repository) StageFile(ctx context.Context, path string) error {
 	// Check if file exists in current tree (only need to check existence, not load all files)
 	inTree := false
 	if r.DB != nil {
-		head, err := r.DB.GetHeadCommit(ctx)
+		headID, err := r.DB.GetHead(ctx)
 		if err != nil {
 			return err
 		}
-		if head != nil {
+		if headID != "" {
 			// Use FileExistsInTree to check if file is tracked (fast, no content load)
-			inTree, err = r.DB.FileExistsInTree(ctx, path, head.ID)
+			inTree, err = r.DB.FileExistsInTree(ctx, path, headID)
 			if err != nil {
 				return err
 			}

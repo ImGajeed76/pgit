@@ -10,6 +10,7 @@ import (
 	"github.com/imgajeed76/pgit/v2/internal/db"
 	"github.com/imgajeed76/pgit/v2/internal/repo"
 	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v2/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -156,7 +157,10 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runCommitDiff shows diff between commits or commit to working tree
+// runCommitDiff shows diff between commits or commit to working tree.
+// Instead of materializing full trees (which decompresses all xpatch content),
+// we identify changed paths first via pgit_file_refs (normal table), then
+// fetch content only for those paths using scoped xpatch queries.
 func runCommitDiff(ctx context.Context, r *repo.Repository, fromRef, toRef string, paths []string, nameOnly, nameStatus, stat, noColor bool) error {
 	// Resolve commit refs
 	fromID, err := resolveCommitRef(ctx, r, fromRef)
@@ -172,114 +176,142 @@ func runCommitDiff(ctx context.Context, r *repo.Repository, fromRef, toRef strin
 		}
 	}
 
-	// Get tree at from commit
-	fromTree, err := r.DB.GetTreeAtCommit(ctx, fromID)
-	if err != nil {
-		return err
-	}
+	var results []repo.DiffResult
 
-	// Build from map
-	fromMap := make(map[string]*db.Blob)
-	for _, b := range fromTree {
-		fromMap[b.Path] = b
-	}
-
-	// Build to map - either from another commit or from working tree
-	toMap := make(map[string][]byte)
 	if toID != "" {
-		// Compare to another commit
-		toTree, err := r.DB.GetTreeAtCommit(ctx, toID)
+		// Commit-to-commit diff: get only changed paths between the two commits,
+		// then fetch old/new content per file via scoped xpatch queries.
+		changedMeta, err := r.DB.GetChangedFilesMetadata(ctx, fromID, toID)
 		if err != nil {
 			return err
 		}
-		for _, b := range toTree {
-			toMap[b.Path] = b.Content
+
+		// Deduplicate: a file may be changed in multiple commits between from..to.
+		// We only need the unique paths.
+		changedPaths := make(map[string]bool)
+		for _, b := range changedMeta {
+			if len(paths) > 0 && !matchesAnyPath(b.Path, paths) {
+				continue
+			}
+			changedPaths[b.Path] = true
+		}
+
+		for path := range changedPaths {
+			oldBlob, _ := r.DB.GetFileAtCommit(ctx, path, fromID)
+			newBlob, _ := r.DB.GetFileAtCommit(ctx, path, toID)
+
+			var result repo.DiffResult
+			result.Path = path
+
+			oldContent := ""
+			newContent := ""
+			if oldBlob != nil {
+				oldContent = string(oldBlob.Content)
+			}
+			if newBlob != nil {
+				newContent = string(newBlob.Content)
+			}
+
+			if oldContent == newContent {
+				continue // no actual change (e.g., added then reverted)
+			}
+
+			result.OldContent = oldContent
+			result.NewContent = newContent
+
+			if oldBlob == nil {
+				result.Status = repo.StatusNew
+			} else if newBlob == nil {
+				result.Status = repo.StatusDeleted
+			} else {
+				result.Status = repo.StatusModified
+			}
+
+			if !nameOnly && !nameStatus {
+				result.Hunks = repo.GenerateHunks(result.OldContent, result.NewContent, 3)
+			}
+			results = append(results, result)
 		}
 	} else {
-		// Compare to working tree - read actual files
+		// Commit-to-working-tree diff: get tree metadata (no content, fast)
+		// then compare hashes against working tree files.
+		treeMeta, err := r.DB.GetTreeMetadataAtCommit(ctx, fromID)
+		if err != nil {
+			return err
+		}
+
+		fromMap := make(map[string]*db.Blob)
+		for _, b := range treeMeta {
+			fromMap[b.Path] = b
+		}
+
+		// Check each tracked file against working tree
 		for path := range fromMap {
-			// Filter by paths if specified
 			if len(paths) > 0 && !matchesAnyPath(path, paths) {
 				continue
 			}
 			absPath := r.AbsPath(path)
-			content, err := os.ReadFile(absPath)
-			if err == nil {
-				toMap[path] = content
+			wtContent, err := os.ReadFile(absPath)
+			if err != nil {
+				// File deleted in working tree
+				oldBlob, err := r.DB.GetFileAtCommit(ctx, path, fromID)
+				if err != nil || oldBlob == nil {
+					continue
+				}
+				result := repo.DiffResult{
+					Path:       path,
+					Status:     repo.StatusDeleted,
+					OldContent: string(oldBlob.Content),
+				}
+				if !nameOnly && !nameStatus {
+					result.Hunks = repo.GenerateHunks(result.OldContent, "", 3)
+				}
+				results = append(results, result)
+				continue
 			}
-			// If file doesn't exist, it's deleted (not in toMap)
+
+			// Quick hash check to skip unchanged files without fetching content
+			wtHash := util.HashBytesBlake3(wtContent)
+			if util.ContentHashEqual(wtHash, fromMap[path].ContentHash) {
+				continue
+			}
+
+			// Content differs — fetch old content
+			oldBlob, err := r.DB.GetFileAtCommit(ctx, path, fromID)
+			if err != nil || oldBlob == nil {
+				continue
+			}
+			result := repo.DiffResult{
+				Path:       path,
+				Status:     repo.StatusModified,
+				OldContent: string(oldBlob.Content),
+				NewContent: string(wtContent),
+			}
+			if !nameOnly && !nameStatus {
+				result.Hunks = repo.GenerateHunks(result.OldContent, result.NewContent, 3)
+			}
+			results = append(results, result)
 		}
-		// Also check for new files in working directory that match paths
+
+		// Check for new files in working directory
 		if len(paths) > 0 {
 			for _, p := range paths {
 				if _, exists := fromMap[p]; !exists {
 					absPath := r.AbsPath(p)
 					content, err := os.ReadFile(absPath)
 					if err == nil {
-						toMap[p] = content
+						result := repo.DiffResult{
+							Path:       p,
+							Status:     repo.StatusNew,
+							NewContent: string(content),
+						}
+						if !nameOnly && !nameStatus {
+							result.Hunks = repo.GenerateHunks("", result.NewContent, 3)
+						}
+						results = append(results, result)
 					}
 				}
 			}
-		}
-	}
-
-	// Generate diffs
-	var results []repo.DiffResult
-	seen := make(map[string]bool)
-
-	// Check files in toMap (added or modified)
-	for path, toContent := range toMap {
-		// Filter by paths if specified
-		if len(paths) > 0 && !matchesAnyPath(path, paths) {
-			continue
-		}
-
-		seen[path] = true
-		fromBlob := fromMap[path]
-
-		var result repo.DiffResult
-		result.Path = path
-
-		if fromBlob == nil {
-			// New file
-			result.Status = repo.StatusNew
-			result.NewContent = string(toContent)
-		} else if string(fromBlob.Content) != string(toContent) {
-			// Modified
-			result.Status = repo.StatusModified
-			result.OldContent = string(fromBlob.Content)
-			result.NewContent = string(toContent)
-		} else {
-			// Unchanged
-			continue
-		}
-
-		if !nameOnly && !nameStatus {
-			result.Hunks = repo.GenerateHunks(result.OldContent, result.NewContent, 3)
-		}
-		results = append(results, result)
-	}
-
-	// Check for deleted files (in fromMap but not in toMap)
-	for path, fromBlob := range fromMap {
-		if seen[path] {
-			continue
-		}
-		// Filter by paths if specified
-		if len(paths) > 0 && !matchesAnyPath(path, paths) {
-			continue
-		}
-
-		if _, exists := toMap[path]; !exists {
-			result := repo.DiffResult{
-				Path:       path,
-				Status:     repo.StatusDeleted,
-				OldContent: string(fromBlob.Content),
-			}
-			if !nameOnly && !nameStatus {
-				result.Hunks = repo.GenerateHunks(result.OldContent, "", 3)
-			}
-			results = append(results, result)
 		}
 	}
 

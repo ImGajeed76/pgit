@@ -91,14 +91,14 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		}
 	} else if !searchAll {
 		// Default: search at HEAD
-		head, err := r.DB.GetHeadCommit(ctx)
+		headID, err := r.DB.GetHead(ctx)
 		if err != nil {
 			return err
 		}
-		if head == nil {
+		if headID == "" {
 			return util.ErrNoCommits
 		}
-		commitID = head.ID
+		commitID = headID
 	}
 
 	spinner := ui.NewSpinner("Searching repository")

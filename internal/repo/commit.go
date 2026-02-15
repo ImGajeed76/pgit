@@ -67,12 +67,12 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 
 	// Get parent commit
 	var parentID *string
-	headCommit, err := r.DB.GetHeadCommit(ctx)
+	headID, err := r.DB.GetHead(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if headCommit != nil {
-		parentID = &headCommit.ID
+	if headID != "" {
+		parentID = &headID
 	}
 
 	// Create blobs for staged files
@@ -81,8 +81,8 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 
 	// First, get the current tree to carry forward unchanged files
 	var currentTree []*db.Blob
-	if headCommit != nil {
-		currentTree, err = r.DB.GetTreeMetadataAtCommit(ctx, headCommit.ID)
+	if headID != "" {
+		currentTree, err = r.DB.GetTreeMetadataAtCommit(ctx, headID)
 		if err != nil {
 			return nil, err
 		}

@@ -114,14 +114,16 @@ func showCommitDetails(ctx context.Context, r *repo.Repository, ref string, show
 
 	fmt.Println()
 
-	// Get parent commit's tree for comparison
+	// Get parent content only for files changed in this commit.
+	// Instead of materializing the entire tree (7k+ files), we fetch only the
+	// specific files we need via scoped xpatch queries (group_id in WHERE).
 	var parentBlobs map[string][]byte
 	if commit.ParentID != nil {
-		parentTree, err := r.DB.GetTreeAtCommit(ctx, *commit.ParentID)
-		if err == nil {
-			parentBlobs = make(map[string][]byte)
-			for _, b := range parentTree {
-				parentBlobs[b.Path] = b.Content
+		parentBlobs = make(map[string][]byte)
+		for _, blob := range blobs {
+			parentBlob, err := r.DB.GetFileAtCommit(ctx, blob.Path, *commit.ParentID)
+			if err == nil && parentBlob != nil {
+				parentBlobs[parentBlob.Path] = parentBlob.Content
 			}
 		}
 	}
@@ -297,14 +299,14 @@ func parseAncestorNotation(ref string) (string, int) {
 func resolveBaseRef(ctx context.Context, r *repo.Repository, ref string) (string, error) {
 	// Handle HEAD
 	if ref == "HEAD" {
-		head, err := r.DB.GetHeadCommit(ctx)
+		headID, err := r.DB.GetHead(ctx)
 		if err != nil {
 			return "", err
 		}
-		if head == nil {
+		if headID == "" {
 			return "", util.ErrNoCommits
 		}
-		return head.ID, nil
+		return headID, nil
 	}
 
 	// Normalize to uppercase for ULID matching

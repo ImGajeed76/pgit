@@ -123,14 +123,14 @@ func runRm(cmd *cobra.Command, args []string) error {
 
 func removeFile(ctx context.Context, r *repo.Repository, relPath, absPath string, cached, force bool) error {
 	// Check if file is tracked
-	head, err := r.DB.GetHeadCommit(ctx)
+	headID, err := r.DB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
 
 	var isTracked bool
-	if head != nil {
-		blob, _ := r.DB.GetFileAtCommit(ctx, relPath, head.ID)
+	if headID != "" {
+		blob, _ := r.DB.GetFileAtCommit(ctx, relPath, headID)
 		isTracked = blob != nil
 	}
 
@@ -145,7 +145,7 @@ func removeFile(ctx context.Context, r *repo.Repository, relPath, absPath string
 	// If not forcing, check for local modifications
 	if !force && isTracked && fileExists {
 		// Compare with HEAD version
-		blob, _ := r.DB.GetFileAtCommit(ctx, relPath, head.ID)
+		blob, _ := r.DB.GetFileAtCommit(ctx, relPath, headID)
 		if blob != nil {
 			currentContent, err := os.ReadFile(absPath)
 			if err == nil && string(currentContent) != string(blob.Content) {

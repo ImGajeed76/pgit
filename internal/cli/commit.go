@@ -67,10 +67,10 @@ func runCommit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get parent commit BEFORE we create new commit (for diff stats)
-	parentHead, _ := r.DB.GetHeadCommit(ctx)
+	parentHeadID, _ := r.DB.GetHead(ctx)
 	var parentCommitID string
-	if parentHead != nil {
-		parentCommitID = parentHead.ID
+	if parentHeadID != "" {
+		parentCommitID = parentHeadID
 	}
 
 	// Check if -m was provided but empty
@@ -149,9 +149,9 @@ func runCommit(cmd *cobra.Command, args []string) error {
 
 		case repo.StatusDeleted:
 			// Deleted - count all lines as deletions
-			head, _ := r.DB.GetHeadCommit(ctx)
-			if head != nil {
-				if blob, err := r.DB.GetFileAtCommit(ctx, c.Path, head.ID); err == nil && blob != nil {
+			headID, _ := r.DB.GetHead(ctx)
+			if headID != "" {
+				if blob, err := r.DB.GetFileAtCommit(ctx, c.Path, headID); err == nil && blob != nil {
 					lines := strings.Count(string(blob.Content), "\n")
 					if len(blob.Content) > 0 && blob.Content[len(blob.Content)-1] != '\n' {
 						lines++

@@ -96,11 +96,11 @@ func runClone(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get remote HEAD
-	remoteHead, err := remoteDB.GetHeadCommit(ctx)
+	remoteHeadID, err := remoteDB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
-	if remoteHead == nil {
+	if remoteHeadID == "" {
 		fmt.Println("Warning: Remote repository is empty (no commits)")
 	}
 
@@ -171,8 +171,8 @@ func runClone(cmd *cobra.Command, args []string) error {
 
 	if schemaExists {
 		// Check if there are commits
-		localHead, _ := r.DB.GetHeadCommit(ctx)
-		if localHead != nil {
+		localHeadID, _ := r.DB.GetHead(ctx)
+		if localHeadID != "" {
 			if !cloneForce {
 				fmt.Printf("%s Local database '%s' already contains data.\n",
 					styles.Yellow("Warning:"), cfg.Core.LocalDB)
@@ -203,8 +203,8 @@ func runClone(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get all commits from remote
-	if remoteHead != nil {
-		commits, err := remoteDB.GetCommitLogFrom(ctx, remoteHead.ID, 100000)
+	if remoteHeadID != "" {
+		commits, err := remoteDB.GetCommitLogFrom(ctx, remoteHeadID, 100000)
 		if err != nil {
 			os.RemoveAll(absDir)
 			return err
@@ -244,20 +244,20 @@ func runClone(cmd *cobra.Command, args []string) error {
 		progress.Done()
 
 		// Set HEAD
-		if err := r.DB.SetHead(ctx, remoteHead.ID); err != nil {
+		if err := r.DB.SetHead(ctx, remoteHeadID); err != nil {
 			os.RemoveAll(absDir)
 			return err
 		}
 
 		// Set sync state
-		if err := r.DB.SetSyncState(ctx, "origin", &remoteHead.ID); err != nil {
+		if err := r.DB.SetSyncState(ctx, "origin", &remoteHeadID); err != nil {
 			os.RemoveAll(absDir)
 			return err
 		}
 
 		// Checkout working directory
 		fmt.Println("Checking out files...")
-		tree, err := r.DB.GetTreeAtCommit(ctx, remoteHead.ID)
+		tree, err := r.DB.GetTreeAtCommit(ctx, remoteHeadID)
 		if err != nil {
 			os.RemoveAll(absDir)
 			return err

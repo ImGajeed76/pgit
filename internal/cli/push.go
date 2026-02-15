@@ -82,38 +82,38 @@ func runPush(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get local HEAD
-	localHead, err := r.DB.GetHeadCommit(ctx)
+	localHeadID, err := r.DB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
-	if localHead == nil {
+	if localHeadID == "" {
 		fmt.Println("Nothing to push (no commits)")
 		return nil
 	}
 
 	// Get remote HEAD
-	remoteHead, err := remoteDB.GetHeadCommit(ctx)
+	remoteHeadID, err := remoteDB.GetHead(ctx)
 	if err != nil {
 		return err
 	}
 
 	// Check if we need to push
-	if remoteHead != nil && remoteHead.ID == localHead.ID {
+	if remoteHeadID != "" && remoteHeadID == localHeadID {
 		fmt.Println("Everything up-to-date")
 		return nil
 	}
 
 	// Check for divergence
-	if remoteHead != nil && !force {
+	if remoteHeadID != "" && !force {
 		// Check if remote HEAD is an ancestor of local HEAD
-		localCommits, err := r.DB.GetCommitLogFrom(ctx, localHead.ID, 1000)
+		localCommits, err := r.DB.GetCommitLogFrom(ctx, localHeadID, 1000)
 		if err != nil {
 			return err
 		}
 
 		isAncestor := false
 		for _, c := range localCommits {
-			if c.ID == remoteHead.ID {
+			if c.ID == remoteHeadID {
 				isAncestor = true
 				break
 			}
@@ -137,14 +137,14 @@ func runPush(cmd *cobra.Command, args []string) error {
 	fmt.Println("Calculating commits to push...")
 
 	var commitsToPush []*db.Commit
-	localCommits, err := r.DB.GetCommitLogFrom(ctx, localHead.ID, 1000)
+	localCommits, err := r.DB.GetCommitLogFrom(ctx, localHeadID, 1000)
 	if err != nil {
 		return err
 	}
 
 	// Find commits that remote doesn't have
 	for _, c := range localCommits {
-		if remoteHead != nil && c.ID == remoteHead.ID {
+		if remoteHeadID != "" && c.ID == remoteHeadID {
 			break
 		}
 		commitsToPush = append(commitsToPush, c)
@@ -186,19 +186,19 @@ func runPush(cmd *cobra.Command, args []string) error {
 	progress.Done()
 
 	// Update remote HEAD
-	if err := remoteDB.SetHead(ctx, localHead.ID); err != nil {
+	if err := remoteDB.SetHead(ctx, localHeadID); err != nil {
 		return err
 	}
 
 	// Update sync state
-	if err := r.DB.SetSyncState(ctx, remoteName, &localHead.ID); err != nil {
+	if err := r.DB.SetSyncState(ctx, remoteName, &localHeadID); err != nil {
 		return err
 	}
 
 	fmt.Println()
 	fmt.Printf("%s %s -> %s\n", styles.Successf("Pushed"),
 		styles.Yellow(util.ShortID(commitsToPush[0].ID)),
-		styles.Yellow(util.ShortID(localHead.ID)))
+		styles.Yellow(util.ShortID(localHeadID)))
 
 	return nil
 }
