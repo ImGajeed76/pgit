@@ -1150,7 +1150,7 @@ func writeMarkdownReport(path string, results []benchResult) error {
 	p("## Methodology")
 	p("")
 	p("### Raw Uncompressed Size")
-	p("- `git cat-file --batch-all-objects --batch='%%(objecttype) %%(objectsize)'` -- sum of all object sizes")
+	p("- `git cat-file --batch-all-objects --batch-check='%%(objecttype) %%(objectsize)'` -- sum of all object sizes")
 	p("- Same number used as the numerator for all compression ratios")
 	p("")
 	p("### Git Storage")
@@ -1191,14 +1191,14 @@ func buildQuickChart(results []benchResult, title string,
 
 	// Build Chart.js config (shorthand syntax supported by QuickChart)
 	config := fmt.Sprintf(
-		"{type:'bar',data:{labels:[%s],datasets:[{label:'git aggressive',data:[%s],backgroundColor:'%%233B82F6'},{label:'pgit actual data',data:[%s],backgroundColor:'%%237C3AED'}]},options:{title:{display:true,text:'%s'},plugins:{datalabels:{display:true,anchor:'end',align:'top'}}}}",
+		"{type:'bar',data:{labels:[%s],datasets:[{label:'git aggressive',data:[%s],backgroundColor:'#3B82F6'},{label:'pgit actual data',data:[%s],backgroundColor:'#7C3AED'}]},options:{title:{display:true,text:'%s'},plugins:{datalabels:{display:true,anchor:'end',align:'top',font:{size:8}}}}}",
 		strings.Join(labels, ","),
 		strings.Join(gitData, ","),
 		strings.Join(pgitData, ","),
 		title,
 	)
 
-	return fmt.Sprintf("https://quickchart.io/chart?w=600&h=300&c=%s", url.PathEscape(config))
+	return fmt.Sprintf("https://quickchart.io/chart?w=900&h=400&c=%s", url.PathEscape(config))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1302,7 +1302,7 @@ func collectGitStats(dir string) gitStats {
 func collectGitRawSize(dir string) gitRawSize {
 	raw := gitRawSize{}
 
-	out, err := runCaptureInDir(dir, "git", "cat-file", "--batch-all-objects", "--batch=%(objecttype) %(objectsize)")
+	out, err := runCaptureInDir(dir, "git", "cat-file", "--batch-all-objects", "--batch-check=%(objecttype) %(objectsize)")
 	if err != nil {
 		return raw
 	}
