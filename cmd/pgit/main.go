@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/imgajeed76/pgit/v2/internal/cli"
+	"github.com/imgajeed76/pgit/v3/internal/cli"
 )
 
 func main() {

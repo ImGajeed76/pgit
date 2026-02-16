@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v2/internal/repo"
-	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v2/internal/util"
+	"github.com/imgajeed76/pgit/v3/internal/repo"
+	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
 )
 

@@ -19,9 +19,9 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X github.com/imgajeed76/pgit/v2/internal/cli.Version={{.Version}}
-      - -X github.com/imgajeed76/pgit/v2/internal/cli.CommitSHA={{.ShortCommit}}
-      - -X github.com/imgajeed76/pgit/v2/internal/cli.BuildDate={{.Date}}
+      - -X github.com/imgajeed76/pgit/v3/internal/cli.Version={{.Version}}
+      - -X github.com/imgajeed76/pgit/v3/internal/cli.CommitSHA={{.ShortCommit}}
+      - -X github.com/imgajeed76/pgit/v3/internal/cli.BuildDate={{.Date}}
 
 archives:
   - id: default

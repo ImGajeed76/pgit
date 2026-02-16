@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/imgajeed76/pgit/v2/internal/config"
-	"github.com/imgajeed76/pgit/v2/internal/repo"
-	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v3/internal/config"
+	"github.com/imgajeed76/pgit/v3/internal/repo"
+	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/spf13/cobra"
 )
 

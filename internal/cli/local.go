@@ -3,9 +3,9 @@ package cli
 import (
 	"fmt"
 
-	"github.com/imgajeed76/pgit/v2/internal/container"
-	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v2/internal/util"
+	"github.com/imgajeed76/pgit/v3/internal/container"
+	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
 )
 

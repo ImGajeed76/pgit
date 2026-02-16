@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"golang.org/x/term"
 )
 

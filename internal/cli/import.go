@@ -17,12 +17,12 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/imgajeed76/pgit/v2/internal/config"
-	"github.com/imgajeed76/pgit/v2/internal/db"
-	"github.com/imgajeed76/pgit/v2/internal/repo"
-	"github.com/imgajeed76/pgit/v2/internal/ui"
-	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v2/internal/util"
+	"github.com/imgajeed76/pgit/v3/internal/config"
+	"github.com/imgajeed76/pgit/v3/internal/db"
+	"github.com/imgajeed76/pgit/v3/internal/repo"
+	"github.com/imgajeed76/pgit/v3/internal/ui"
+	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v2/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/spf13/cobra"
 )
 
@@ -62,7 +62,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		fmt.Println(styles.Mute("(Version info unavailable - installed via 'go install')"))
 		fmt.Println()
 		fmt.Printf("%s To check if you have the latest code, re-run:\n", styles.Green("Tip:"))
-		fmt.Printf("  %s\n", styles.Cyan("go install github.com/imgajeed76/pgit/v2/cmd/pgit@latest"))
+		fmt.Printf("  %s\n", styles.Cyan("go install github.com/imgajeed76/pgit/v3/cmd/pgit@latest"))
 		return nil
 	}
 
@@ -133,7 +133,7 @@ func printUpdateInstructions(release *githubRelease) {
 	// Go install (recommended)
 	fmt.Println(styles.Boldf("Using Go (recommended):"))
 	fmt.Println()
-	fmt.Printf("  %s\n", styles.Cyan("go install github.com/imgajeed76/pgit/v2/cmd/pgit@latest"))
+	fmt.Printf("  %s\n", styles.Cyan("go install github.com/imgajeed76/pgit/v3/cmd/pgit@latest"))
 	fmt.Println()
 
 	// Binary download
