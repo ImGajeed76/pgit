@@ -135,20 +135,22 @@ func (r *Repository) Diff(ctx context.Context, opts DiffOptions) ([]DiffResult, 
 	return results, nil
 }
 
-// isBinary checks if content appears to be binary (contains null bytes or non-text chars)
+// isBinary checks if content appears to be binary for display purposes.
+// Uses git's heuristic (first 8000 bytes) since this is only for diff rendering.
+// Note: storage-level binary detection (util.DetectBinary) scans full content
+// because PostgreSQL TEXT rejects \x00 anywhere.
 func isBinary(data []byte) bool {
 	if len(data) == 0 {
 		return false
 	}
 
-	// Check first 8000 bytes (like Git does)
+	// Check first 8000 bytes (like Git does for display)
 	checkLen := len(data)
 	if checkLen > 8000 {
 		checkLen = 8000
 	}
 
 	for i := 0; i < checkLen; i++ {
-		// Null byte is a strong indicator of binary
 		if data[i] == 0 {
 			return true
 		}

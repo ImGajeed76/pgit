@@ -1,6 +1,7 @@
 package util
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -121,18 +122,11 @@ func ContentHashFromHex(s string) ([]byte, error) {
 }
 
 // DetectBinary returns true if content appears to be binary.
-// Uses git's heuristic: a NUL byte in the first 8000 bytes means binary.
+// Scans the entire content for NUL bytes (\x00). While git only checks
+// the first 8000 bytes, PostgreSQL's TEXT type rejects \x00 anywhere,
+// so we must scan everything to avoid insertion failures.
 func DetectBinary(content []byte) bool {
-	checkLen := len(content)
-	if checkLen > 8000 {
-		checkLen = 8000
-	}
-	for i := 0; i < checkLen; i++ {
-		if content[i] == 0 {
-			return true
-		}
-	}
-	return false
+	return bytes.IndexByte(content, 0) != -1
 }
 
 // TreeEntry represents a file in the tree for hashing.
