@@ -27,27 +27,24 @@ GROUP BY pa.path, pb.path
 ORDER BY times_together DESC;
 ```
 
-## Compression: pgit vs git vs fossil
+## Compression: pgit vs git
 
-Benchmarked on real repositories (single branch, full history). Comparing packfile vs table data only (excluding indexes for both):
+Benchmarked on [19 real repositories](BENCHMARK.md) across 6 languages (193k total commits). Comparing `git gc --aggressive` packfile vs pgit actual data (excluding indexes for both):
 
-### git/git (79,588 commits, 3.8 GB raw content)
+**Scorecard: pgit 9 wins, git 9 wins, 1 tie.**
 
-| | git --aggressive | pgit | fossil |
-|--|------------------|------|--------|
-| **Storage** | 91 MB | **53.5 MB** | 326 MB |
-| **Import time** | - | 16 min | 32 min |
+| Repository | Commits | Raw Size | git --aggressive | pgit | Winner |
+|:-----------|--------:|---------:|-----------------:|-----:|:-------|
+| serde | 4,352 | 203.5 MB | 5.6 MB | 3.9 MB | pgit (30%) |
+| fzf | 3,482 | 209.2 MB | 3.4 MB | 2.7 MB | pgit (21%) |
+| curl | 37,818 | 3.3 GB | 48.4 MB | 45.0 MB | pgit (7%) |
+| cargo | 21,833 | 1.2 GB | 29.8 MB | 30.3 MB | git (2%) |
+| prettier | 11,084 | 2.0 GB | 66.2 MB | 96.4 MB | git (46%) |
+| hugo | 9,520 | 569.3 MB | 108.8 MB | 222.9 MB | git (105%) |
 
-**pgit is 41% smaller than git with `git gc --aggressive`, and 84% smaller than fossil.**
+See the [full benchmark results](BENCHMARK.md) for all 19 repositories with detailed per-repo breakdowns, charts, and methodology.
 
-### tokio (4,377 commits, 179 MB raw content)
-
-| | git --aggressive | pgit | fossil |
-|--|------------------|------|--------|
-| **Storage** | 8.3 MB | **7.4 MB** | 8.1 MB |
-| **Import time** | - | 17 sec | 13 sec |
-
-pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression with zstd. Compression improves with repository size - larger repos see better results.
+pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression with zstd. Results vary by repository — pgit tends to win on source-code-heavy repos with incremental changes, while git wins on repos with large vendored dependencies or binary assets.
 
 ### Run the benchmarks yourself
 
@@ -57,8 +54,8 @@ pgit includes `pgit-bench`, a CLI tool that benchmarks compression against git o
 # Build the benchmark tool
 go build -o pgit-bench ./cmd/pgit-bench/
 
-# Run against the curated repo list (19 repos, ~30 min at 3 parallel)
-./pgit-bench --file bench_repos.txt --parallel 3 --report BENCHMARK.md --json benchmark.json
+# Run against the curated repo list (19 repos, ~50 min at 3 parallel)
+./pgit-bench --file bench_repos.txt --parallel 3 --report BENCHMARK.md
 ```
 
 The repo list in [`bench_repos.txt`](bench_repos.txt) covers 19 projects across 6 languages (Rust, Go, Python, JavaScript, TypeScript, C) — from small utilities like jq (1.9k commits) to large projects like curl (38k commits).
@@ -76,7 +73,7 @@ Requirements: `git` and `pgit` on PATH, local container running (`pgit local sta
 - **Git-familiar commands**: init, add, commit, log, diff, checkout, push, pull, clone
 - **PostgreSQL as remote**: Connection URL is your "remote" - no separate auth system
 - **SQL queryable**: Run arbitrary queries on your entire repo history
-- **Delta compression**: pg-xpatch achieves better compression than git's packfiles (up to 41% smaller)
+- **Delta compression**: pg-xpatch achieves competitive compression with git's packfiles ([benchmark results](BENCHMARK.md))
 - **Search across history**: `pgit search "pattern"` searches all versions of all files
 - **Local development**: Uses Docker/Podman container for local database
 - **Import from Git**: Migrate existing repositories with full history
@@ -172,7 +169,7 @@ SELECT
   pg_size_pretty(AVG(LENGTH(ct.content))::bigint) as avg_size
 FROM pgit_file_refs r
 JOIN pgit_commits c ON r.commit_id = c.id
-JOIN pgit_content ct ON ct.group_id = r.group_id AND ct.version_id = r.version_id
+JOIN pgit_text_content ct ON ct.group_id = r.group_id AND ct.version_id = r.version_id
 GROUP BY EXTRACT(YEAR FROM c.created_at)
 ORDER BY year;
 ```

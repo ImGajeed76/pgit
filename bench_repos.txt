@@ -1,8 +1,8 @@
 # pgit-bench repository list
 # Curated for language diversity, size variety, and recognizable projects
 #
-# 19 repos across 6 languages, ~150k total commits
-# Estimated runtime: ~30 min at --parallel 3
+# 19 repos across 6 languages, ~194k total commits
+# Estimated runtime: ~50 min at --parallel 3
 
 # ── Rust ──────────────────────────────────────────────────────────────────
 https://github.com/serde-rs/serde
