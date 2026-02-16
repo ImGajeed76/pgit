@@ -916,7 +916,6 @@ func (db *DB) getSearchFileRefs(ctx context.Context, pathPattern, commitID strin
 	if commitID != "" {
 		whereClauses = append(whereClauses, fmt.Sprintf("r.commit_id <= $%d", argNum))
 		args = append(args, commitID)
-		argNum++
 	}
 
 	whereClause := strings.Join(whereClauses, " AND ")

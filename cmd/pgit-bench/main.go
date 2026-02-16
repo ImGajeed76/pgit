@@ -497,7 +497,7 @@ func benchmarkRepo(repoURL, branch string, interactive bool, onStatus statusCall
 	}
 	log.phase("2", "Measuring git storage (normal clone)")
 
-	runQuietInDirErr(gitDir, "git", "gc", "--quiet")
+	_ = runQuietInDirErr(gitDir, "git", "gc", "--quiet")
 	gitNormal := collectGitStats(gitDir)
 	if interactive {
 		printGitStats("Normal clone", gitNormal)
@@ -513,7 +513,7 @@ func benchmarkRepo(repoURL, branch string, interactive bool, onStatus statusCall
 	log.phase("3", "Measuring git storage (aggressive gc)")
 
 	aggressiveStart := time.Now()
-	runQuietInDirErr(gitDir, "git", "gc", "--aggressive", "--quiet")
+	_ = runQuietInDirErr(gitDir, "git", "gc", "--aggressive", "--quiet")
 	aggressiveDuration := time.Since(aggressiveStart)
 	if interactive {
 		infoMsg("Aggressive gc completed in %s", formatDuration(aggressiveDuration))
@@ -950,9 +950,9 @@ func writeJSONOutput(results []benchResult, path string) {
 	enc.SetIndent("", "  ")
 
 	if len(results) == 1 {
-		enc.Encode(results[0])
+		_ = enc.Encode(results[0])
 	} else {
-		enc.Encode(results)
+		_ = enc.Encode(results)
 	}
 }
 

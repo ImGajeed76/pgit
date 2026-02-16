@@ -386,8 +386,8 @@ func exportToFile(gitPath, branch string) (string, int64, error) {
 
 	tmpFile, err := os.CreateTemp("", "pgit-import-*.fastexport")
 	if err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return "", 0, err
 	}
 	tmpPath := tmpFile.Name()
@@ -458,7 +458,7 @@ func indexFastExport(tmpPath string) ([]commitEntry, map[int]*blobEntry, error) 
 		if err == nil {
 			offset++
 			if b != '\n' {
-				reader.UnreadByte()
+				_ = reader.UnreadByte()
 				offset--
 			}
 		}
@@ -579,8 +579,7 @@ func indexFastExport(tmpPath string) ([]commitEntry, map[int]*blobEntry, error) 
 						// This shouldn't happen without -M, but if it does we can't resolve it here
 						_ = newPath
 					}
-				} else if cline == "deleteall" {
-					// deleteall: marks all files as deleted — rare, skip for now
+				} else if cline == "deleteall" { //nolint:staticcheck // deleteall: rare in practice, skip for now
 				}
 			}
 
