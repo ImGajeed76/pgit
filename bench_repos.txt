@@ -1,0 +1,34 @@
+# pgit-bench repository list
+# Curated for language diversity, size variety, and recognizable projects
+#
+# 19 repos across 6 languages, ~150k total commits
+# Estimated runtime: ~30 min at --parallel 3
+
+# ── Rust ──────────────────────────────────────────────────────────────────
+https://github.com/serde-rs/serde
+https://github.com/BurntSushi/ripgrep
+https://github.com/tokio-rs/tokio
+https://github.com/astral-sh/ruff
+https://github.com/rust-lang/cargo
+
+# ── Go ────────────────────────────────────────────────────────────────────
+https://github.com/junegunn/fzf
+https://github.com/gin-gonic/gin
+https://github.com/gohugoio/hugo
+https://github.com/cli/cli
+
+# ── Python ────────────────────────────────────────────────────────────────
+https://github.com/pallets/flask
+https://github.com/psf/requests
+
+# ── JavaScript / TypeScript ───────────────────────────────────────────────
+https://github.com/expressjs/express
+https://github.com/vuejs/core
+https://github.com/sveltejs/svelte
+https://github.com/prettier/prettier
+https://github.com/facebook/react
+
+# ── C ─────────────────────────────────────────────────────────────────────
+https://github.com/jqlang/jq
+https://github.com/redis/redis
+https://github.com/curl/curl

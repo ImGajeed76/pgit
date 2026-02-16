@@ -49,6 +49,28 @@ Benchmarked on real repositories (single branch, full history). Comparing packfi
 
 pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression with zstd. Compression improves with repository size - larger repos see better results.
 
+### Run the benchmarks yourself
+
+pgit includes `pgit-bench`, a CLI tool that benchmarks compression against git on real repositories. Results are generated as a markdown report with charts.
+
+```bash
+# Build the benchmark tool
+go build -o pgit-bench ./cmd/pgit-bench/
+
+# Run against the curated repo list (19 repos, ~30 min at 3 parallel)
+./pgit-bench --file bench_repos.txt --parallel 3 --report BENCHMARK.md --json benchmark.json
+```
+
+The repo list in [`bench_repos.txt`](bench_repos.txt) covers 19 projects across 6 languages (Rust, Go, Python, JavaScript, TypeScript, C) — from small utilities like jq (1.9k commits) to large projects like curl (38k commits).
+
+You can also benchmark individual repos:
+
+```bash
+./pgit-bench https://github.com/tokio-rs/tokio
+```
+
+Requirements: `git` and `pgit` on PATH, local container running (`pgit local start`).
+
 ## Features
 
 - **Git-familiar commands**: init, add, commit, log, diff, checkout, push, pull, clone
