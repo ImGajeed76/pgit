@@ -33,10 +33,11 @@ minimize how much of the delta chain gets decompressed.
 
 | Table | Description |
 |-------|-------------|
-| `pgit_refs` | Ref name -> commit_id (e.g., HEAD) |
-| `pgit_file_refs` | File version metadata: group_id, version_id, commit_id, content_hash, is_binary |
+| `pgit_file_refs` | File version metadata. PK: `(group_id, commit_id)`. Also: version_id, content_hash, mode, is_symlink, symlink_target, is_binary |
 | `pgit_paths` | group_id -> file path |
+| `pgit_refs` | Ref name -> commit_id (e.g., HEAD) |
 | `pgit_metadata` | Repository key-value store |
+| `pgit_sync_state` | Remote sync tracking (remote_name, last_commit_id, synced_at) |
 
 Normal tables have no decompression cost. **Always prefer querying these first**
 and only touch xpatch tables when you need actual content or commit messages.
@@ -82,8 +83,12 @@ SELECT * FROM pgit_commits WHERE id = $1
 only that single row. Cost depends on distance from the nearest keyframe.
 
 ```sql
+-- Content tables: PK is (group_id, version_id)
 SELECT content FROM pgit_text_content
 WHERE group_id = $1 AND version_id = $2
+
+-- Commits table: PK is just id
+SELECT * FROM pgit_commits WHERE id = $1
 ```
 
 ### 4. Front-to-back sequential access is fastest

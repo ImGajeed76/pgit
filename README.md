@@ -178,11 +178,14 @@ GROUP BY p.path
 ORDER BY versions DESC
 LIMIT 10;
 
--- Commits by author
-SELECT author_name, author_email, COUNT(*) as commits
-FROM pgit_commits
-GROUP BY author_name, author_email
-ORDER BY commits DESC;
+-- Files by extension
+SELECT
+  COALESCE(NULLIF(SUBSTRING(path FROM '\.([^.]+)$'), ''), '(no ext)') as extension,
+  COUNT(*) as file_count
+FROM pgit_paths
+GROUP BY extension
+ORDER BY file_count DESC
+LIMIT 15;
 ```
 
 See `pgit sql examples` for more, or check [docs/xpatch-query-patterns.md](docs/xpatch-query-patterns.md) for query optimization tips.
@@ -220,23 +223,32 @@ pgit import /path/to/git/repo --branch main
 |---------|-------------|
 | `pgit init` | Initialize new repository |
 | `pgit add <files>` | Stage files for commit |
+| `pgit rm <files>` | Remove files and stage the deletion |
+| `pgit mv <src> <dst>` | Move/rename a file and stage the change |
 | `pgit status` | Show working tree status |
-| `pgit commit -m "msg"` | Create a commit |
+| `pgit commit -m "msg"` | Record changes to the repository |
+| `pgit reset [commit]` | Reset HEAD, index, and working tree |
 | `pgit log` | Show commit history (interactive) |
-| `pgit diff` | Show changes |
+| `pgit diff` | Show changes between commits, working tree, etc. |
 | `pgit show <commit>` | Show commit details |
-| `pgit checkout <commit>` | Restore files |
+| `pgit checkout <commit>` | Restore working tree files |
 | `pgit blame <file>` | Show line-by-line attribution |
-| `pgit search <pattern>` | Search across history |
+| `pgit search <pattern>` | Search file contents across history |
 | `pgit analyze <analysis>` | Run pre-built analyses (churn, coupling, etc.) |
 | `pgit sql <query>` | Run SQL queries on repository |
+| `pgit stats` | Show repository statistics |
 | `pgit remote add <name> <url>` | Add remote database |
 | `pgit push <remote>` | Push to remote |
 | `pgit pull <remote>` | Pull from remote |
 | `pgit clone <url> [dir]` | Clone repository |
 | `pgit import <git-repo>` | Import from Git |
-| `pgit stats` | Show repository statistics |
-| `pgit local start/stop` | Manage local container |
+| `pgit resolve <file>` | Mark merge conflicts as resolved |
+| `pgit config <key> [value]` | Get and set repository options |
+| `pgit clean` | Remove untracked files from working tree |
+| `pgit doctor` | Check system health and diagnose issues |
+| `pgit local <cmd>` | Manage local container (start, stop, status, logs, destroy, update) |
+| `pgit repos` | Manage pgit repositories in the local container |
+| `pgit update` | Check for pgit updates |
 
 ## Shell Completions
 

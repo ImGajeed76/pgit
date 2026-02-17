@@ -520,10 +520,13 @@ func getRepoInfoForDB(dbName string, port int, searchFS bool, searchPath string,
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var commitsSize, blobsSize int64
+		var commitsSize, textSize, binarySize, refsSize, pathsSize int64
 		_ = repoDb.QueryRow(ctx, "SELECT pg_relation_size('pgit_commits')").Scan(&commitsSize)
-		_ = repoDb.QueryRow(ctx, "SELECT pg_relation_size('pgit_blobs')").Scan(&blobsSize)
-		info.SizeBytes = commitsSize + blobsSize
+		_ = repoDb.QueryRow(ctx, "SELECT pg_relation_size('pgit_text_content')").Scan(&textSize)
+		_ = repoDb.QueryRow(ctx, "SELECT pg_relation_size('pgit_binary_content')").Scan(&binarySize)
+		_ = repoDb.QueryRow(ctx, "SELECT pg_relation_size('pgit_file_refs')").Scan(&refsSize)
+		_ = repoDb.QueryRow(ctx, "SELECT pg_relation_size('pgit_paths')").Scan(&pathsSize)
+		info.SizeBytes = commitsSize + textSize + binarySize + refsSize + pathsSize
 		info.Size = formatBytes(info.SizeBytes)
 	}()
 
