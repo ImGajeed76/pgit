@@ -1,7 +1,8 @@
 # pg-xpatch Query Patterns
 
-> This is the first doc in an evolving collection. More documentation will be
-> added as the project matures.
+> **Tip:** If you just want to run common analyses (churn, coupling, authors,
+> etc.), use `pgit analyze` — it wraps optimized queries so you don't need
+> to think about any of this. This doc is for writing your own custom SQL.
 
 Guide for writing performant SQL queries against pg-xpatch tables in pgit.
 

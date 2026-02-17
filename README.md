@@ -139,9 +139,24 @@ pgit remote add origin postgres://user:pass@host/database
 pgit push origin
 ```
 
+## Analyze Your Repository
+
+pgit includes pre-built analyses that are optimized for the underlying storage engine. No SQL knowledge needed:
+
+```bash
+pgit analyze churn                  # most frequently modified files
+pgit analyze coupling               # files always changed together
+pgit analyze hotspots --depth 2     # churn aggregated by directory
+pgit analyze authors                # commits per contributor
+pgit analyze activity --period month # commit velocity over time
+pgit analyze bus-factor             # files with fewest authors (knowledge silos)
+```
+
+All commands support `--json`, `--raw` (for piping), `--limit`, and `--path` (glob filter). Results are displayed in an interactive table with search, column expand/hide, and clipboard copy (`y`/`Y`).
+
 ## Query Your Repository
 
-pgit stores everything in PostgreSQL, so you can query it directly:
+For custom queries, pgit stores everything in PostgreSQL so you can query it directly:
 
 ```bash
 # Built-in search across all history
@@ -149,7 +164,7 @@ pgit search "TODO" --path "*.rs"
 pgit search --all "panic!" --ignore-case
 
 # Raw SQL access
-pgit sql "SELECT * FROM pgit_commits ORDER BY created_at DESC LIMIT 10"
+pgit sql "SELECT * FROM pgit_commits ORDER BY authored_at DESC LIMIT 10"
 ```
 
 ### Example Queries
@@ -163,16 +178,14 @@ GROUP BY p.path
 ORDER BY versions DESC
 LIMIT 10;
 
--- File size growth over time
-SELECT 
-  EXTRACT(YEAR FROM c.created_at)::int as year,
-  pg_size_pretty(AVG(LENGTH(ct.content))::bigint) as avg_size
-FROM pgit_file_refs r
-JOIN pgit_commits c ON r.commit_id = c.id
-JOIN pgit_text_content ct ON ct.group_id = r.group_id AND ct.version_id = r.version_id
-GROUP BY EXTRACT(YEAR FROM c.created_at)
-ORDER BY year;
+-- Commits by author
+SELECT author_name, author_email, COUNT(*) as commits
+FROM pgit_commits
+GROUP BY author_name, author_email
+ORDER BY commits DESC;
 ```
+
+See `pgit sql examples` for more, or check [docs/xpatch-query-patterns.md](docs/xpatch-query-patterns.md) for query optimization tips.
 
 ## Testing Remote Functionality
 
@@ -215,6 +228,7 @@ pgit import /path/to/git/repo --branch main
 | `pgit checkout <commit>` | Restore files |
 | `pgit blame <file>` | Show line-by-line attribution |
 | `pgit search <pattern>` | Search across history |
+| `pgit analyze <analysis>` | Run pre-built analyses (churn, coupling, etc.) |
 | `pgit sql <query>` | Run SQL queries on repository |
 | `pgit remote add <name> <url>` | Add remote database |
 | `pgit push <remote>` | Push to remote |
