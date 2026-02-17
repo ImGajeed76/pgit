@@ -90,6 +90,7 @@ func init() {
 		newImportCmd(),
 		newSQLCmd(),
 		newStatsCmd(),
+		newAnalyzeCmd(),
 		newSearchCmd(),
 		newGrepCmd(),
 		newCleanCmd(),
