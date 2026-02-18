@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -12,7 +13,9 @@ import (
 	"github.com/imgajeed76/pgit/v3/internal/repo"
 	"github.com/imgajeed76/pgit/v3/internal/ui"
 	"github.com/imgajeed76/pgit/v3/internal/ui/table"
+	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -63,6 +66,9 @@ type analyzeFlags struct {
 	json     bool
 	raw      bool
 	noPager  bool
+	remote   string
+	sortBy   string
+	reverse  bool
 }
 
 // addAnalyzeFlags adds the shared flags to a cobra.Command.
@@ -72,6 +78,9 @@ func addAnalyzeFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("json", false, "Output as JSON")
 	cmd.Flags().Bool("raw", false, "Output as tab-separated values (for piping)")
 	cmd.Flags().Bool("no-pager", false, "Plain table output, no interactive viewer")
+	cmd.Flags().String("remote", "", "Run analysis against a remote database (e.g. 'origin')")
+	cmd.Flags().String("sort", "", "Sort by column name")
+	cmd.Flags().Bool("reverse", false, "Reverse the sort order")
 }
 
 // parseAnalyzeFlags reads the shared flags from a cobra.Command.
@@ -81,12 +90,18 @@ func parseAnalyzeFlags(cmd *cobra.Command) analyzeFlags {
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	raw, _ := cmd.Flags().GetBool("raw")
 	noPager, _ := cmd.Flags().GetBool("no-pager")
+	remote, _ := cmd.Flags().GetString("remote")
+	sortBy, _ := cmd.Flags().GetString("sort")
+	reverse, _ := cmd.Flags().GetBool("reverse")
 	return analyzeFlags{
 		limit:    limit,
 		pathGlob: pathGlob,
 		json:     jsonOutput,
 		raw:      raw,
 		noPager:  noPager,
+		remote:   remote,
+		sortBy:   sortBy,
+		reverse:  reverse,
 	}
 }
 
@@ -97,6 +112,66 @@ func (f analyzeFlags) displayOpts() table.DisplayOptions {
 		Raw:     f.raw,
 		NoPager: f.noPager,
 	}
+}
+
+// sortConfig defines the sort behavior for an analyze subcommand.
+type sortConfig struct {
+	validColumns  map[string]int // column name -> column index in tableRows
+	defaultColumn string
+	defaultDesc   bool // true = descending by default
+}
+
+// applySortFlags sorts tableRows in place based on the flags and config.
+func applySortFlags(flags analyzeFlags, cfg sortConfig, rows [][]string) error {
+	sortCol := cfg.defaultColumn
+	desc := cfg.defaultDesc
+
+	if flags.sortBy != "" {
+		if _, ok := cfg.validColumns[flags.sortBy]; !ok {
+			valid := make([]string, 0, len(cfg.validColumns))
+			for k := range cfg.validColumns {
+				valid = append(valid, k)
+			}
+			sort.Strings(valid)
+			return fmt.Errorf("invalid sort column %q, valid columns: %s",
+				flags.sortBy, strings.Join(valid, ", "))
+		}
+		sortCol = flags.sortBy
+	}
+
+	if flags.reverse {
+		desc = !desc
+	}
+
+	colIdx := cfg.validColumns[sortCol]
+
+	// Detect numeric columns by parsing the first non-empty value
+	isNumeric := false
+	for _, row := range rows {
+		if colIdx < len(row) && row[colIdx] != "" {
+			_, err := strconv.ParseFloat(row[colIdx], 64)
+			isNumeric = err == nil
+			break
+		}
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i][colIdx], rows[j][colIdx]
+		if isNumeric {
+			af, _ := strconv.ParseFloat(a, 64)
+			bf, _ := strconv.ParseFloat(b, 64)
+			if desc {
+				return af > bf
+			}
+			return af < bf
+		}
+		if desc {
+			return a > b
+		}
+		return a < b
+	})
+
+	return nil
 }
 
 // matchPath checks if a file path matches the glob pattern.
@@ -141,13 +216,41 @@ func matchPath(pattern, path string) bool {
 }
 
 // connectRepo opens and connects to the repository database.
-func connectRepo(ctx context.Context) (*repo.Repository, error) {
+// If remoteName is non-empty, connects to that remote instead of the local database.
+func connectRepo(ctx context.Context, remoteName string) (*repo.Repository, error) {
 	r, err := repo.Open()
 	if err != nil {
 		return nil, err
 	}
-	if err := r.Connect(ctx); err != nil {
-		return nil, err
+
+	if remoteName == "" {
+		// Local connection (existing behavior)
+		if err := r.Connect(ctx); err != nil {
+			return nil, err
+		}
+	} else {
+		// Remote connection
+		remote, exists := r.Config.GetRemote(remoteName)
+		if !exists {
+			return nil, util.RemoteNotFoundError(remoteName)
+		}
+		remoteDB, err := r.ConnectTo(ctx, remote.URL)
+		if err != nil {
+			return nil, util.DatabaseConnectionError(remote.URL, err)
+		}
+		// Check schema exists on remote
+		schemaExists, err := remoteDB.SchemaExists(ctx)
+		if err != nil {
+			remoteDB.Close()
+			return nil, err
+		}
+		if !schemaExists {
+			remoteDB.Close()
+			return nil, util.NewError("Remote database has no pgit schema").
+				WithMessage(fmt.Sprintf("The remote '%s' exists but has no pgit data", remoteName)).
+				WithSuggestion(fmt.Sprintf("pgit push %s  # Push your repository first", remoteName))
+		}
+		r.DB = remoteDB
 	}
 	return r, nil
 }
@@ -178,7 +281,7 @@ func runAnalyzeChurn(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	r, err := connectRepo(ctx)
+	r, err := connectRepo(ctx, flags.remote)
 	if err != nil {
 		return err
 	}
@@ -193,47 +296,47 @@ func runAnalyzeChurn(cmd *cobra.Command, args []string) error {
 		FROM pgit_file_refs r
 		JOIN pgit_paths p ON p.group_id = r.group_id
 		GROUP BY p.path
-		ORDER BY versions DESC
 	`)
 	if err != nil {
 		spinner.Stop()
 		return err
 	}
 
-	type churnEntry struct {
-		path     string
-		versions int64
-	}
-
-	var results []churnEntry
+	// Build table data (filter by path glob, sort and limit in Go)
+	columns := []string{"path", "versions"}
+	var tableRows [][]string
 	for rows.Next() {
-		var e churnEntry
-		if err := rows.Scan(&e.path, &e.versions); err != nil {
+		var path string
+		var versions int64
+		if err := rows.Scan(&path, &versions); err != nil {
 			rows.Close()
 			spinner.Stop()
 			return err
 		}
-		if matchPath(flags.pathGlob, e.path) {
-			results = append(results, e)
+		if matchPath(flags.pathGlob, path) {
+			tableRows = append(tableRows, []string{path, strconv.FormatInt(versions, 10)})
 		}
 	}
 	rows.Close()
 
 	spinner.Stop()
 
-	// Apply limit
-	if flags.limit > 0 && len(results) > flags.limit {
-		results = results[:flags.limit]
+	// Sort
+	cfg := sortConfig{
+		validColumns:  map[string]int{"path": 0, "versions": 1},
+		defaultColumn: "versions",
+		defaultDesc:   true,
+	}
+	if err := applySortFlags(flags, cfg, tableRows); err != nil {
+		return err
 	}
 
-	// Build table data
-	columns := []string{"path", "versions"}
-	tableRows := make([][]string, len(results))
-	for i, e := range results {
-		tableRows[i] = []string{e.path, strconv.FormatInt(e.versions, 10)}
+	// Apply limit after sorting
+	if flags.limit > 0 && len(tableRows) > flags.limit {
+		tableRows = tableRows[:flags.limit]
 	}
 
-	title := fmt.Sprintf("churn: top %d files", len(results))
+	title := fmt.Sprintf("churn: top %d files", len(tableRows))
 	return table.DisplayResults(title, columns, tableRows, flags.displayOpts())
 }
 
@@ -270,7 +373,7 @@ func runAnalyzeCoupling(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	r, err := connectRepo(ctx)
+	r, err := connectRepo(ctx, flags.remote)
 	if err != nil {
 		return err
 	}
@@ -366,16 +469,7 @@ func runAnalyzeCoupling(cmd *cobra.Command, args []string) error {
 		results = append(results, couplingEntry{pathA, pathB, count})
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].count > results[j].count
-	})
-
 	spinner.Stop()
-
-	// Apply limit
-	if flags.limit > 0 && len(results) > flags.limit {
-		results = results[:flags.limit]
-	}
 
 	// Build table data
 	columns := []string{"file_a", "file_b", "commits_together"}
@@ -384,7 +478,22 @@ func runAnalyzeCoupling(cmd *cobra.Command, args []string) error {
 		tableRows[i] = []string{e.pathA, e.pathB, strconv.Itoa(e.count)}
 	}
 
-	title := fmt.Sprintf("coupling: top %d pairs", len(results))
+	// Sort
+	cfg := sortConfig{
+		validColumns:  map[string]int{"file_a": 0, "file_b": 1, "commits_together": 2},
+		defaultColumn: "commits_together",
+		defaultDesc:   true,
+	}
+	if err := applySortFlags(flags, cfg, tableRows); err != nil {
+		return err
+	}
+
+	// Apply limit after sorting
+	if flags.limit > 0 && len(tableRows) > flags.limit {
+		tableRows = tableRows[:flags.limit]
+	}
+
+	title := fmt.Sprintf("coupling: top %d pairs", len(tableRows))
 	return table.DisplayResults(title, columns, tableRows, flags.displayOpts())
 }
 
@@ -420,7 +529,7 @@ func runAnalyzeHotspots(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	r, err := connectRepo(ctx)
+	r, err := connectRepo(ctx, flags.remote)
 	if err != nil {
 		return err
 	}
@@ -472,40 +581,35 @@ func runAnalyzeHotspots(cmd *cobra.Command, args []string) error {
 
 	spinner.Stop()
 
-	// Sort by total versions descending
-	type hotspotEntry struct {
-		dir      string
-		files    int
-		versions int64
-		avg      float64
-	}
-	var results []hotspotEntry
-	for dir, stats := range dirMap {
-		avg := float64(stats.versions) / float64(stats.files)
-		results = append(results, hotspotEntry{dir, stats.files, stats.versions, avg})
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].versions > results[j].versions
-	})
-
-	// Apply limit
-	if flags.limit > 0 && len(results) > flags.limit {
-		results = results[:flags.limit]
-	}
-
 	// Build table data
 	columns := []string{"directory", "files", "total_versions", "avg_versions"}
-	tableRows := make([][]string, len(results))
-	for i, e := range results {
-		tableRows[i] = []string{
-			e.dir,
-			strconv.Itoa(e.files),
-			strconv.FormatInt(e.versions, 10),
-			fmt.Sprintf("%.1f", e.avg),
-		}
+	var tableRows [][]string
+	for dir, stats := range dirMap {
+		avg := float64(stats.versions) / float64(stats.files)
+		tableRows = append(tableRows, []string{
+			dir,
+			strconv.Itoa(stats.files),
+			strconv.FormatInt(stats.versions, 10),
+			fmt.Sprintf("%.1f", avg),
+		})
 	}
 
-	title := fmt.Sprintf("hotspots: top %d directories (depth %d)", len(results), depth)
+	// Sort
+	cfg := sortConfig{
+		validColumns:  map[string]int{"directory": 0, "files": 1, "total_versions": 2, "avg_versions": 3},
+		defaultColumn: "total_versions",
+		defaultDesc:   true,
+	}
+	if err := applySortFlags(flags, cfg, tableRows); err != nil {
+		return err
+	}
+
+	// Apply limit after sorting
+	if flags.limit > 0 && len(tableRows) > flags.limit {
+		tableRows = tableRows[:flags.limit]
+	}
+
+	title := fmt.Sprintf("hotspots: top %d directories (depth %d)", len(tableRows), depth)
 	return table.DisplayResults(title, columns, tableRows, flags.displayOpts())
 }
 
@@ -553,7 +657,7 @@ func runAnalyzeAuthors(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	r, err := connectRepo(ctx)
+	r, err := connectRepo(ctx, flags.remote)
 	if err != nil {
 		return err
 	}
@@ -607,41 +711,35 @@ func runAnalyzeAuthors(cmd *cobra.Command, args []string) error {
 
 	spinner.Stop()
 
-	// Sort by commit count descending
-	type authorEntry struct {
-		name    string
-		email   string
-		commits int
-		first   time.Time
-		last    time.Time
-	}
-	var results []authorEntry
-	for k, s := range statsMap {
-		results = append(results, authorEntry{k.name, k.email, s.commits, s.first, s.last})
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].commits > results[j].commits
-	})
-
-	// Apply limit
-	if flags.limit > 0 && len(results) > flags.limit {
-		results = results[:flags.limit]
-	}
-
 	// Build table data
 	columns := []string{"author", "email", "commits", "first_commit", "last_commit"}
-	tableRows := make([][]string, len(results))
-	for i, e := range results {
-		tableRows[i] = []string{
-			e.name,
-			e.email,
-			strconv.Itoa(e.commits),
-			e.first.Format("2006-01-02"),
-			e.last.Format("2006-01-02"),
-		}
+	var tableRows [][]string
+	for k, s := range statsMap {
+		tableRows = append(tableRows, []string{
+			k.name,
+			k.email,
+			strconv.Itoa(s.commits),
+			s.first.Format("2006-01-02"),
+			s.last.Format("2006-01-02"),
+		})
 	}
 
-	title := fmt.Sprintf("authors: %d contributors", len(results))
+	// Sort
+	cfg := sortConfig{
+		validColumns:  map[string]int{"author": 0, "email": 1, "commits": 2, "first_commit": 3, "last_commit": 4},
+		defaultColumn: "commits",
+		defaultDesc:   true,
+	}
+	if err := applySortFlags(flags, cfg, tableRows); err != nil {
+		return err
+	}
+
+	// Apply limit after sorting
+	if flags.limit > 0 && len(tableRows) > flags.limit {
+		tableRows = tableRows[:flags.limit]
+	}
+
+	title := fmt.Sprintf("authors: %d contributors", len(tableRows))
 	return table.DisplayResults(title, columns, tableRows, flags.displayOpts())
 }
 
@@ -662,13 +760,16 @@ Periods with zero commits are included so the timeline is continuous.`,
 		RunE: runAnalyzeActivity,
 	}
 	addAnalyzeFlags(cmd)
+	cmd.Flags().MarkHidden("sort") // activity is chronological; only --reverse is supported
 	cmd.Flags().String("period", "month", "Time bucket: week, month, quarter, year")
+	cmd.Flags().Bool("chart", false, "Include ASCII bar chart column")
 	return cmd
 }
 
 func runAnalyzeActivity(cmd *cobra.Command, args []string) error {
 	flags := parseAnalyzeFlags(cmd)
 	period, _ := cmd.Flags().GetString("period")
+	chart, _ := cmd.Flags().GetBool("chart")
 
 	// Validate period
 	switch period {
@@ -680,7 +781,7 @@ func runAnalyzeActivity(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	r, err := connectRepo(ctx)
+	r, err := connectRepo(ctx, flags.remote)
 	if err != nil {
 		return err
 	}
@@ -747,12 +848,73 @@ func runAnalyzeActivity(cmd *cobra.Command, args []string) error {
 	// Generate all periods between first and last to fill gaps
 	allPeriods := generatePeriodRange(timestamps[0], timestamps[len(timestamps)-1], period)
 
+	// Activity is chronological — --sort is not supported, --reverse flips order
+	if flags.sortBy != "" {
+		return fmt.Errorf("--sort is not supported for activity (output is chronological, use --reverse)")
+	}
+
 	// Build table data
 	columns := []string{"period", "commits"}
 	var tableRows [][]string
 	for _, p := range allPeriods {
 		count := bucketCounts[p]
 		tableRows = append(tableRows, []string{p, strconv.Itoa(count)})
+	}
+
+	if flags.reverse {
+		for i, j := 0, len(tableRows)-1; i < j; i, j = i+1, j-1 {
+			tableRows[i], tableRows[j] = tableRows[j], tableRows[i]
+		}
+	}
+
+	// Add ASCII bar chart column if requested
+	if chart {
+		maxCommits := 0
+		for _, count := range bucketCounts {
+			if count > maxCommits {
+				maxCommits = count
+			}
+		}
+
+		barWidth := 30
+		if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 60 {
+			barWidth = w - 30
+			if barWidth > 50 {
+				barWidth = 50
+			}
+			if barWidth < 10 {
+				barWidth = 10
+			}
+		}
+
+		columns = []string{"period", "commits", "bar"}
+		// Sub-character precision using Unicode block elements (1/8th increments)
+		eighths := []rune{' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'}
+		newRows := make([][]string, len(tableRows))
+		for i, row := range tableRows {
+			count, _ := strconv.Atoi(row[1])
+			// Scale to eighths of a cell: 0..barWidth*8
+			scaled := 0
+			if maxCommits > 0 {
+				scaled = (count * barWidth * 8) / maxCommits
+			}
+			fullCells := scaled / 8
+			remainder := scaled % 8
+
+			var bar strings.Builder
+			bar.Grow(barWidth * 4) // UTF-8 block chars are up to 3 bytes
+			for j := 0; j < barWidth; j++ {
+				if j < fullCells {
+					bar.WriteRune('█')
+				} else if j == fullCells && remainder > 0 {
+					bar.WriteRune(eighths[remainder])
+				} else {
+					bar.WriteRune('░')
+				}
+			}
+			newRows[i] = []string{row[0], row[1], bar.String()}
+		}
+		tableRows = newRows
 	}
 
 	title := fmt.Sprintf("activity: %d %ss", len(tableRows), period)
@@ -825,7 +987,7 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	r, err := connectRepo(ctx)
+	r, err := connectRepo(ctx, flags.remote)
 	if err != nil {
 		return err
 	}
@@ -944,19 +1106,6 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	// Sort by author count ascending (most vulnerable first)
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].authors != results[j].authors {
-			return results[i].authors < results[j].authors
-		}
-		return results[i].path < results[j].path
-	})
-
-	// Apply limit
-	if flags.limit > 0 && len(results) > flags.limit {
-		results = results[:flags.limit]
-	}
-
 	// Build table data
 	columns := []string{"path", "authors", "author_list"}
 	tableRows := make([][]string, len(results))
@@ -968,6 +1117,21 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	title := fmt.Sprintf("bus-factor: %d files", len(results))
+	// Sort (default: fewest authors first — ascending)
+	cfg := sortConfig{
+		validColumns:  map[string]int{"path": 0, "authors": 1},
+		defaultColumn: "authors",
+		defaultDesc:   false,
+	}
+	if err := applySortFlags(flags, cfg, tableRows); err != nil {
+		return err
+	}
+
+	// Apply limit after sorting
+	if flags.limit > 0 && len(tableRows) > flags.limit {
+		tableRows = tableRows[:flags.limit]
+	}
+
+	title := fmt.Sprintf("bus-factor: %d files", len(tableRows))
 	return table.DisplayResults(title, columns, tableRows, flags.displayOpts())
 }

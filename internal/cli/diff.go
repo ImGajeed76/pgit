@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/imgajeed76/pgit/v3/internal/db"
@@ -12,6 +14,7 @@ import (
 	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 )
 
 func newDiffCmd() *cobra.Command {
@@ -40,6 +43,7 @@ Use -- to separate commits from paths:
 	cmd.Flags().Bool("name-status", false, "Show names and status of changed files")
 	cmd.Flags().Bool("stat", false, "Show diffstat summary")
 	cmd.Flags().Bool("no-color", false, "Disable colored output")
+	cmd.Flags().IntP("unified", "U", 3, "Number of lines of unified diff context")
 
 	return cmd
 }
@@ -51,6 +55,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	nameStatus, _ := cmd.Flags().GetBool("name-status")
 	stat, _ := cmd.Flags().GetBool("stat")
 	noColor, _ := cmd.Flags().GetBool("no-color")
+	contextLines, _ := cmd.Flags().GetInt("unified")
 
 	if cached {
 		staged = true
@@ -111,12 +116,13 @@ func runDiff(cmd *cobra.Command, args []string) error {
 
 	// If we have commit refs, do commit-to-commit diff
 	if fromCommit != "" {
-		return runCommitDiff(ctx, r, fromCommit, toCommit, paths, nameOnly, nameStatus, stat, noColor)
+		return runCommitDiff(ctx, r, fromCommit, toCommit, paths, nameOnly, nameStatus, stat, noColor, contextLines)
 	}
 
 	// Standard working tree diff
 	opts := repo.DiffOptions{
 		Staged:     staged,
+		Context:    contextLines,
 		NameOnly:   nameOnly,
 		NameStatus: nameStatus,
 		NoColor:    noColor,
@@ -161,7 +167,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 // Instead of materializing full trees (which decompresses all xpatch content),
 // we identify changed paths first via pgit_file_refs (normal table), then
 // fetch content only for those paths using scoped xpatch queries.
-func runCommitDiff(ctx context.Context, r *repo.Repository, fromRef, toRef string, paths []string, nameOnly, nameStatus, stat, noColor bool) error {
+func runCommitDiff(ctx context.Context, r *repo.Repository, fromRef, toRef string, paths []string, nameOnly, nameStatus, stat, noColor bool, contextLines int) error {
 	// Resolve commit refs
 	fromID, err := resolveCommitRef(ctx, r, fromRef)
 	if err != nil {
@@ -196,42 +202,64 @@ func runCommitDiff(ctx context.Context, r *repo.Repository, fromRef, toRef strin
 			changedPaths[b.Path] = true
 		}
 
+		// Parallel fetch with concurrency cap.
+		// Each file is a different group_id in xpatch, so parallel fetches
+		// across files are safe — they hit independent delta chains.
+		// Within each file, old and new fetches are sequential to benefit
+		// from intra-group cache warming.
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(15)
+
+		var mu sync.Mutex
 		for path := range changedPaths {
-			oldBlob, _ := r.DB.GetFileAtCommit(ctx, path, fromID)
-			newBlob, _ := r.DB.GetFileAtCommit(ctx, path, toID)
+			g.Go(func() error {
+				oldBlob, _ := r.DB.GetFileAtCommit(gCtx, path, fromID)
+				newBlob, _ := r.DB.GetFileAtCommit(gCtx, path, toID)
 
-			var result repo.DiffResult
-			result.Path = path
+				oldContent := ""
+				newContent := ""
+				if oldBlob != nil {
+					oldContent = string(oldBlob.Content)
+				}
+				if newBlob != nil {
+					newContent = string(newBlob.Content)
+				}
 
-			oldContent := ""
-			newContent := ""
-			if oldBlob != nil {
-				oldContent = string(oldBlob.Content)
-			}
-			if newBlob != nil {
-				newContent = string(newBlob.Content)
-			}
+				if oldContent == newContent {
+					return nil // no actual change (e.g., added then reverted)
+				}
 
-			if oldContent == newContent {
-				continue // no actual change (e.g., added then reverted)
-			}
+				var result repo.DiffResult
+				result.Path = path
+				result.OldContent = oldContent
+				result.NewContent = newContent
 
-			result.OldContent = oldContent
-			result.NewContent = newContent
+				if oldBlob == nil {
+					result.Status = repo.StatusNew
+				} else if newBlob == nil {
+					result.Status = repo.StatusDeleted
+				} else {
+					result.Status = repo.StatusModified
+				}
 
-			if oldBlob == nil {
-				result.Status = repo.StatusNew
-			} else if newBlob == nil {
-				result.Status = repo.StatusDeleted
-			} else {
-				result.Status = repo.StatusModified
-			}
+				if !nameOnly && !nameStatus {
+					result.Hunks = repo.GenerateHunks(result.OldContent, result.NewContent, contextLines)
+				}
 
-			if !nameOnly && !nameStatus {
-				result.Hunks = repo.GenerateHunks(result.OldContent, result.NewContent, 3)
-			}
-			results = append(results, result)
+				mu.Lock()
+				results = append(results, result)
+				mu.Unlock()
+				return nil
+			})
 		}
+		if err := g.Wait(); err != nil {
+			return err
+		}
+
+		// Sort results by path for deterministic output order
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Path < results[j].Path
+		})
 	} else {
 		// Commit-to-working-tree diff: get tree metadata (no content, fast)
 		// then compare hashes against working tree files.
@@ -245,52 +273,69 @@ func runCommitDiff(ctx context.Context, r *repo.Repository, fromRef, toRef strin
 			fromMap[b.Path] = b
 		}
 
-		// Check each tracked file against working tree
+		// Parallel check of tracked files against working tree.
+		// Disk reads are fast; the parallelism helps with DB fetches for
+		// changed/deleted files (each file is a different xpatch group).
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(15)
+
+		var mu sync.Mutex
 		for path := range fromMap {
 			if len(paths) > 0 && !matchesAnyPath(path, paths) {
 				continue
 			}
-			absPath := r.AbsPath(path)
-			wtContent, err := os.ReadFile(absPath)
-			if err != nil {
-				// File deleted in working tree
-				oldBlob, err := r.DB.GetFileAtCommit(ctx, path, fromID)
+			blob := fromMap[path]
+			g.Go(func() error {
+				absPath := r.AbsPath(path)
+				wtContent, err := os.ReadFile(absPath)
+				if err != nil {
+					// File deleted in working tree
+					oldBlob, err := r.DB.GetFileAtCommit(gCtx, path, fromID)
+					if err != nil || oldBlob == nil {
+						return nil
+					}
+					result := repo.DiffResult{
+						Path:       path,
+						Status:     repo.StatusDeleted,
+						OldContent: string(oldBlob.Content),
+					}
+					if !nameOnly && !nameStatus {
+						result.Hunks = repo.GenerateHunks(result.OldContent, "", contextLines)
+					}
+					mu.Lock()
+					results = append(results, result)
+					mu.Unlock()
+					return nil
+				}
+
+				// Quick hash check to skip unchanged files without fetching content
+				wtHash := util.HashBytesBlake3(wtContent)
+				if util.ContentHashEqual(wtHash, blob.ContentHash) {
+					return nil
+				}
+
+				// Content differs — fetch old content
+				oldBlob, err := r.DB.GetFileAtCommit(gCtx, path, fromID)
 				if err != nil || oldBlob == nil {
-					continue
+					return nil
 				}
 				result := repo.DiffResult{
 					Path:       path,
-					Status:     repo.StatusDeleted,
+					Status:     repo.StatusModified,
 					OldContent: string(oldBlob.Content),
+					NewContent: string(wtContent),
 				}
 				if !nameOnly && !nameStatus {
-					result.Hunks = repo.GenerateHunks(result.OldContent, "", 3)
+					result.Hunks = repo.GenerateHunks(result.OldContent, result.NewContent, contextLines)
 				}
+				mu.Lock()
 				results = append(results, result)
-				continue
-			}
-
-			// Quick hash check to skip unchanged files without fetching content
-			wtHash := util.HashBytesBlake3(wtContent)
-			if util.ContentHashEqual(wtHash, fromMap[path].ContentHash) {
-				continue
-			}
-
-			// Content differs — fetch old content
-			oldBlob, err := r.DB.GetFileAtCommit(ctx, path, fromID)
-			if err != nil || oldBlob == nil {
-				continue
-			}
-			result := repo.DiffResult{
-				Path:       path,
-				Status:     repo.StatusModified,
-				OldContent: string(oldBlob.Content),
-				NewContent: string(wtContent),
-			}
-			if !nameOnly && !nameStatus {
-				result.Hunks = repo.GenerateHunks(result.OldContent, result.NewContent, 3)
-			}
-			results = append(results, result)
+				mu.Unlock()
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return err
 		}
 
 		// Check for new files in working directory
@@ -306,13 +351,18 @@ func runCommitDiff(ctx context.Context, r *repo.Repository, fromRef, toRef strin
 							NewContent: string(content),
 						}
 						if !nameOnly && !nameStatus {
-							result.Hunks = repo.GenerateHunks("", result.NewContent, 3)
+							result.Hunks = repo.GenerateHunks("", result.NewContent, contextLines)
 						}
 						results = append(results, result)
 					}
 				}
 			}
 		}
+
+		// Sort results by path for deterministic output order
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Path < results[j].Path
+		})
 	}
 
 	if len(results) == 0 {

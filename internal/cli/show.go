@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/imgajeed76/pgit/v3/internal/db"
@@ -12,6 +14,7 @@ import (
 	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 )
 
 func newShowCmd() *cobra.Command {
@@ -29,6 +32,7 @@ Examples:
 
 	cmd.Flags().Bool("stat", false, "Show diffstat instead of full diff")
 	cmd.Flags().Bool("no-patch", false, "Suppress diff output")
+	cmd.Flags().IntP("unified", "U", 3, "Number of lines of unified diff context")
 
 	return cmd
 }
@@ -36,6 +40,7 @@ Examples:
 func runShow(cmd *cobra.Command, args []string) error {
 	showStat, _ := cmd.Flags().GetBool("stat")
 	noPatch, _ := cmd.Flags().GetBool("no-patch")
+	contextLines, _ := cmd.Flags().GetInt("unified")
 
 	r, err := repo.Open()
 	if err != nil {
@@ -63,10 +68,10 @@ func runShow(cmd *cobra.Command, args []string) error {
 	}
 
 	// Show commit
-	return showCommitDetails(ctx, r, arg, showStat, noPatch)
+	return showCommitDetails(ctx, r, arg, showStat, noPatch, contextLines)
 }
 
-func showCommitDetails(ctx context.Context, r *repo.Repository, ref string, showStat, noPatch bool) error {
+func showCommitDetails(ctx context.Context, r *repo.Repository, ref string, showStat, noPatch bool, contextLines int) error {
 	commitID, err := resolveCommitRef(ctx, r, ref)
 	if err != nil {
 		return err
@@ -117,14 +122,31 @@ func showCommitDetails(ctx context.Context, r *repo.Repository, ref string, show
 	// Get parent content only for files changed in this commit.
 	// Instead of materializing the entire tree (7k+ files), we fetch only the
 	// specific files we need via scoped xpatch queries (group_id in WHERE).
+	// Fetch parent content in parallel.
+	// Each file is a different group_id in xpatch, so parallel fetches
+	// across files are safe — they hit independent delta chains.
 	var parentBlobs map[string][]byte
 	if commit.ParentID != nil {
 		parentBlobs = make(map[string][]byte)
+		var mu sync.Mutex
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(15)
+
+		parentID := *commit.ParentID
 		for _, blob := range blobs {
-			parentBlob, err := r.DB.GetFileAtCommit(ctx, blob.Path, *commit.ParentID)
-			if err == nil && parentBlob != nil {
-				parentBlobs[parentBlob.Path] = parentBlob.Content
-			}
+			path := blob.Path
+			g.Go(func() error {
+				parentBlob, err := r.DB.GetFileAtCommit(gCtx, path, parentID)
+				if err == nil && parentBlob != nil {
+					mu.Lock()
+					parentBlobs[parentBlob.Path] = parentBlob.Content
+					mu.Unlock()
+				}
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return err
 		}
 	}
 
@@ -161,7 +183,7 @@ func showCommitDetails(ctx context.Context, r *repo.Repository, ref string, show
 			result.Status = repo.StatusModified
 		}
 
-		result.Hunks = repo.GenerateHunks(oldContent, newContent, 3)
+		result.Hunks = repo.GenerateHunks(oldContent, newContent, contextLines)
 		fmt.Print(repo.FormatDiff(result, styles.NoColor()))
 	}
 
@@ -324,7 +346,11 @@ func resolveBaseRef(ctx context.Context, r *repo.Repository, ref string) (string
 	// Try partial match using SQL LIKE (much faster than loading all commits)
 	commit, err = r.DB.FindCommitByPartialID(ctx, refUpper)
 	if err != nil {
-		return "", err // This includes "ambiguous reference" errors
+		var ambErr *db.AmbiguousCommitError
+		if errors.As(err, &ambErr) {
+			return "", formatAmbiguousError(ctx, r, ambErr)
+		}
+		return "", err
 	}
 	if commit != nil {
 		return commit.ID, nil
@@ -349,4 +375,36 @@ func showFileAtCommit(ctx context.Context, r *repo.Repository, ref, path string)
 
 	fmt.Print(string(blob.Content))
 	return nil
+}
+
+// formatAmbiguousError creates a rich PgitError listing the matching candidates.
+func formatAmbiguousError(ctx context.Context, r *repo.Repository, ambErr *db.AmbiguousCommitError) error {
+	// Build candidate list with commit metadata
+	var lines []string
+	for _, id := range ambErr.MatchIDs {
+		c, err := r.DB.GetCommit(ctx, id)
+		if err != nil || c == nil {
+			lines = append(lines, util.ShortID(id))
+			continue
+		}
+		// First line of commit message, truncated
+		subject := strings.SplitN(c.Message, "\n", 2)[0]
+		if len(subject) > 60 {
+			subject = subject[:57] + "..."
+		}
+		lines = append(lines, fmt.Sprintf("%s  %s  %s",
+			util.ShortID(id), c.AuthoredAt.Format("2006-01-02"), subject))
+	}
+
+	// Join with "\n  " so every line gets the same 2-space indent
+	// that PgitError.Format() applies to the first line of Message.
+	msg := strings.Join(lines, "\n  ")
+	if len(ambErr.MatchIDs) >= 10 {
+		msg += "\n  (showing first 10 matches)"
+	}
+
+	return util.NewError(fmt.Sprintf("ambiguous commit reference '%s' matches %d commits",
+		strings.ToLower(ambErr.PartialID), len(ambErr.MatchIDs))).
+		WithMessage(msg).
+		WithSuggestion("Use more characters to narrow the match")
 }

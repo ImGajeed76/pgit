@@ -47,8 +47,19 @@ Examples:
 	cmd.Flags().IntP("limit", "n", 50, "Maximum number of results")
 	cmd.Flags().Bool("all", false, "Search all versions (not just latest per file)")
 	cmd.Flags().String("commit", "", "Search only at specific commit")
+	cmd.Flags().Bool("no-group", false, "Don't group identical matches across versions (only with --all)")
 
 	return cmd
+}
+
+// lineResult holds a single line match from a search.
+type lineResult struct {
+	Path       string
+	CommitID   string
+	CommitTime time.Time
+	LineNum    int
+	Line       string
+	MatchPos   []int
 }
 
 func runSearch(cmd *cobra.Command, args []string) error {
@@ -58,6 +69,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	limit, _ := cmd.Flags().GetInt("limit")
 	searchAll, _ := cmd.Flags().GetBool("all")
 	commitRef, _ := cmd.Flags().GetString("commit")
+	noGroup, _ := cmd.Flags().GetBool("no-group")
 
 	// Compile regex for Go-side line matching and highlighting
 	goPattern := pattern
@@ -132,14 +144,6 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	// Extract line-level matches from the files PostgreSQL found
-	type lineResult struct {
-		Path       string
-		CommitID   string
-		CommitTime time.Time
-		LineNum    int
-		Line       string
-		MatchPos   []int
-	}
 
 	var results []lineResult
 	resultCount := 0
@@ -190,6 +194,11 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if len(results) == 0 {
 		fmt.Println("No matches found")
 		return nil
+	}
+
+	// In --all mode, group identical lines across versions by default
+	if searchAll && !noGroup {
+		return printGroupedResults(results, re, limit, resultCount)
 	}
 
 	// Print results grouped by path + commit
@@ -245,6 +254,97 @@ func runSearch(cmd *cobra.Command, args []string) error {
 			styles.Mute(fmt.Sprintf("Found %d+ matches", resultCount)), limit)
 	} else {
 		fmt.Printf("%s\n", styles.Mute(fmt.Sprintf("Found %d matches", resultCount)))
+	}
+
+	return nil
+}
+
+// printGroupedResults deduplicates identical matches across versions,
+// showing each unique (path, line) once with the commits that contain it.
+func printGroupedResults(results []lineResult, re *regexp.Regexp, limit, resultCount int) error {
+	type groupKey struct {
+		path    string
+		content string
+	}
+	type groupEntry struct {
+		key     groupKey
+		lineNum int
+		commits []struct {
+			id   string
+			time time.Time
+		}
+	}
+
+	seen := make(map[groupKey]*groupEntry)
+	var ordered []*groupEntry // preserve first-seen order
+
+	for _, res := range results {
+		trimmed := strings.TrimSpace(res.Line)
+		k := groupKey{path: res.Path, content: trimmed}
+		if entry, ok := seen[k]; ok {
+			entry.commits = append(entry.commits, struct {
+				id   string
+				time time.Time
+			}{res.CommitID, res.CommitTime})
+		} else {
+			entry := &groupEntry{
+				key:     k,
+				lineNum: res.LineNum,
+				commits: []struct {
+					id   string
+					time time.Time
+				}{{res.CommitID, res.CommitTime}},
+			}
+			seen[k] = entry
+			ordered = append(ordered, entry)
+		}
+	}
+
+	// Print grouped output
+	currentPath := ""
+	for _, entry := range ordered {
+		if entry.key.path != currentPath {
+			if currentPath != "" {
+				fmt.Println()
+			}
+			fmt.Println(styles.Cyan(entry.key.path))
+			currentPath = entry.key.path
+		}
+
+		// Truncate and highlight the match line
+		line := entry.key.content
+		if len(line) > 200 {
+			line = line[:200] + "..."
+		}
+		highlighted := highlightMatch(line, re)
+		fmt.Printf("  %s: %s\n", styles.Mute(fmt.Sprintf("%4d", entry.lineNum)), highlighted)
+
+		// Print commit list
+		maxShow := 3
+		var commitStrs []string
+		for i, c := range entry.commits {
+			if i >= maxShow {
+				break
+			}
+			commitStrs = append(commitStrs,
+				util.ShortID(c.id)+" "+util.RelativeTime(c.time))
+		}
+		summary := strings.Join(commitStrs, ", ")
+		if len(entry.commits) > maxShow {
+			summary += fmt.Sprintf(", +%d more", len(entry.commits)-maxShow)
+		}
+		fmt.Printf("        %s\n", styles.Mute("("+summary+")"))
+	}
+
+	fmt.Println()
+	uniqueMatches := len(ordered)
+	totalMatches := len(results)
+	if resultCount >= limit {
+		fmt.Printf("%s\n", styles.Mute(
+			fmt.Sprintf("Found %d+ matches (%d unique across versions, showing first %d)", totalMatches, uniqueMatches, limit)))
+	} else {
+		fmt.Printf("%s\n", styles.Mute(
+			fmt.Sprintf("Found %d matches (%d unique across versions)", totalMatches, uniqueMatches)))
 	}
 
 	return nil

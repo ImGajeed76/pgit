@@ -23,9 +23,14 @@ import (
 
 func newLogCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "log",
+		Use:   "log [commit]",
 		Short: "Show commit logs",
-		Long: `Shows the commit logs starting from HEAD.
+		Long: `Shows the commit logs starting from HEAD, or from a specific commit.
+
+Examples:
+  pgit log                 # Log from HEAD
+  pgit log abc123          # Log from specific commit
+  pgit log HEAD~10         # Log from 10 commits back
 
 Interactive mode (default):
   Use j/k or arrows to navigate, Enter to view details, q to quit.
@@ -68,9 +73,26 @@ func runLog(cmd *cobra.Command, args []string) error {
 	}
 	defer r.Close()
 
-	commits, err := r.DB.GetCommitLog(ctx, maxCount)
-	if err != nil {
-		return err
+	var commits []*db.Commit
+	isFromHead := true
+	if len(args) > 0 {
+		// Start from specified commit
+		commitID, err := resolveCommitRef(ctx, r, args[0])
+		if err != nil {
+			return err
+		}
+		commits, err = r.DB.GetCommitLogFrom(ctx, commitID, maxCount)
+		if err != nil {
+			return err
+		}
+		// Only show HEAD label if the resolved commit actually is HEAD
+		headID, _ := r.DB.GetHead(ctx)
+		isFromHead = len(commits) > 0 && commits[0].ID == headID
+	} else {
+		commits, err = r.DB.GetCommitLog(ctx, maxCount)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(commits) == 0 {
@@ -89,7 +111,7 @@ func runLog(cmd *cobra.Command, args []string) error {
 
 	// Graph mode - ASCII visualization
 	if graph {
-		return printGraphLog(commits, oneline)
+		return printGraphLog(commits, oneline, isFromHead)
 	}
 
 	// Oneline mode - simple output
@@ -111,17 +133,17 @@ func runLog(cmd *cobra.Command, args []string) error {
 			if i > 0 {
 				fmt.Println()
 			}
-			printCommitFull(commit, i == 0)
+			printCommitFull(commit, isFromHead && i == 0)
 		}
 		return nil
 	}
 
 	// Interactive TUI mode
-	return runLogTUI(commits)
+	return runLogTUI(commits, isFromHead)
 }
 
 // printGraphLog prints commits with ASCII graph
-func printGraphLog(commits []*db.Commit, oneline bool) error {
+func printGraphLog(commits []*db.Commit, oneline, isFromHead bool) error {
 	for i, commit := range commits {
 		// Simple linear graph for now (pgit is typically single-branch)
 		var graphPrefix string
@@ -144,7 +166,7 @@ func printGraphLog(commits []*db.Commit, oneline bool) error {
 		} else {
 			// Full format with graph
 			refs := ""
-			if i == 0 {
+			if isFromHead && i == 0 {
 				refs = " " + lipgloss.NewStyle().Foreground(styles.Accent).Render("(HEAD → main)")
 			}
 
@@ -227,6 +249,7 @@ type logModel struct {
 	searchQuery  string
 	searchHits   []int // indices of matching commits
 	searchCursor int   // current position in searchHits
+	isFromHead   bool  // true if the first commit is HEAD
 }
 
 type keyMap struct {
@@ -257,7 +280,7 @@ var keys = keyMap{
 	PrevMatch: key.NewBinding(key.WithKeys("N"), key.WithHelp("N", "prev match")),
 }
 
-func runLogTUI(commits []*db.Commit) error {
+func runLogTUI(commits []*db.Commit, isFromHead bool) error {
 	ti := textinput.New()
 	ti.Placeholder = "search commits..."
 	ti.CharLimit = 100
@@ -268,6 +291,7 @@ func runLogTUI(commits []*db.Commit) error {
 		cursor:      0,
 		mode:        logModeNormal,
 		searchInput: ti,
+		isFromHead:  isFromHead,
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -530,7 +554,7 @@ func (m logModel) renderCommits() string {
 
 		hash := styles.Hash(commit.ID, false)
 		refs := ""
-		if i == 0 {
+		if m.isFromHead && i == 0 {
 			refs = " " + lipgloss.NewStyle().Foreground(styles.Accent).Render("(HEAD → main)")
 		}
 

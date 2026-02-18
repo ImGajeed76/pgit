@@ -242,6 +242,16 @@ func (db *DB) FindCommonAncestor(ctx context.Context, commitA, commitB string) (
 	return id, err
 }
 
+// AmbiguousCommitError is returned when a partial commit ID matches multiple commits.
+type AmbiguousCommitError struct {
+	PartialID string
+	MatchIDs  []string
+}
+
+func (e *AmbiguousCommitError) Error() string {
+	return fmt.Sprintf("ambiguous commit reference '%s' matches %d commits", e.PartialID, len(e.MatchIDs))
+}
+
 // FindCommitByPartialID finds a commit by partial ID match.
 // Uses prefix range scan first (fast, uses xpatch PK index), then falls back
 // to suffix match on pgit_file_refs (normal table) if no prefix match found.
@@ -251,7 +261,7 @@ func (db *DB) FindCommitByPartialID(ctx context.Context, partialID string) (*Com
 	prefixSQL := `
 	SELECT id FROM pgit_commits
 	WHERE id >= $1 AND id < $2
-	LIMIT 2`
+	LIMIT 10`
 
 	rows, err := db.Query(ctx, prefixSQL, partialID, upperBound)
 	if err != nil {
@@ -277,7 +287,7 @@ func (db *DB) FindCommitByPartialID(ctx context.Context, partialID string) (*Com
 		suffixSQL := `
 		SELECT DISTINCT commit_id FROM pgit_file_refs
 		WHERE commit_id LIKE '%' || $1
-		LIMIT 2`
+		LIMIT 10`
 
 		rows, err := db.Query(ctx, suffixSQL, partialID)
 		if err != nil {
@@ -303,7 +313,7 @@ func (db *DB) FindCommitByPartialID(ctx context.Context, partialID string) (*Com
 	case 1:
 		return db.GetCommit(ctx, matchIDs[0])
 	default:
-		return nil, fmt.Errorf("ambiguous commit reference '%s' matches multiple commits", partialID)
+		return nil, &AmbiguousCommitError{PartialID: partialID, MatchIDs: matchIDs}
 	}
 }
 

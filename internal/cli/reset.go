@@ -2,12 +2,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/imgajeed76/pgit/v3/internal/db"
 	"github.com/imgajeed76/pgit/v3/internal/repo"
 	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/imgajeed76/pgit/v3/internal/util"
@@ -108,7 +110,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 		targetCommit = headID
 	} else {
 		// Check if first arg looks like a commit ref
-		commitID, refResult := tryResolveCommit(ctx, r, args[0])
+		commitID, refResult, resolveErr := tryResolveCommit(ctx, r, args[0])
 
 		// Handle -- separator
 		dashDashIdx := -1
@@ -122,8 +124,11 @@ func runReset(cmd *cobra.Command, args []string) error {
 		if dashDashIdx >= 0 {
 			// Explicit separator: before -- is commit, after is paths
 			if dashDashIdx > 0 {
-				commitID, refResult = tryResolveCommit(ctx, r, args[0])
+				commitID, refResult, resolveErr = tryResolveCommit(ctx, r, args[0])
 				if refResult == commitRefInvalid {
+					if resolveErr != nil {
+						return formatAmbiguousResetError(ctx, r, resolveErr)
+					}
 					return util.NewError(fmt.Sprintf("Invalid commit reference: %s", args[0])).
 						WithMessage("Cannot resolve this commit reference").
 						WithSuggestion("pgit log --oneline  # View available commits")
@@ -150,6 +155,9 @@ func runReset(cmd *cobra.Command, args []string) error {
 			paths = args[1:]
 		} else if refResult == commitRefInvalid {
 			// Looks like a commit ref but couldn't resolve (e.g., HEAD~99)
+			if resolveErr != nil {
+				return formatAmbiguousResetError(ctx, r, resolveErr)
+			}
 			return util.NewError(fmt.Sprintf("Invalid commit reference: %s", args[0])).
 				WithMessage("This looks like a commit reference but cannot be resolved").
 				WithCause("The commit may not exist or you're trying to go back too far in history").
@@ -187,9 +195,10 @@ const (
 	commitRefResolved                        // Successfully resolved to a commit
 )
 
-// tryResolveCommit attempts to resolve a string to a commit ID
-// Returns the commit ID and a result indicating what happened
-func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (string, commitRefResult) {
+// tryResolveCommit attempts to resolve a string to a commit ID.
+// Returns the commit ID, a result indicating what happened, and an optional
+// error (non-nil only for actionable errors like ambiguous references).
+func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (string, commitRefResult, error) {
 	// Check if this looks like a commit reference pattern
 	looksLikeCommitRef := ref == "HEAD" ||
 		strings.HasPrefix(ref, "HEAD~") ||
@@ -201,9 +210,9 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 	if ref == "HEAD" {
 		headID, err := r.DB.GetHead(ctx)
 		if err != nil || headID == "" {
-			return "", commitRefInvalid
+			return "", commitRefInvalid, nil
 		}
-		return headID, commitRefResolved
+		return headID, commitRefResolved, nil
 	}
 
 	// HEAD~N syntax
@@ -214,15 +223,15 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 		}
 		headID, err := r.DB.GetHead(ctx)
 		if err != nil || headID == "" {
-			return "", commitRefInvalid
+			return "", commitRefInvalid, nil
 		}
 		// Walk back n commits
 		commits, err := r.DB.GetCommitLogFrom(ctx, headID, n+1)
 		if err != nil || len(commits) <= n {
 			// This looks like a commit ref but we can't go back that far
-			return "", commitRefInvalid
+			return "", commitRefInvalid, nil
 		}
-		return commits[n].ID, commitRefResolved
+		return commits[n].ID, commitRefResolved, nil
 	}
 
 	// HEAD^ syntax
@@ -230,41 +239,58 @@ func tryResolveCommit(ctx context.Context, r *repo.Repository, ref string) (stri
 		n := strings.Count(ref, "^")
 		headID, err := r.DB.GetHead(ctx)
 		if err != nil || headID == "" {
-			return "", commitRefInvalid
+			return "", commitRefInvalid, nil
 		}
 		commits, err := r.DB.GetCommitLogFrom(ctx, headID, n+1)
 		if err != nil || len(commits) <= n {
-			return "", commitRefInvalid
+			return "", commitRefInvalid, nil
 		}
-		return commits[n].ID, commitRefResolved
+		return commits[n].ID, commitRefResolved, nil
 	}
 
 	// Try exact match first
 	commit, err := r.DB.GetCommit(ctx, ref)
 	if err == nil && commit != nil {
-		return commit.ID, commitRefResolved
+		return commit.ID, commitRefResolved, nil
 	}
 
 	// Try partial match (short ID) using prefix/suffix search
 	partialCommit, err := r.DB.FindCommitByPartialID(ctx, strings.ToUpper(ref))
+	if err != nil {
+		// Surface ambiguous commit errors to the caller
+		var ambErr *db.AmbiguousCommitError
+		if errors.As(err, &ambErr) {
+			return "", commitRefInvalid, err
+		}
+	}
 	if err == nil && partialCommit != nil {
-		return partialCommit.ID, commitRefResolved
+		return partialCommit.ID, commitRefResolved, nil
 	}
 
 	// If it doesn't look like a path (no / or . extension), treat as invalid ref
 	// This prevents treating typos like "nonexistent-ref" as filenames
 	if looksLikeCommitRef {
-		return "", commitRefInvalid
+		return "", commitRefInvalid, nil
 	}
 
 	// Check if a file/directory with this name exists - if so, treat as path
 	absPath := r.AbsPath(ref)
 	if _, err := os.Stat(absPath); err == nil {
-		return "", commitRefNotARef
+		return "", commitRefNotARef, nil
 	}
 
 	// Doesn't exist as file and doesn't look like a path - likely a typo'd ref
-	return "", commitRefInvalid
+	return "", commitRefInvalid, nil
+}
+
+// formatAmbiguousResetError formats an ambiguous commit error for the reset command.
+// If the error is not an AmbiguousCommitError, it returns the error as-is.
+func formatAmbiguousResetError(ctx context.Context, r *repo.Repository, err error) error {
+	var ambErr *db.AmbiguousCommitError
+	if errors.As(err, &ambErr) {
+		return formatAmbiguousError(ctx, r, ambErr)
+	}
+	return err
 }
 
 // isHexOrULID checks if a string looks like a commit ID (hex or ULID chars)
