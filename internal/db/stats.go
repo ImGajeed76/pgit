@@ -16,7 +16,7 @@ type XpatchStats struct {
 	CompressionRatio float64
 	CacheHits        int64
 	CacheMisses      int64
-	AvgChainLength   float64
+	AvgDepth         float64 // avg_compression_depth: average delta distance (versions back) per reconstruction
 }
 
 // RepoStats contains all repository statistics for schema v3.
@@ -32,13 +32,28 @@ type RepoStats struct {
 	TotalContentSize int64 // Raw content size (sum from both content tables via xpatch.stats)
 	DeletedEntries   int64
 
-	// Table sizes from PostgreSQL (actual disk usage)
+	// Table sizes from PostgreSQL (pg_table_size = heap + TOAST + FSM)
 	CommitsTableSize       int64
 	PathsTableSize         int64
 	FileRefsTableSize      int64
 	TextContentTableSize   int64
 	BinaryContentTableSize int64
+	RefsTableSize          int64
+	MetadataTableSize      int64
+	SyncStateTableSize     int64
 	TotalIndexSize         int64
+
+	// xpatch compressed bytes (compressed_size_bytes from xpatch.stats)
+	// This is the actual data after delta compression, excluding PG overhead.
+	XpatchCompressedCommits int64
+	XpatchCompressedText    int64
+	XpatchCompressedBinary  int64
+
+	// Normal table raw data bytes (computed from column widths, no PG overhead)
+	NormalRawFileRefs int64
+	NormalRawPaths    int64
+	NormalRawRefs     int64
+	NormalRawMetadata int64
 
 	// Legacy field for compatibility (sum of paths + file_refs + both content tables)
 	BlobsTableSize int64
@@ -71,15 +86,19 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 		}
 	}()
 
-	// Query 2: Content stats from xpatch.stats() - sum both tables - O(1) each
+	// Query 2: xpatch stats for all 3 tables - raw + compressed sizes - O(1) each
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var textSize, binarySize int64
-		_ = db.QueryRow(ctx, "SELECT raw_size_bytes FROM xpatch.stats('pgit_text_content')").Scan(&textSize)
-		_ = db.QueryRow(ctx, "SELECT raw_size_bytes FROM xpatch.stats('pgit_binary_content')").Scan(&binarySize)
+		var textRaw, textComp, binaryRaw, binaryComp, commitRaw, commitComp int64
+		_ = db.QueryRow(ctx, "SELECT raw_size_bytes, compressed_size_bytes FROM xpatch.stats('pgit_text_content')").Scan(&textRaw, &textComp)
+		_ = db.QueryRow(ctx, "SELECT raw_size_bytes, compressed_size_bytes FROM xpatch.stats('pgit_binary_content')").Scan(&binaryRaw, &binaryComp)
+		_ = db.QueryRow(ctx, "SELECT raw_size_bytes, compressed_size_bytes FROM xpatch.stats('pgit_commits')").Scan(&commitRaw, &commitComp)
 		mu.Lock()
-		stats.TotalContentSize = textSize + binarySize
+		stats.TotalContentSize = textRaw + binaryRaw
+		stats.XpatchCompressedText = textComp
+		stats.XpatchCompressedBinary = binaryComp
+		stats.XpatchCompressedCommits = commitComp
 		mu.Unlock()
 	}()
 
@@ -90,15 +109,18 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 		_ = db.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_paths").Scan(&stats.UniqueFiles)
 	}()
 
-	// Query 4: Table sizes (fast, from pg_class)
+	// Query 4: Table sizes via pg_table_size (heap + TOAST + FSM), all pgit tables
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_commits')").Scan(&stats.CommitsTableSize)
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_paths')").Scan(&stats.PathsTableSize)
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_file_refs')").Scan(&stats.FileRefsTableSize)
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_text_content')").Scan(&stats.TextContentTableSize)
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_binary_content')").Scan(&stats.BinaryContentTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_commits')").Scan(&stats.CommitsTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_paths')").Scan(&stats.PathsTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_file_refs')").Scan(&stats.FileRefsTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_text_content')").Scan(&stats.TextContentTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_binary_content')").Scan(&stats.BinaryContentTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_refs')").Scan(&stats.RefsTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_metadata')").Scan(&stats.MetadataTableSize)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_sync_state')").Scan(&stats.SyncStateTableSize)
 
 		// Calculate legacy BlobsTableSize as sum
 		stats.BlobsTableSize = stats.PathsTableSize + stats.FileRefsTableSize + stats.TextContentTableSize + stats.BinaryContentTableSize
@@ -113,7 +135,8 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 				'pgit_text_content'::regclass,
 				'pgit_binary_content'::regclass,
 				'pgit_refs'::regclass,
-				'pgit_sync_state'::regclass
+				'pgit_sync_state'::regclass,
+				'pgit_metadata'::regclass
 			)
 		`).Scan(&stats.TotalIndexSize)
 	}()
@@ -131,6 +154,28 @@ func (db *DB) GetRepoStatsFast(ctx context.Context) (*RepoStats, error) {
 	go func() {
 		defer wg.Done()
 		_ = db.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_file_refs").Scan(&stats.TotalBlobs)
+	}()
+
+	// Query 7: Normal table raw data bytes (actual column data, no PG overhead)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(
+				octet_length(commit_id) + 4 + 4 +
+				octet_length(content_hash) + 4 + 1 + 1 +
+				COALESCE(octet_length(symlink_target), 0)
+			), 0) FROM pgit_file_refs
+		`).Scan(&stats.NormalRawFileRefs)
+		_ = db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(4 + octet_length(path)), 0) FROM pgit_paths
+		`).Scan(&stats.NormalRawPaths)
+		_ = db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(octet_length(name) + octet_length(commit_id)), 0) FROM pgit_refs
+		`).Scan(&stats.NormalRawRefs)
+		_ = db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(octet_length(key) + octet_length(value)), 0) FROM pgit_metadata
+		`).Scan(&stats.NormalRawMetadata)
 	}()
 
 	wg.Wait()
@@ -170,7 +215,7 @@ func (db *DB) GetXpatchStats(ctx context.Context, tableName string) (*XpatchStat
 		&stats.CompressionRatio,
 		&stats.CacheHits,
 		&stats.CacheMisses,
-		&stats.AvgChainLength,
+		&stats.AvgDepth,
 	)
 	if err != nil {
 		return nil, err
@@ -202,35 +247,35 @@ func (db *DB) GetDetailedTableSizes(ctx context.Context) (*DetailedTableSizes, e
 
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_commits')").Scan(&sizes.Commits)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_commits')").Scan(&sizes.Commits)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_paths')").Scan(&sizes.Paths)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_paths')").Scan(&sizes.Paths)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_file_refs')").Scan(&sizes.FileRefs)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_file_refs')").Scan(&sizes.FileRefs)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_text_content')").Scan(&sizes.TextContent)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_text_content')").Scan(&sizes.TextContent)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_binary_content')").Scan(&sizes.BinaryContent)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_binary_content')").Scan(&sizes.BinaryContent)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_refs')").Scan(&sizes.Refs)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_refs')").Scan(&sizes.Refs)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_sync_state')").Scan(&sizes.SyncState)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_sync_state')").Scan(&sizes.SyncState)
 	}()
 	go func() {
 		defer wg.Done()
-		_ = db.QueryRow(ctx, "SELECT pg_relation_size('pgit_metadata')").Scan(&sizes.Metadata)
+		_ = db.QueryRow(ctx, "SELECT pg_table_size('pgit_metadata')").Scan(&sizes.Metadata)
 	}()
 
 	wg.Wait()

@@ -552,30 +552,63 @@ func runStats(cmd *cobra.Command, args []string) error {
 			styles.Mute("(uncompressed)"))
 	}
 
-	// Storage section
+	// Storage section — uses pg_table_size (includes TOAST)
 	fmt.Println()
 	fmt.Println(styles.Boldf("Storage (on disk)"))
 	fmt.Println()
 
-	// Calculate total for all data tables
-	contentTableSize := stats.TextContentTableSize + stats.BinaryContentTableSize
-	totalDataStorage := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize + contentTableSize
-	fmt.Printf("  Commits table:    %s\n", formatBytes(stats.CommitsTableSize))
-	fmt.Printf("  Paths table:      %s\n", formatBytes(stats.PathsTableSize))
-	fmt.Printf("  File refs table:  %s\n", formatBytes(stats.FileRefsTableSize))
-	fmt.Printf("  Text content:     %s\n", formatBytes(stats.TextContentTableSize))
-	fmt.Printf("  Binary content:   %s\n", formatBytes(stats.BinaryContentTableSize))
-	fmt.Printf("  Indexes:          %s\n", formatBytes(stats.TotalIndexSize))
-	fmt.Printf("  ─────────────────────\n")
-	fmt.Printf("  Total:            %s\n", styles.SuccessText(formatBytes(totalDataStorage+stats.TotalIndexSize)))
+	// On-disk: sum of pg_table_size for all pgit tables (no indexes)
+	totalOnDisk := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize +
+		stats.TextContentTableSize + stats.BinaryContentTableSize +
+		stats.RefsTableSize + stats.MetadataTableSize + stats.SyncStateTableSize
 
-	// Show compression ratio if we have meaningful content size
-	if stats.TotalContentSize > 1024 && contentTableSize > 0 {
-		ratio := float64(stats.TotalContentSize) / float64(contentTableSize)
-		savings := (1 - float64(contentTableSize)/float64(stats.TotalContentSize)) * 100
-		if savings > 0 {
-			fmt.Printf("\n  %s %.1fx compression (%.0f%% space saved)\n",
-				styles.Successf("→"), ratio, savings)
+	fmt.Printf("  Commits:        %s\n", formatBytes(stats.CommitsTableSize))
+	fmt.Printf("  Text content:   %s\n", formatBytes(stats.TextContentTableSize))
+	fmt.Printf("  Binary content: %s\n", formatBytes(stats.BinaryContentTableSize))
+	fmt.Printf("  File refs:      %s\n", formatBytes(stats.FileRefsTableSize))
+	fmt.Printf("  Paths:          %s\n", formatBytes(stats.PathsTableSize))
+	otherTables := stats.RefsTableSize + stats.MetadataTableSize + stats.SyncStateTableSize
+	if otherTables > 0 {
+		fmt.Printf("  Other:          %s  %s\n", formatBytes(otherTables), styles.Mute("(refs, metadata, sync)"))
+	}
+	fmt.Printf("  Indexes:        %s\n", formatBytes(stats.TotalIndexSize))
+	fmt.Printf("  ─────────────────────\n")
+	fmt.Printf("  Total:          %s\n", styles.Boldf("%s", formatBytes(totalOnDisk+stats.TotalIndexSize)))
+
+	// Actual data: xpatch compressed bytes + normal table raw column data
+	xpatchComp := stats.XpatchCompressedCommits + stats.XpatchCompressedText + stats.XpatchCompressedBinary
+	normalRaw := stats.NormalRawFileRefs + stats.NormalRawPaths + stats.NormalRawRefs + stats.NormalRawMetadata
+	actualData := xpatchComp + normalRaw
+
+	// Raw uncompressed: xpatch raw_size_bytes + normal table raw data
+	xpatchRaw := stats.TotalContentSize // text + binary raw_size_bytes (already fetched)
+	// Add commits raw size — we need it from xpatch.stats but TotalContentSize only has text+binary.
+	// We already have the compressed commits bytes but not the raw. We'll compute ratio from what we have.
+
+	if actualData > 0 && totalOnDisk > 0 {
+		fmt.Println()
+		fmt.Printf("  %s\n", styles.Mute("Actual data (xpatch compressed + raw column data):"))
+		fmt.Printf("  xpatch:         %s  %s\n", formatBytes(xpatchComp), styles.Mute("(commits + text + binary)"))
+		fmt.Printf("  normal tables:  %s  %s\n", formatBytes(normalRaw), styles.Mute("(file_refs, paths, refs, metadata)"))
+		fmt.Printf("  ─────────────────────\n")
+		fmt.Printf("  Actual data:    %s\n", styles.Boldf("%s", formatBytes(actualData)))
+
+		overhead := totalOnDisk - actualData
+		if overhead > 0 && totalOnDisk > 0 {
+			overheadPct := float64(overhead) / float64(totalOnDisk) * 100
+			fmt.Printf("  PG overhead:    %s  %s\n",
+				formatBytes(overhead),
+				styles.Mute(fmt.Sprintf("(%.1f%% of on-disk)", overheadPct)))
+		}
+	}
+
+	// Compression ratios
+	if xpatchRaw > 1024 && actualData > 0 {
+		dataRatio := float64(xpatchRaw) / float64(actualData)
+		dataSavings := (1 - float64(actualData)/float64(xpatchRaw)) * 100
+		if dataSavings > 0 {
+			fmt.Printf("\n  %s %.1fx data compression (%.0f%% space saved vs uncompressed content)\n",
+				styles.Successf("→"), dataRatio, dataSavings)
 		}
 	}
 
@@ -647,8 +680,8 @@ func printXpatchStats(stats *db.XpatchStats) {
 		}
 	}
 
-	if stats.AvgChainLength > 0 {
-		fmt.Printf("    Avg chain:    %.1f\n", stats.AvgChainLength)
+	if stats.AvgDepth > 0 {
+		fmt.Printf("    Avg depth:    %.1f\n", stats.AvgDepth)
 	}
 
 	cacheTotal := stats.CacheHits + stats.CacheMisses
@@ -678,10 +711,16 @@ type JSONStorageStats struct {
 	FileRefsTableBytes      int64   `json:"file_refs_table_bytes"`
 	TextContentTableBytes   int64   `json:"text_content_table_bytes"`
 	BinaryContentTableBytes int64   `json:"binary_content_table_bytes"`
+	RefsTableBytes          int64   `json:"refs_table_bytes"`
+	MetadataTableBytes      int64   `json:"metadata_table_bytes"`
+	SyncStateTableBytes     int64   `json:"sync_state_table_bytes"`
 	IndexesBytes            int64   `json:"indexes_bytes"`
-	TotalBytes              int64   `json:"total_bytes"`
-	CompressionRatio        float64 `json:"compression_ratio,omitempty"`
-	SpaceSavedPercent       float64 `json:"space_saved_percent,omitempty"`
+	TotalOnDiskBytes        int64   `json:"total_on_disk_bytes"`
+	ActualDataBytes         int64   `json:"actual_data_bytes"`
+	OverheadBytes           int64   `json:"overhead_bytes"`
+	OverheadPercent         float64 `json:"overhead_percent,omitempty"`
+	DataCompressionRatio    float64 `json:"data_compression_ratio,omitempty"`
+	DataSpaceSavedPercent   float64 `json:"data_space_saved_percent,omitempty"`
 }
 
 type JSONXpatchStats struct {
@@ -698,13 +737,19 @@ type JSONXpatchTableStats struct {
 	RawSizeBytes     int64   `json:"raw_size_bytes"`
 	CompressedBytes  int64   `json:"compressed_bytes"`
 	CompressionRatio float64 `json:"compression_ratio"`
-	AvgChainLength   float64 `json:"avg_chain_length"`
+	AvgDepth         float64 `json:"avg_depth"`
 	CacheHitPercent  float64 `json:"cache_hit_percent"`
 }
 
 func printJSONStats(ctx context.Context, r *repo.Repository, stats *db.RepoStats, showXpatch bool) error {
-	contentTableSize := stats.TextContentTableSize + stats.BinaryContentTableSize
-	totalStorage := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize + contentTableSize + stats.TotalIndexSize
+	totalOnDisk := stats.CommitsTableSize + stats.PathsTableSize + stats.FileRefsTableSize +
+		stats.TextContentTableSize + stats.BinaryContentTableSize +
+		stats.RefsTableSize + stats.MetadataTableSize + stats.SyncStateTableSize
+
+	xpatchComp := stats.XpatchCompressedCommits + stats.XpatchCompressedText + stats.XpatchCompressedBinary
+	normalRaw := stats.NormalRawFileRefs + stats.NormalRawPaths + stats.NormalRawRefs + stats.NormalRawMetadata
+	actualData := xpatchComp + normalRaw
+	overhead := totalOnDisk - actualData
 
 	jsonStats := JSONStats{
 		Repository: JSONRepoStats{
@@ -719,17 +764,27 @@ func printJSONStats(ctx context.Context, r *repo.Repository, stats *db.RepoStats
 			FileRefsTableBytes:      stats.FileRefsTableSize,
 			TextContentTableBytes:   stats.TextContentTableSize,
 			BinaryContentTableBytes: stats.BinaryContentTableSize,
+			RefsTableBytes:          stats.RefsTableSize,
+			MetadataTableBytes:      stats.MetadataTableSize,
+			SyncStateTableBytes:     stats.SyncStateTableSize,
 			IndexesBytes:            stats.TotalIndexSize,
-			TotalBytes:              totalStorage,
+			TotalOnDiskBytes:        totalOnDisk + stats.TotalIndexSize,
+			ActualDataBytes:         actualData,
+			OverheadBytes:           overhead,
 		},
 	}
 
-	if stats.TotalContentSize > 1024 && contentTableSize > 0 {
-		ratio := float64(stats.TotalContentSize) / float64(contentTableSize)
-		savings := (1 - float64(contentTableSize)/float64(stats.TotalContentSize)) * 100
+	if totalOnDisk > 0 && overhead > 0 {
+		jsonStats.Storage.OverheadPercent = float64(overhead) / float64(totalOnDisk) * 100
+	}
+
+	xpatchRaw := stats.TotalContentSize
+	if xpatchRaw > 1024 && actualData > 0 {
+		ratio := float64(xpatchRaw) / float64(actualData)
+		savings := (1 - float64(actualData)/float64(xpatchRaw)) * 100
 		if savings > 0 {
-			jsonStats.Storage.CompressionRatio = ratio
-			jsonStats.Storage.SpaceSavedPercent = savings
+			jsonStats.Storage.DataCompressionRatio = ratio
+			jsonStats.Storage.DataSpaceSavedPercent = savings
 		}
 	}
 
@@ -766,7 +821,7 @@ func xpatchToJSON(stats *db.XpatchStats) *JSONXpatchTableStats {
 		RawSizeBytes:     stats.RawSizeBytes,
 		CompressedBytes:  stats.CompressedBytes,
 		CompressionRatio: stats.CompressionRatio,
-		AvgChainLength:   stats.AvgChainLength,
+		AvgDepth:         stats.AvgDepth,
 	}
 
 	cacheTotal := stats.CacheHits + stats.CacheMisses

@@ -760,7 +760,7 @@ Periods with zero commits are included so the timeline is continuous.`,
 		RunE: runAnalyzeActivity,
 	}
 	addAnalyzeFlags(cmd)
-	cmd.Flags().MarkHidden("sort") // activity is chronological; only --reverse is supported
+	_ = cmd.Flags().MarkHidden("sort") // activity is chronological; only --reverse is supported
 	cmd.Flags().String("period", "month", "Time bucket: week, month, quarter, year")
 	cmd.Flags().Bool("chart", false, "Include ASCII bar chart column")
 	return cmd
