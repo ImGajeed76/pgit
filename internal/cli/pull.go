@@ -9,6 +9,7 @@ import (
 
 	"github.com/imgajeed76/pgit/v3/internal/config"
 	"github.com/imgajeed76/pgit/v3/internal/db"
+	"github.com/imgajeed76/pgit/v3/internal/merge"
 	"github.com/imgajeed76/pgit/v3/internal/repo"
 	"github.com/imgajeed76/pgit/v3/internal/ui"
 	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
@@ -306,11 +307,32 @@ func pullFastForward(ctx context.Context, r *repo.Repository, remoteDB *db.DB, c
 	return nil
 }
 
+// mergeFileResult describes the outcome of merging a single file.
+type mergeFileResult struct {
+	path          string
+	category      mergeCategory
+	mergedData    []byte // merged content (for autoMerged and conflicted)
+	autoResolved  int    // count of auto-resolved regions
+	conflictCount int    // count of conflict regions
+}
+
+type mergeCategory int
+
+const (
+	mergeCategoryRemoteOnly     mergeCategory = iota // only remote changed — take remote
+	mergeCategoryLocalOnly                           // only local changed — keep local
+	mergeCategoryAutoMerged                          // both changed, fully auto-merged
+	mergeCategoryConflicted                          // both changed, has unresolvable conflicts
+	mergeCategoryDeleteLocal                         // remote deleted, local modified → conflict
+	mergeCategoryDeleteRemote                        // local deleted, remote modified → conflict
+	mergeCategoryBinaryConflict                      // both changed a binary file → whole-file conflict
+)
+
 func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localHeadID string, localCommits, remoteCommits []*db.Commit, commonAncestor, remoteName string) error {
 	fmt.Printf("Local commits since divergence: %d\n", len(localCommits))
 	fmt.Printf("Remote commits to pull: %d\n", len(remoteCommits))
 
-	// Get trees for conflict detection
+	// ─── Phase 1: Load trees for three-way comparison ─────────────────
 	localTree, err := r.DB.GetTreeAtCommit(ctx, localHeadID)
 	if err != nil {
 		return err
@@ -346,12 +368,7 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 		remoteFiles[b.Path] = b
 	}
 
-	// Detect conflicts and modified files
-	var conflicts []string
-	var localOnlyChanges []string
-	var remoteOnlyChanges []string
-
-	// Check all files
+	// ─── Phase 2: Three-way merge per file ────────────────────────────
 	allPaths := make(map[string]bool)
 	for p := range localFiles {
 		allPaths[p] = true
@@ -363,6 +380,8 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 		allPaths[p] = true
 	}
 
+	var results []mergeFileResult
+
 	for path := range allPaths {
 		local := localFiles[path]
 		remote := remoteFiles[path]
@@ -371,28 +390,137 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 		localChanged := fileChanged(ancestor, local)
 		remoteChanged := fileChanged(ancestor, remote)
 
-		if localChanged && remoteChanged {
-			// Both modified - potential conflict
-			if !filesEqual(local, remote) {
-				conflicts = append(conflicts, path)
-			}
-		} else if localChanged {
-			localOnlyChanges = append(localOnlyChanges, path)
-		} else if remoteChanged {
-			remoteOnlyChanges = append(remoteOnlyChanges, path)
+		if !localChanged && !remoteChanged {
+			// Neither side changed — nothing to do
+			continue
+		}
+
+		if localChanged && !remoteChanged {
+			results = append(results, mergeFileResult{
+				path:     path,
+				category: mergeCategoryLocalOnly,
+			})
+			continue
+		}
+
+		if !localChanged && remoteChanged {
+			results = append(results, mergeFileResult{
+				path:     path,
+				category: mergeCategoryRemoteOnly,
+			})
+			continue
+		}
+
+		// Both sides changed. Check if they agree.
+		if filesEqual(local, remote) {
+			// Both made the same change — treat as remote-only (no conflict)
+			results = append(results, mergeFileResult{
+				path:     path,
+				category: mergeCategoryRemoteOnly,
+			})
+			continue
+		}
+
+		// Both changed differently. Classify the type of conflict.
+
+		// Case: one side deleted the file
+		if local == nil {
+			results = append(results, mergeFileResult{
+				path:     path,
+				category: mergeCategoryDeleteLocal,
+			})
+			continue
+		}
+		if remote == nil {
+			results = append(results, mergeFileResult{
+				path:     path,
+				category: mergeCategoryDeleteRemote,
+			})
+			continue
+		}
+
+		// Case: symlink changed on both sides differently
+		if local.IsSymlink || remote.IsSymlink {
+			results = append(results, mergeFileResult{
+				path:     path,
+				category: mergeCategoryBinaryConflict,
+			})
+			continue
+		}
+
+		// Case: binary file changed on both sides
+		if local.IsBinary || remote.IsBinary {
+			results = append(results, mergeFileResult{
+				path:     path,
+				category: mergeCategoryBinaryConflict,
+			})
+			continue
+		}
+
+		// Case: text file — run three-way merge
+		var baseContent []byte
+		if ancestor != nil {
+			baseContent = ancestor.Content
+		}
+		mergeResult := merge.ThreeWay(baseContent, local.Content, remote.Content, remoteName)
+
+		if mergeResult.HasConflicts {
+			results = append(results, mergeFileResult{
+				path:          path,
+				category:      mergeCategoryConflicted,
+				mergedData:    mergeResult.Content,
+				autoResolved:  mergeResult.AutoResolved,
+				conflictCount: len(mergeResult.Conflicts),
+			})
+		} else {
+			results = append(results, mergeFileResult{
+				path:         path,
+				category:     mergeCategoryAutoMerged,
+				mergedData:   mergeResult.Content,
+				autoResolved: mergeResult.AutoResolved,
+			})
+		}
+	}
+
+	// ─── Phase 3: Report merge results ────────────────────────────────
+
+	// Collect categorized files for reporting
+	var conflictedFiles []string
+	var autoMergedFiles []string
+	var localOnlyFiles []string
+	var remoteOnlyFiles []string
+	totalAutoResolved := 0
+
+	for _, res := range results {
+		switch res.category {
+		case mergeCategoryConflicted, mergeCategoryDeleteLocal, mergeCategoryDeleteRemote, mergeCategoryBinaryConflict:
+			conflictedFiles = append(conflictedFiles, res.path)
+		case mergeCategoryAutoMerged:
+			autoMergedFiles = append(autoMergedFiles, res.path)
+			totalAutoResolved += res.autoResolved
+		case mergeCategoryLocalOnly:
+			localOnlyFiles = append(localOnlyFiles, res.path)
+		case mergeCategoryRemoteOnly:
+			remoteOnlyFiles = append(remoteOnlyFiles, res.path)
 		}
 	}
 
 	fmt.Println()
-	if len(conflicts) > 0 {
-		fmt.Printf("Conflicting files: %s\n", styles.Redf("%d", len(conflicts)))
+	if len(autoMergedFiles) > 0 {
+		fmt.Printf("Auto-merged: %s (%d region(s) resolved)\n",
+			styles.Greenf("%d file(s)", len(autoMergedFiles)), totalAutoResolved)
 	}
-	if len(localOnlyChanges) > 0 {
-		fmt.Printf("Local-only changes: %d\n", len(localOnlyChanges))
+	if len(conflictedFiles) > 0 {
+		fmt.Printf("Conflicting files: %s\n", styles.Redf("%d", len(conflictedFiles)))
 	}
-	if len(remoteOnlyChanges) > 0 {
-		fmt.Printf("Remote-only changes: %d\n", len(remoteOnlyChanges))
+	if len(localOnlyFiles) > 0 {
+		fmt.Printf("Local-only changes: %d\n", len(localOnlyFiles))
 	}
+	if len(remoteOnlyFiles) > 0 {
+		fmt.Printf("Remote-only changes: %d\n", len(remoteOnlyFiles))
+	}
+
+	// ─── Phase 4: Delete diverged local data and pull remote ──────────
 
 	// Collect ALL commit IDs after common ancestor (local-only commits plus
 	// any previously-pulled remote commits that may be interleaved in the
@@ -414,26 +542,21 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 	}
 
 	// DELETE FIRST, THEN PULL — required by xpatch's append-only delta chain.
-	// Local changes are already loaded in memory (localTree) and the working
-	// directory files are untouched, so no data is lost.
+	// Local changes are already loaded in memory (localTree/results) and the
+	// working directory files are untouched, so no data is lost.
 	fmt.Println()
 	fmt.Println("Cleaning up diverged commits...")
 
-	// Step 1: Delete blobs (file_refs + truncate content chains) for all
-	// commits after the common ancestor
 	if len(allAfterIDs) > 0 {
 		if err := r.DB.DeleteBlobsForCommits(ctx, allAfterIDs); err != nil {
 			return fmt.Errorf("failed to clean up blobs: %w", err)
 		}
 	}
-
-	// Step 2: Delete commits by PK. xpatch cascade-deletes all rows with
-	// higher _xp_seq, so the first delete effectively truncates the chain.
 	if err := r.DB.DeleteCommits(ctx, allAfterIDs); err != nil {
 		return fmt.Errorf("failed to delete diverged commits: %w", err)
 	}
 
-	// Step 3: Pull remote commits fresh (they append to the truncated chain)
+	// Pull remote commits fresh (they append to the truncated chain)
 	fmt.Println("Pulling remote commits...")
 
 	const batchSize = 100
@@ -467,69 +590,35 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 	if err := r.DB.SetHead(ctx, remoteHeadCommit.ID); err != nil {
 		return err
 	}
-
-	// Update sync state
 	if err := r.DB.SetSyncState(ctx, remoteName, &remoteHeadCommit.ID); err != nil {
 		return err
 	}
 
-	// Update working directory
+	// ─── Phase 5: Update working directory ────────────────────────────
 	fmt.Println()
 	fmt.Println("Updating working directory...")
 
-	// Start merge state if we have conflicts
 	mergeState := &config.MergeState{
-		InProgress:     len(conflicts) > 0,
+		InProgress:     len(conflictedFiles) > 0,
 		RemoteName:     remoteName,
 		RemoteCommitID: remoteHeadCommit.ID,
 		LocalCommitID:  localHeadID,
 		CommonAncestor: commonAncestor,
 	}
 
-	// Write files to working directory
-	for _, blob := range remoteTree {
-		absPath := r.AbsPath(blob.Path)
+	// Process each merge result
+	for _, res := range results {
+		absPath := r.AbsPath(res.path)
 
-		// Check if this is a conflict
-		isConflict := false
-		for _, cp := range conflicts {
-			if cp == blob.Path {
-				isConflict = true
-				break
-			}
-		}
-
-		if isConflict {
-			// Write with conflict markers
-			localBlob := localFiles[blob.Path]
-			var localContent, remoteContent []byte
-			if localBlob != nil {
-				localContent = localBlob.Content
-			}
-			if blob.Content != nil {
-				remoteContent = blob.Content
-			}
-
-			if err := config.CreateConflictedFile(absPath, localContent, remoteContent, remoteName); err != nil {
-				return fmt.Errorf("failed to create conflicted file %s: %w", blob.Path, err)
-			}
-			mergeState.AddConflict(blob.Path)
-		} else {
-			// Check if local has changes we should preserve
-			isLocalOnly := false
-			for _, lp := range localOnlyChanges {
-				if lp == blob.Path {
-					isLocalOnly = true
-					break
-				}
-			}
-
-			if isLocalOnly {
-				// Keep local version (it's already in working dir)
+		switch res.category {
+		case mergeCategoryRemoteOnly:
+			// Write remote version
+			blob := remoteFiles[res.path]
+			if blob == nil {
+				// Remote deleted a file that was unchanged locally — remove it
+				_ = os.Remove(absPath)
 				continue
 			}
-
-			// Write remote version
 			if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
 				continue
 			}
@@ -539,15 +628,75 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 			} else if blob.Content != nil {
 				_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
 			}
-		}
-	}
 
-	// Also restore local-only files to working directory
-	for _, path := range localOnlyChanges {
-		if blob, ok := localFiles[path]; ok && blob.Content != nil {
-			absPath := r.AbsPath(path)
-			_ = os.MkdirAll(filepath.Dir(absPath), 0755)
-			_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+		case mergeCategoryLocalOnly:
+			// Keep local version — it's already in the working directory.
+			// Write it explicitly to ensure it's there (might have been
+			// deleted from working dir manually).
+			blob := localFiles[res.path]
+			if blob != nil && blob.Content != nil {
+				_ = os.MkdirAll(filepath.Dir(absPath), 0755)
+				_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+			}
+
+		case mergeCategoryAutoMerged:
+			// Three-way merge succeeded — write the merged content
+			if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+				continue
+			}
+			mode := os.FileMode(0644)
+			if remote := remoteFiles[res.path]; remote != nil {
+				mode = os.FileMode(remote.Mode)
+			}
+			_ = os.WriteFile(absPath, res.mergedData, mode)
+
+		case mergeCategoryConflicted:
+			// Three-way merge produced inline conflict markers — write as-is
+			if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+				continue
+			}
+			mode := os.FileMode(0644)
+			if remote := remoteFiles[res.path]; remote != nil {
+				mode = os.FileMode(remote.Mode)
+			}
+			_ = os.WriteFile(absPath, res.mergedData, mode)
+			mergeState.AddConflict(res.path)
+
+		case mergeCategoryBinaryConflict:
+			// Binary or symlink conflict — fall back to whole-file markers
+			local := localFiles[res.path]
+			remote := remoteFiles[res.path]
+			var localContent, remoteContent []byte
+			if local != nil {
+				localContent = local.Content
+			}
+			if remote != nil {
+				remoteContent = remote.Content
+			}
+			if err := config.CreateConflictedFile(absPath, localContent, remoteContent, remoteName); err != nil {
+				return fmt.Errorf("failed to create conflicted file %s: %w", res.path, err)
+			}
+			mergeState.AddConflict(res.path)
+
+		case mergeCategoryDeleteLocal:
+			// Local deleted the file, remote modified it — conflict.
+			// Write remote version and mark as conflicted so user decides.
+			remote := remoteFiles[res.path]
+			if remote != nil && remote.Content != nil {
+				_ = os.MkdirAll(filepath.Dir(absPath), 0755)
+				_ = os.WriteFile(absPath, remote.Content, os.FileMode(remote.Mode))
+			}
+			mergeState.AddConflict(res.path)
+
+		case mergeCategoryDeleteRemote:
+			// Remote deleted the file, local modified it — conflict.
+			// Keep local version and mark as conflicted so user decides.
+			local := localFiles[res.path]
+			if local != nil && local.Content != nil {
+				_ = os.MkdirAll(filepath.Dir(absPath), 0755)
+				_ = os.WriteFile(absPath, local.Content, os.FileMode(local.Mode))
+			}
+			mergeState.AddConflict(res.path)
 		}
 	}
 
@@ -556,27 +705,54 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 		return err
 	}
 
+	// ─── Phase 6: Report summary ──────────────────────────────────────
 	fmt.Println()
-	if len(conflicts) > 0 {
-		fmt.Println(styles.Warningf("CONFLICTS detected in %d file(s):", len(conflicts)))
+	if len(conflictedFiles) > 0 {
+		fmt.Println(styles.Warningf("CONFLICTS detected in %d file(s):", len(conflictedFiles)))
 		fmt.Println()
-		for _, f := range conflicts {
-			fmt.Printf("  %s %s\n", styles.Red("C"), f)
+		for _, res := range results {
+			switch res.category {
+			case mergeCategoryConflicted:
+				fmt.Printf("  %s %s (%d conflict(s), %d region(s) auto-resolved)\n",
+					styles.Red("C"), res.path, res.conflictCount, res.autoResolved)
+			case mergeCategoryBinaryConflict:
+				fmt.Printf("  %s %s (binary/symlink conflict)\n",
+					styles.Red("C"), res.path)
+			case mergeCategoryDeleteLocal:
+				fmt.Printf("  %s %s (deleted locally, modified remotely)\n",
+					styles.Red("C"), res.path)
+			case mergeCategoryDeleteRemote:
+				fmt.Printf("  %s %s (modified locally, deleted remotely)\n",
+					styles.Red("C"), res.path)
+			}
+		}
+		if len(autoMergedFiles) > 0 {
+			fmt.Println()
+			fmt.Printf("  Auto-merged %d file(s) successfully\n", len(autoMergedFiles))
 		}
 		fmt.Println()
 		fmt.Println("Fix the conflicts, then:")
 		fmt.Println("  pgit resolve <file>    # Mark file as resolved")
 		fmt.Println("  pgit add <file>        # Stage resolved file")
 		fmt.Println("  pgit commit -m \"...\"   # Complete the merge")
-	} else if len(localOnlyChanges) > 0 {
-		fmt.Println(styles.Successf("Merged successfully"))
-		fmt.Println()
-		fmt.Println("Your local changes are preserved in the working directory:")
-		for _, f := range localOnlyChanges {
-			fmt.Printf("  %s %s\n", styles.Yellow("M"), f)
+	} else if len(autoMergedFiles) > 0 || len(localOnlyFiles) > 0 {
+		fmt.Println(styles.Successf("Merged successfully (no conflicts)"))
+		if len(autoMergedFiles) > 0 {
+			fmt.Println()
+			fmt.Println("Auto-merged files:")
+			for _, f := range autoMergedFiles {
+				fmt.Printf("  %s %s\n", styles.Green("M"), f)
+			}
+		}
+		if len(localOnlyFiles) > 0 {
+			fmt.Println()
+			fmt.Println("Local-only changes preserved:")
+			for _, f := range localOnlyFiles {
+				fmt.Printf("  %s %s\n", styles.Yellow("M"), f)
+			}
 		}
 		fmt.Println()
-		fmt.Println("Stage and commit them when ready:")
+		fmt.Println("Stage and commit when ready:")
 		fmt.Println("  pgit add .")
 		fmt.Println("  pgit commit -m \"Merge with local changes\"")
 	} else {
