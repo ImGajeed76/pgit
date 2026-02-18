@@ -10,6 +10,7 @@ import (
 	"github.com/imgajeed76/pgit/v3/internal/ui"
 	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/jackc/pgx/v5"
 	"github.com/spf13/cobra"
 )
 
@@ -50,7 +51,7 @@ func runPush(cmd *cobra.Command, args []string) error {
 		return util.RemoteNotFoundError(remoteName)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	// Connect to local database
@@ -103,23 +104,13 @@ func runPush(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Check for divergence
+	// Check for divergence (no limit — just check if remote HEAD exists locally)
 	if remoteHeadID != "" && !force {
-		// Check if remote HEAD is an ancestor of local HEAD
-		localCommits, err := r.DB.GetCommitLogFrom(ctx, localHeadID, 1000)
+		localHasRemoteHead, err := r.DB.CommitExists(ctx, remoteHeadID)
 		if err != nil {
 			return err
 		}
-
-		isAncestor := false
-		for _, c := range localCommits {
-			if c.ID == remoteHeadID {
-				isAncestor = true
-				break
-			}
-		}
-
-		if !isAncestor {
+		if !localHasRemoteHead {
 			return util.NewError("Push rejected (non-fast-forward)").
 				WithMessage("Remote has commits that you don't have locally").
 				WithCauses(
@@ -133,26 +124,17 @@ func runPush(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Get commits to push
-	fmt.Println("Calculating commits to push...")
-
+	// Get commits to push — no limit
 	var commitsToPush []*db.Commit
-	localCommits, err := r.DB.GetCommitLogFrom(ctx, localHeadID, 1000)
+	if remoteHeadID == "" {
+		// First push: push everything
+		commitsToPush, err = r.DB.GetAllCommits(ctx)
+	} else {
+		// Incremental push: only commits after remote HEAD
+		commitsToPush, err = r.DB.GetCommitsAfter(ctx, remoteHeadID)
+	}
 	if err != nil {
 		return err
-	}
-
-	// Find commits that remote doesn't have
-	for _, c := range localCommits {
-		if remoteHeadID != "" && c.ID == remoteHeadID {
-			break
-		}
-		commitsToPush = append(commitsToPush, c)
-	}
-
-	// Reverse to push in correct order
-	for i, j := 0, len(commitsToPush)-1; i < j; i, j = i+1, j-1 {
-		commitsToPush[i], commitsToPush[j] = commitsToPush[j], commitsToPush[i]
 	}
 
 	if len(commitsToPush) == 0 {
@@ -162,26 +144,39 @@ func runPush(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Pushing %d commit(s)...\n", len(commitsToPush))
 
-	// Push commits and blobs
+	// Push in batches of 100, each batch wrapped in a transaction
+	const batchSize = 100
 	progress := ui.NewProgress("Pushing", len(commitsToPush))
-	for i, commit := range commitsToPush {
-		progress.Update(i)
-		fmt.Printf("\r\033[K  [%d/%d] %s %s\n", i+1, len(commitsToPush),
-			styles.Yellow(util.ShortID(commit.ID)), firstLine(commit.Message))
 
-		// Create commit on remote
-		if err := remoteDB.CreateCommit(ctx, commit); err != nil {
-			return fmt.Errorf("failed to push commit %s: %w", util.ShortID(commit.ID), err)
-		}
+	for i := 0; i < len(commitsToPush); i += batchSize {
+		end := min(i+batchSize, len(commitsToPush))
+		batch := commitsToPush[i:end]
 
-		// Get and push blobs for this commit
-		blobs, err := r.DB.GetBlobsAtCommit(ctx, commit.ID)
+		err := remoteDB.WithTx(ctx, func(tx pgx.Tx) error {
+			// Insert commits via COPY on tx
+			if err := remoteDB.CreateCommitsBatchTx(ctx, tx, batch); err != nil {
+				return fmt.Errorf("failed to push commits: %w", err)
+			}
+
+			// Insert blobs per commit within same tx
+			for _, commit := range batch {
+				blobs, err := r.DB.GetBlobsAtCommit(ctx, commit.ID)
+				if err != nil {
+					return err
+				}
+				if len(blobs) > 0 {
+					if err := remoteDB.CreateBlobsTx(ctx, tx, blobs); err != nil {
+						return fmt.Errorf("failed to push blobs for %s: %w", util.ShortID(commit.ID), err)
+					}
+				}
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		if err := remoteDB.CreateBlobs(ctx, blobs); err != nil {
-			return fmt.Errorf("failed to push blobs for %s: %w", util.ShortID(commit.ID), err)
-		}
+
+		progress.Update(end)
 	}
 	progress.Done()
 

@@ -44,6 +44,7 @@ Use -- to separate commits from paths:
 	cmd.Flags().Bool("stat", false, "Show diffstat summary")
 	cmd.Flags().Bool("no-color", false, "Disable colored output")
 	cmd.Flags().IntP("unified", "U", 3, "Number of lines of unified diff context")
+	cmd.Flags().String("remote", "", "Diff commits on a remote database (e.g. 'origin'). Requires commit range.")
 
 	return cmd
 }
@@ -57,20 +58,17 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	noColor, _ := cmd.Flags().GetBool("no-color")
 	contextLines, _ := cmd.Flags().GetInt("unified")
 
+	remoteName, _ := cmd.Flags().GetString("remote")
+
 	if cached {
 		staged = true
-	}
-
-	r, err := repo.Open()
-	if err != nil {
-		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Connect to database
-	if err := r.Connect(ctx); err != nil {
+	r, err := connectForCommand(ctx, remoteName)
+	if err != nil {
 		return err
 	}
 	defer r.Close()
@@ -112,6 +110,15 @@ func runDiff(cmd *cobra.Command, args []string) error {
 		// Two commits specified
 		fromCommit = commits[0]
 		toCommit = commits[1]
+	}
+
+	// Remote mode: only commit-to-commit diff is supported
+	if remoteName != "" {
+		if fromCommit == "" || toCommit == "" {
+			return util.NewError("Remote diff requires a commit range").
+				WithMessage("Working tree diff is not available for remote databases").
+				WithSuggestion("pgit diff <commit1>..<commit2> --remote " + remoteName)
+		}
 	}
 
 	// If we have commit refs, do commit-to-commit diff

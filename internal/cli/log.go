@@ -14,7 +14,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
 	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
@@ -45,6 +44,7 @@ Use --graph for ASCII commit graph visualization.`,
 	cmd.Flags().Bool("graph", false, "Show ASCII commit graph")
 	cmd.Flags().Bool("no-pager", false, "Disable interactive pager")
 	cmd.Flags().Bool("json", false, "Output in JSON format")
+	cmd.Flags().String("remote", "", "Show log from a remote database (e.g. 'origin')")
 
 	return cmd
 }
@@ -60,15 +60,13 @@ func runLog(cmd *cobra.Command, args []string) error {
 		maxCount = 1000 // Default limit
 	}
 
-	r, err := repo.Open()
-	if err != nil {
-		return err
-	}
+	remoteName, _ := cmd.Flags().GetString("remote")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := r.Connect(ctx); err != nil {
+	r, err := connectForCommand(ctx, remoteName)
+	if err != nil {
 		return err
 	}
 	defer r.Close()

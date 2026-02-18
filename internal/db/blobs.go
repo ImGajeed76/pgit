@@ -174,6 +174,175 @@ func (db *DB) CreateBlobs(ctx context.Context, blobs []*Blob) error {
 	})
 }
 
+// CreateBlobsTx inserts multiple blobs within an existing transaction.
+// Same logic as CreateBlobs but uses the provided tx instead of creating its own.
+func (db *DB) CreateBlobsTx(ctx context.Context, tx pgx.Tx, blobs []*Blob) error {
+	if len(blobs) == 0 {
+		return nil
+	}
+
+	// Collect all unique paths
+	pathSet := make(map[string]bool)
+	for _, b := range blobs {
+		pathSet[b.Path] = true
+	}
+	paths := make([]string, 0, len(pathSet))
+	for p := range pathSet {
+		paths = append(paths, p)
+	}
+
+	// Batch get/create paths
+	pathToGroupID, err := db.getOrCreatePathsBatchTx(ctx, tx, paths)
+	if err != nil {
+		return err
+	}
+
+	// Group blobs by path to assign sequential version IDs
+	blobsByPath := make(map[string][]*Blob)
+	for _, b := range blobs {
+		blobsByPath[b.Path] = append(blobsByPath[b.Path], b)
+	}
+
+	// Get current max version_id for each group
+	groupIDs := make([]int32, 0, len(pathToGroupID))
+	for _, gid := range pathToGroupID {
+		groupIDs = append(groupIDs, gid)
+	}
+	maxVersions, err := db.getMaxVersionIDsBatchTx(ctx, tx, groupIDs)
+	if err != nil {
+		return err
+	}
+
+	// Prepare batch inserts
+	var fileRefs []*FileRef
+	var contents []*Content
+
+	for path, pathBlobs := range blobsByPath {
+		groupID := pathToGroupID[path]
+		baseVersion := maxVersions[groupID]
+
+		for i, b := range pathBlobs {
+			versionID := baseVersion + int32(i) + 1
+
+			fileRefs = append(fileRefs, &FileRef{
+				GroupID:       groupID,
+				CommitID:      b.CommitID,
+				VersionID:     versionID,
+				ContentHash:   b.ContentHash,
+				Mode:          b.Mode,
+				IsSymlink:     b.IsSymlink,
+				SymlinkTarget: b.SymlinkTarget,
+				IsBinary:      b.IsBinary,
+			})
+
+			if b.ContentHash != nil {
+				contents = append(contents, &Content{
+					GroupID:   groupID,
+					VersionID: versionID,
+					Content:   b.Content,
+					IsBinary:  b.IsBinary,
+				})
+			}
+		}
+	}
+
+	if err := db.createFileRefsBatchTx(ctx, tx, fileRefs); err != nil {
+		return err
+	}
+	if err := db.createContentsBatchTx(ctx, tx, contents); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// DeleteBlobsForCommits removes all file_refs and content data for the given
+// commit IDs. For xpatch content tables, it truncates each affected file's
+// chain at the lowest version_id being removed (xpatch cascade-deletes the rest).
+// This must be called BEFORE DeleteCommits since we need the commit data
+// to identify which content versions to clean up.
+func (db *DB) DeleteBlobsForCommits(ctx context.Context, commitIDs []string) error {
+	if len(commitIDs) == 0 {
+		return nil
+	}
+
+	// Step 1: Get (group_id, version_id, is_binary) for all file_refs being removed.
+	// This tells us which content chain entries to truncate.
+	type versionInfo struct {
+		groupID   int32
+		versionID int32
+		isBinary  bool
+	}
+
+	// Find the minimum version_id per group among the commits being deleted.
+	// Deleting that version from the xpatch content table cascades to all later versions.
+	minVersionByGroup := make(map[int32]versionInfo) // group_id -> lowest versionInfo to delete
+
+	for _, cid := range commitIDs {
+		rows, err := db.Query(ctx,
+			"SELECT group_id, version_id, is_binary FROM pgit_file_refs WHERE commit_id = $1", cid)
+		if err != nil {
+			return fmt.Errorf("failed to query file_refs for commit %s: %w", cid, err)
+		}
+
+		for rows.Next() {
+			var vi versionInfo
+			if err := rows.Scan(&vi.groupID, &vi.versionID, &vi.isBinary); err != nil {
+				rows.Close()
+				return err
+			}
+			if existing, ok := minVersionByGroup[vi.groupID]; !ok || vi.versionID < existing.versionID {
+				minVersionByGroup[vi.groupID] = vi
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+
+	// Step 2: Truncate content chains. For each group, delete the row at the
+	// minimum version_id — xpatch cascades to all subsequent versions.
+	for _, vi := range minVersionByGroup {
+		table := "pgit_text_content"
+		if vi.isBinary {
+			table = "pgit_binary_content"
+		}
+		// Only delete if content exists (deleted files have no content row)
+		var exists bool
+		err := db.QueryRow(ctx,
+			fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE group_id = $1 AND version_id = $2)", table),
+			vi.groupID, vi.versionID,
+		).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if err := db.Exec(ctx,
+				fmt.Sprintf("DELETE FROM %s WHERE group_id = $1 AND version_id = $2", table),
+				vi.groupID, vi.versionID,
+			); err != nil {
+				return fmt.Errorf("failed to truncate content for group %d: %w", vi.groupID, err)
+			}
+		}
+	}
+
+	// Step 3: Delete file_refs (normal heap table, simple delete)
+	for _, cid := range commitIDs {
+		if err := db.Exec(ctx, "DELETE FROM pgit_file_refs WHERE commit_id = $1", cid); err != nil {
+			return fmt.Errorf("failed to delete file_refs for commit %s: %w", cid, err)
+		}
+	}
+
+	// Note: xpatch stats for content tables become stale after deletion.
+	// We don't refresh them here since refresh_stats() is table-wide (scans
+	// all groups) and content tables have thousands of groups. The stats
+	// are only used for display (pgit stats) and self-correct on next refresh.
+	// The caller should refresh pgit_commits stats separately (single group, cheap).
+
+	return nil
+}
+
 // getOrCreatePathsBatchTx handles multiple paths within a transaction.
 func (db *DB) getOrCreatePathsBatchTx(ctx context.Context, tx pgx.Tx, paths []string) (map[string]int32, error) {
 	if len(paths) == 0 {

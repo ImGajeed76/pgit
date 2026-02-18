@@ -13,7 +13,6 @@ import (
 	"github.com/imgajeed76/pgit/v3/internal/repo"
 	"github.com/imgajeed76/pgit/v3/internal/ui"
 	"github.com/imgajeed76/pgit/v3/internal/ui/table"
-	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -218,41 +217,7 @@ func matchPath(pattern, path string) bool {
 // connectRepo opens and connects to the repository database.
 // If remoteName is non-empty, connects to that remote instead of the local database.
 func connectRepo(ctx context.Context, remoteName string) (*repo.Repository, error) {
-	r, err := repo.Open()
-	if err != nil {
-		return nil, err
-	}
-
-	if remoteName == "" {
-		// Local connection (existing behavior)
-		if err := r.Connect(ctx); err != nil {
-			return nil, err
-		}
-	} else {
-		// Remote connection
-		remote, exists := r.Config.GetRemote(remoteName)
-		if !exists {
-			return nil, util.RemoteNotFoundError(remoteName)
-		}
-		remoteDB, err := r.ConnectTo(ctx, remote.URL)
-		if err != nil {
-			return nil, util.DatabaseConnectionError(remote.URL, err)
-		}
-		// Check schema exists on remote
-		schemaExists, err := remoteDB.SchemaExists(ctx)
-		if err != nil {
-			remoteDB.Close()
-			return nil, err
-		}
-		if !schemaExists {
-			remoteDB.Close()
-			return nil, util.NewError("Remote database has no pgit schema").
-				WithMessage(fmt.Sprintf("The remote '%s' exists but has no pgit data", remoteName)).
-				WithSuggestion(fmt.Sprintf("pgit push %s  # Push your repository first", remoteName))
-		}
-		r.DB = remoteDB
-	}
-	return r, nil
+	return connectForCommand(ctx, remoteName)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

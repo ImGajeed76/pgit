@@ -6,14 +6,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/repo"
 	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/imgajeed76/pgit/v3/internal/util"
 	"github.com/spf13/cobra"
 )
 
 func newBlameCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "blame <file>",
 		Short: "Show what revision and author last modified each line",
 		Long: `Show what revision and author last modified each line of a file.
@@ -27,21 +26,20 @@ For each line, shows:
 		Args: cobra.ExactArgs(1),
 		RunE: runBlame,
 	}
+	cmd.Flags().String("remote", "", "Blame file on a remote database (e.g. 'origin')")
+	return cmd
 }
 
 func runBlame(cmd *cobra.Command, args []string) error {
 	path := args[0]
 
-	r, err := repo.Open()
-	if err != nil {
-		return err
-	}
+	remoteName, _ := cmd.Flags().GetString("remote")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Connect to database
-	if err := r.Connect(ctx); err != nil {
+	r, err := connectForCommand(ctx, remoteName)
+	if err != nil {
 		return err
 	}
 	defer r.Close()

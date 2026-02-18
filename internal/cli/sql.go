@@ -43,6 +43,7 @@ Use with caution - this can corrupt your repository!`,
 	cmd.Flags().Bool("json", false, "Output results as JSON array")
 	cmd.Flags().Bool("no-pager", false, "Disable interactive table view")
 	cmd.Flags().Int("timeout", 60, "Query timeout in seconds")
+	cmd.Flags().String("remote", "", "Run query against a remote database (e.g. 'origin')")
 
 	// Add subcommands
 	cmd.AddCommand(newSQLSchemaCmd())
@@ -376,16 +377,17 @@ func runSQL(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("write operation not allowed")
 	}
 
-	r, err := repo.Open()
-	if err != nil {
-		return err
+	remoteName, _ := cmd.Flags().GetString("remote")
+
+	if isWrite && remoteName != "" {
+		fmt.Println(styles.WarningText("WARNING: Writing directly to remote database!"))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	// Connect to database
-	if err := r.Connect(ctx); err != nil {
+	r, err := connectForCommand(ctx, remoteName)
+	if err != nil {
 		return err
 	}
 	defer r.Close()
@@ -498,6 +500,7 @@ func newStatsCmd() *cobra.Command {
 
 	cmd.Flags().Bool("xpatch", false, "Include detailed pg-xpatch compression stats (slower)")
 	cmd.Flags().Bool("json", false, "Output in JSON format")
+	cmd.Flags().String("remote", "", "Show stats for a remote database (e.g. 'origin')")
 
 	return cmd
 }
@@ -506,16 +509,13 @@ func runStats(cmd *cobra.Command, args []string) error {
 	showXpatch, _ := cmd.Flags().GetBool("xpatch")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 
-	r, err := repo.Open()
-	if err != nil {
-		return err
-	}
+	remoteName, _ := cmd.Flags().GetString("remote")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Connect to database
-	if err := r.Connect(ctx); err != nil {
+	r, err := connectForCommand(ctx, remoteName)
+	if err != nil {
 		return err
 	}
 	defer r.Close()

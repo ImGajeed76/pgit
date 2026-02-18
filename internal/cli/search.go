@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
 	"github.com/imgajeed76/pgit/v3/internal/ui"
 	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
 	"github.com/imgajeed76/pgit/v3/internal/util"
@@ -48,6 +47,7 @@ Examples:
 	cmd.Flags().Bool("all", false, "Search all versions (not just latest per file)")
 	cmd.Flags().String("commit", "", "Search only at specific commit")
 	cmd.Flags().Bool("no-group", false, "Don't group identical matches across versions (only with --all)")
+	cmd.Flags().String("remote", "", "Search a remote database (e.g. 'origin')")
 
 	return cmd
 }
@@ -81,15 +81,13 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid pattern: %w", err)
 	}
 
-	r, err := repo.Open()
-	if err != nil {
-		return err
-	}
+	remoteName, _ := cmd.Flags().GetString("remote")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	if err := r.Connect(ctx); err != nil {
+	r, err := connectForCommand(ctx, remoteName)
+	if err != nil {
 		return err
 	}
 	defer r.Close()

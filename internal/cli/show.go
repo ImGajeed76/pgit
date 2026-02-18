@@ -33,6 +33,7 @@ Examples:
 	cmd.Flags().Bool("stat", false, "Show diffstat instead of full diff")
 	cmd.Flags().Bool("no-patch", false, "Suppress diff output")
 	cmd.Flags().IntP("unified", "U", 3, "Number of lines of unified diff context")
+	cmd.Flags().String("remote", "", "Show object from a remote database (e.g. 'origin')")
 
 	return cmd
 }
@@ -42,15 +43,13 @@ func runShow(cmd *cobra.Command, args []string) error {
 	noPatch, _ := cmd.Flags().GetBool("no-patch")
 	contextLines, _ := cmd.Flags().GetInt("unified")
 
-	r, err := repo.Open()
-	if err != nil {
-		return err
-	}
+	remoteName, _ := cmd.Flags().GetString("remote")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := r.Connect(ctx); err != nil {
+	r, err := connectForCommand(ctx, remoteName)
+	if err != nil {
 		return err
 	}
 	defer r.Close()

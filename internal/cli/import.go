@@ -52,6 +52,7 @@ The current directory must be a pgit repository (run 'pgit init' first).`,
 	cmd.Flags().BoolP("dry-run", "n", false, "Show what would be imported without actually importing")
 	cmd.Flags().BoolP("force", "f", false, "Overwrite existing data in database")
 	cmd.Flags().StringP("branch", "b", "", "Branch to import (default: current branch, or interactive picker)")
+	cmd.Flags().String("remote", "", "Import directly into a remote database (e.g. 'origin'), skipping local container")
 
 	return cmd
 }
@@ -151,17 +152,49 @@ func runImport(cmd *cobra.Command, args []string) error {
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	force, _ := cmd.Flags().GetBool("force")
 
+	remoteName, _ := cmd.Flags().GetString("remote")
+	isRemote := remoteName != ""
+
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
 	defer cancel()
 
 	// Connect to database
-	if err := r.StartContainer(); err != nil {
-		return err
+	if isRemote {
+		// Remote mode: connect directly to remote, skip container
+		remote, exists := r.Config.GetRemote(remoteName)
+		if !exists {
+			return util.RemoteNotFoundError(remoteName)
+		}
+
+		remoteDB, err := r.ConnectTo(ctx, remote.URL)
+		if err != nil {
+			return util.DatabaseConnectionError(remote.URL, err)
+		}
+		defer remoteDB.Close()
+
+		r.DB = remoteDB
+
+		// Initialize schema if needed
+		schemaExists, err := remoteDB.SchemaExists(ctx)
+		if err != nil {
+			return err
+		}
+		if !schemaExists {
+			fmt.Println("Initializing remote schema...")
+			if err := remoteDB.InitSchema(ctx); err != nil {
+				return err
+			}
+		}
+	} else {
+		// Local mode (existing behavior)
+		if err := r.StartContainer(); err != nil {
+			return err
+		}
+		if err := r.Connect(ctx); err != nil {
+			return err
+		}
+		defer r.Close()
 	}
-	if err := r.Connect(ctx); err != nil {
-		return err
-	}
-	defer r.Close()
 
 	fmt.Printf("Importing from: %s\n", styles.Cyan(gitPath))
 	fmt.Printf("Workers: %d\n", workers)
@@ -329,35 +362,44 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 7: Checkout working tree
+	// Step 7: Checkout working tree (local only)
 	// ═══════════════════════════════════════════════════════════════════════
 
-	fmt.Printf("\nChecking out files...\n")
-	tree, err := r.DB.GetTreeAtCommit(ctx, latestCommit.ID)
-	if err != nil {
-		return fmt.Errorf("failed to get tree: %w", err)
-	}
-
-	for _, blob := range tree {
-		absPath := r.AbsPath(blob.Path)
-
-		// Ensure directory exists
-		if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
-			continue
+	if !isRemote {
+		fmt.Printf("\nChecking out files...\n")
+		tree, err := r.DB.GetTreeAtCommit(ctx, latestCommit.ID)
+		if err != nil {
+			return fmt.Errorf("failed to get tree: %w", err)
 		}
 
-		// Write file
-		if blob.IsSymlink && blob.SymlinkTarget != nil {
-			os.Remove(absPath)
-			_ = os.Symlink(*blob.SymlinkTarget, absPath)
-		} else {
-			_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+		for _, blob := range tree {
+			absPath := r.AbsPath(blob.Path)
+
+			// Ensure directory exists
+			if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+				continue
+			}
+
+			// Write file
+			if blob.IsSymlink && blob.SymlinkTarget != nil {
+				os.Remove(absPath)
+				_ = os.Symlink(*blob.SymlinkTarget, absPath)
+			} else {
+				_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
+			}
 		}
 	}
 
-	fmt.Printf("\n%s Imported %s commits from git repository\n",
-		styles.Green("Success!"),
-		ui.FormatCount(len(commitEntries)))
+	if isRemote {
+		fmt.Printf("\n%s Imported %s commits to remote '%s'\n",
+			styles.Green("Success!"),
+			ui.FormatCount(len(commitEntries)),
+			remoteName)
+	} else {
+		fmt.Printf("\n%s Imported %s commits from git repository\n",
+			styles.Green("Success!"),
+			ui.FormatCount(len(commitEntries)))
+	}
 	fmt.Printf("HEAD is now at %s %s\n",
 		styles.Hash(latestCommit.ID, true),
 		firstLine(latestCommit.Message))

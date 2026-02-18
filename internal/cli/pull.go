@@ -81,7 +81,7 @@ func runPull(cmd *cobra.Command, args []string) error {
 		return util.RemoteNotFoundError(remoteName)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	// Connect to local database
@@ -122,86 +122,152 @@ func runPull(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Get all remote commits
-	remoteCommits, err := remoteDB.GetCommitLogFrom(ctx, remoteHeadID, 10000)
-	if err != nil {
-		return err
-	}
-
-	// Check for divergence
-	var localCommits []*db.Commit
-	if localHeadID != "" {
-		localCommits, err = r.DB.GetCommitLogFrom(ctx, localHeadID, 10000)
+	// Determine relationship between local and remote
+	if localHeadID == "" {
+		// Local is empty — full fast-forward
+		newCommits, err := remoteDB.GetAllCommits(ctx)
 		if err != nil {
 			return err
 		}
-	}
-
-	// Find common ancestor
-	localIDs := make(map[string]bool)
-	for _, c := range localCommits {
-		localIDs[c.ID] = true
-	}
-
-	var commonAncestor string
-	var newCommits []*db.Commit
-	for _, c := range remoteCommits {
-		if localIDs[c.ID] {
-			commonAncestor = c.ID
-			break
-		}
-		newCommits = append(newCommits, c)
-	}
-
-	// Reverse to get oldest first
-	for i, j := 0, len(newCommits)-1; i < j; i, j = i+1, j-1 {
-		newCommits[i], newCommits[j] = newCommits[j], newCommits[i]
-	}
-
-	if len(newCommits) == 0 {
-		fmt.Println("Already up to date")
-		return nil
-	}
-
-	// Check if this is a fast-forward
-	isFF := localHeadID == "" || commonAncestor == localHeadID
-
-	if isFF {
-		// Fast-forward: just add commits
 		fmt.Printf("Fast-forward: %d new commit(s)\n", len(newCommits))
 		return pullFastForward(ctx, r, remoteDB, newCommits, remoteName)
 	}
 
-	// Diverged: need to handle conflicts
-	fmt.Println(styles.Warningf("Histories have diverged"))
-	fmt.Printf("Common ancestor: %s\n", styles.Yellow(util.ShortID(commonAncestor)))
-
-	if useRebase {
-		return pullRebase(ctx, r, remoteDB, localHeadID, localCommits, newCommits, commonAncestor, remoteName)
+	// Check if this is a fast-forward (local HEAD exists on remote as ancestor)
+	localExistsOnRemote, err := remoteDB.CommitExists(ctx, localHeadID)
+	if err != nil {
+		return err
 	}
 
-	return pullDiverged(ctx, r, remoteDB, localHeadID, localCommits, newCommits, commonAncestor, remoteName)
-}
-
-func pullFastForward(ctx context.Context, r *repo.Repository, remoteDB *db.DB, commits []*db.Commit, remoteName string) error {
-	for i, commit := range commits {
-		fmt.Printf("  [%d/%d] %s %s\n", i+1, len(commits),
-			styles.Yellow(util.ShortID(commit.ID)), firstLine(commit.Message))
-
-		// Create commit locally
-		if err := r.DB.CreateCommit(ctx, commit); err != nil {
-			return fmt.Errorf("failed to create commit %s: %w", util.ShortID(commit.ID), err)
-		}
-
-		// Get and create blobs
-		blobs, err := remoteDB.GetBlobsAtCommit(ctx, commit.ID)
+	if localExistsOnRemote {
+		// Fast-forward: remote has everything we have, plus more
+		newCommits, err := remoteDB.GetCommitsAfter(ctx, localHeadID)
 		if err != nil {
 			return err
 		}
-		if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
-			return fmt.Errorf("failed to create blobs for %s: %w", util.ShortID(commit.ID), err)
+		if len(newCommits) == 0 {
+			fmt.Println("Already up to date")
+			return nil
 		}
+		fmt.Printf("Fast-forward: %d new commit(s)\n", len(newCommits))
+		return pullFastForward(ctx, r, remoteDB, newCommits, remoteName)
 	}
+
+	// Check if remote HEAD exists locally (we're ahead, nothing to pull)
+	remoteExistsLocally, err := r.DB.CommitExists(ctx, remoteHeadID)
+	if err != nil {
+		return err
+	}
+	if remoteExistsLocally {
+		fmt.Println("Already up to date (local is ahead of remote)")
+		return nil
+	}
+
+	// Diverged: find common ancestor via cross-DB walk
+	commonAncestor, err := findCommonAncestorCrossDB(ctx, r.DB, remoteDB, remoteHeadID)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(styles.Warningf("Histories have diverged"))
+	if commonAncestor != "" {
+		fmt.Printf("Common ancestor: %s\n", styles.Yellow(util.ShortID(commonAncestor)))
+	}
+
+	// Get new remote commits since common ancestor
+	var newRemoteCommits []*db.Commit
+	if commonAncestor == "" {
+		newRemoteCommits, err = remoteDB.GetAllCommits(ctx)
+	} else {
+		newRemoteCommits, err = remoteDB.GetCommitsAfter(ctx, commonAncestor)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Get local commits since common ancestor
+	var localCommitsAfter []*db.Commit
+	if commonAncestor == "" {
+		localCommitsAfter, err = r.DB.GetAllCommits(ctx)
+	} else {
+		localCommitsAfter, err = r.DB.GetCommitsAfter(ctx, commonAncestor)
+	}
+	if err != nil {
+		return err
+	}
+
+	if useRebase {
+		return pullRebase(ctx, r, remoteDB, localHeadID, localCommitsAfter, newRemoteCommits, commonAncestor, remoteName)
+	}
+
+	return pullDiverged(ctx, r, remoteDB, localHeadID, localCommitsAfter, newRemoteCommits, commonAncestor, remoteName)
+}
+
+// findCommonAncestorCrossDB finds the latest commit that exists in both databases.
+// Walks remote commits backward (newest first) and checks each against local.
+// Returns the common ancestor ID (may be empty if no common history).
+func findCommonAncestorCrossDB(ctx context.Context, localDB, remoteDB *db.DB, remoteHeadID string) (string, error) {
+	pageSize := 500
+	currentID := remoteHeadID
+
+	for {
+		remoteCommits, err := remoteDB.GetCommitLogFrom(ctx, currentID, pageSize)
+		if err != nil {
+			return "", err
+		}
+		if len(remoteCommits) == 0 {
+			return "", nil // No common ancestor found
+		}
+
+		for _, rc := range remoteCommits {
+			exists, err := localDB.CommitExists(ctx, rc.ID)
+			if err != nil {
+				return "", err
+			}
+			if exists {
+				return rc.ID, nil
+			}
+		}
+
+		// Move to next page: oldest commit in this page
+		lastCommit := remoteCommits[len(remoteCommits)-1]
+		if lastCommit.ParentID == nil {
+			return "", nil // Reached root of remote, no common ancestor
+		}
+		currentID = *lastCommit.ParentID
+	}
+}
+
+func pullFastForward(ctx context.Context, r *repo.Repository, remoteDB *db.DB, commits []*db.Commit, remoteName string) error {
+	// Batched insertion: 100 commits per batch
+	const batchSize = 100
+	progress := ui.NewProgress("Pulling", len(commits))
+
+	for i := 0; i < len(commits); i += batchSize {
+		end := min(i+batchSize, len(commits))
+		batch := commits[i:end]
+
+		// Batch insert commits
+		if err := r.DB.CreateCommitsBatch(ctx, batch); err != nil {
+			return fmt.Errorf("failed to create commits: %w", err)
+		}
+
+		// Insert blobs per commit
+		for _, commit := range batch {
+			blobs, err := remoteDB.GetBlobsAtCommit(ctx, commit.ID)
+			if err != nil {
+				return err
+			}
+			if len(blobs) > 0 {
+				if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
+					return fmt.Errorf("failed to create blobs for %s: %w", util.ShortID(commit.ID), err)
+				}
+			}
+		}
+
+		progress.Update(end)
+	}
+	progress.Done()
 
 	// Update HEAD
 	lastCommit := commits[len(commits)-1]
@@ -241,16 +307,7 @@ func pullFastForward(ctx context.Context, r *repo.Repository, remoteDB *db.DB, c
 }
 
 func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localHeadID string, localCommits, remoteCommits []*db.Commit, commonAncestor, remoteName string) error {
-	// Find local commits after common ancestor
-	var localToReapply []*db.Commit
-	for _, c := range localCommits {
-		if c.ID == commonAncestor {
-			break
-		}
-		localToReapply = append(localToReapply, c)
-	}
-
-	fmt.Printf("Local commits since divergence: %d\n", len(localToReapply))
+	fmt.Printf("Local commits since divergence: %d\n", len(localCommits))
 	fmt.Printf("Remote commits to pull: %d\n", len(remoteCommits))
 
 	// Get trees for conflict detection
@@ -337,38 +394,74 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 		fmt.Printf("Remote-only changes: %d\n", len(remoteOnlyChanges))
 	}
 
-	// Delete local commits after common ancestor
-	fmt.Println()
-	fmt.Println("Resetting to common ancestor...")
-	if commonAncestor != "" {
-		for _, c := range localToReapply {
-			if err := r.DB.DeleteCommitsAfter(ctx, c.ID); err != nil {
-				return err
-			}
-		}
-		if err := r.DB.SetHead(ctx, commonAncestor); err != nil {
-			return err
-		}
+	// Collect ALL commit IDs after common ancestor (local-only commits plus
+	// any previously-pulled remote commits that may be interleaved in the
+	// xpatch chain). We need these to clean up file_refs and content.
+	var allAfterIDs []string
+	for _, c := range localCommits {
+		allAfterIDs = append(allAfterIDs, c.ID)
 	}
-
-	// Pull remote commits
-	fmt.Println("Pulling remote commits...")
-	for i, commit := range remoteCommits {
-		fmt.Printf("  [%d/%d] %s %s\n", i+1, len(remoteCommits),
-			styles.Yellow(util.ShortID(commit.ID)), firstLine(commit.Message))
-
-		if err := r.DB.CreateCommit(ctx, commit); err != nil {
-			return fmt.Errorf("failed to create commit %s: %w", util.ShortID(commit.ID), err)
-		}
-
-		blobs, err := remoteDB.GetBlobsAtCommit(ctx, commit.ID)
+	// Also include any remote commits that already exist locally from a
+	// previous partial pull — they'll be re-pulled fresh after truncation.
+	for _, rc := range remoteCommits {
+		exists, err := r.DB.CommitExists(ctx, rc.ID)
 		if err != nil {
 			return err
 		}
-		if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
-			return fmt.Errorf("failed to create blobs for %s: %w", util.ShortID(commit.ID), err)
+		if exists {
+			allAfterIDs = append(allAfterIDs, rc.ID)
 		}
 	}
+
+	// DELETE FIRST, THEN PULL — required by xpatch's append-only delta chain.
+	// Local changes are already loaded in memory (localTree) and the working
+	// directory files are untouched, so no data is lost.
+	fmt.Println()
+	fmt.Println("Cleaning up diverged commits...")
+
+	// Step 1: Delete blobs (file_refs + truncate content chains) for all
+	// commits after the common ancestor
+	if len(allAfterIDs) > 0 {
+		if err := r.DB.DeleteBlobsForCommits(ctx, allAfterIDs); err != nil {
+			return fmt.Errorf("failed to clean up blobs: %w", err)
+		}
+	}
+
+	// Step 2: Delete commits by PK. xpatch cascade-deletes all rows with
+	// higher _xp_seq, so the first delete effectively truncates the chain.
+	if err := r.DB.DeleteCommits(ctx, allAfterIDs); err != nil {
+		return fmt.Errorf("failed to delete diverged commits: %w", err)
+	}
+
+	// Step 3: Pull remote commits fresh (they append to the truncated chain)
+	fmt.Println("Pulling remote commits...")
+
+	const batchSize = 100
+	progress := ui.NewProgress("Pulling", len(remoteCommits))
+
+	for i := 0; i < len(remoteCommits); i += batchSize {
+		end := min(i+batchSize, len(remoteCommits))
+		batch := remoteCommits[i:end]
+
+		if err := r.DB.CreateCommitsBatch(ctx, batch); err != nil {
+			return fmt.Errorf("failed to create commits: %w", err)
+		}
+
+		for _, commit := range batch {
+			blobs, err := remoteDB.GetBlobsAtCommit(ctx, commit.ID)
+			if err != nil {
+				return err
+			}
+			if len(blobs) > 0 {
+				if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
+					return fmt.Errorf("failed to create blobs for %s: %w", util.ShortID(commit.ID), err)
+				}
+			}
+		}
+
+		progress.Update(end)
+	}
+	progress.Done()
 
 	// Update HEAD to remote
 	if err := r.DB.SetHead(ctx, remoteHeadCommit.ID); err != nil {
@@ -495,27 +588,20 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 
 // pullRebase rebases local commits on top of remote
 func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localHeadID string, localCommits, remoteCommits []*db.Commit, commonAncestor, remoteName string) error {
-	// Find local commits after common ancestor (in reverse order - oldest first for replay)
-	var localToReplay []*db.Commit
-	for _, c := range localCommits {
-		if c.ID == commonAncestor {
-			break
-		}
-		localToReplay = append(localToReplay, c)
-	}
-	// Reverse to get oldest first
-	for i, j := 0, len(localToReplay)-1; i < j; i, j = i+1, j-1 {
-		localToReplay[i], localToReplay[j] = localToReplay[j], localToReplay[i]
-	}
+	fmt.Printf("Rebasing %d local commit(s) onto remote\n", len(localCommits))
 
-	fmt.Printf("Rebasing %d local commit(s) onto remote\n", len(localToReplay))
-
-	// Delete local commits after common ancestor
+	// Delete local commits after common ancestor.
+	// Must delete blobs first, then truncate the xpatch commit chain.
 	fmt.Println("Resetting to common ancestor...")
-	for i := len(localToReplay) - 1; i >= 0; i-- {
-		if err := r.DB.DeleteCommitsAfter(ctx, localToReplay[i].ID); err != nil {
-			return err
-		}
+	localIDs := make([]string, len(localCommits))
+	for i, c := range localCommits {
+		localIDs[i] = c.ID
+	}
+	if err := r.DB.DeleteBlobsForCommits(ctx, localIDs); err != nil {
+		return fmt.Errorf("failed to clean up blobs: %w", err)
+	}
+	if err := r.DB.DeleteCommits(ctx, localIDs); err != nil {
+		return fmt.Errorf("failed to delete local commits: %w", err)
 	}
 	if commonAncestor != "" {
 		if err := r.DB.SetHead(ctx, commonAncestor); err != nil {
@@ -523,24 +609,34 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 		}
 	}
 
-	// Pull remote commits
+	// Pull remote commits in batches
 	fmt.Println("Pulling remote commits...")
-	for i, commit := range remoteCommits {
-		fmt.Printf("  [%d/%d] %s %s\n", i+1, len(remoteCommits),
-			styles.Yellow(util.ShortID(commit.ID)), firstLine(commit.Message))
+	const batchSize = 100
+	progress := ui.NewProgress("Pulling", len(remoteCommits))
 
-		if err := r.DB.CreateCommit(ctx, commit); err != nil {
-			return fmt.Errorf("failed to create commit %s: %w", util.ShortID(commit.ID), err)
+	for i := 0; i < len(remoteCommits); i += batchSize {
+		end := min(i+batchSize, len(remoteCommits))
+		batch := remoteCommits[i:end]
+
+		if err := r.DB.CreateCommitsBatch(ctx, batch); err != nil {
+			return fmt.Errorf("failed to create commits: %w", err)
 		}
 
-		blobs, err := remoteDB.GetBlobsAtCommit(ctx, commit.ID)
-		if err != nil {
-			return err
+		for _, commit := range batch {
+			blobs, err := remoteDB.GetBlobsAtCommit(ctx, commit.ID)
+			if err != nil {
+				return err
+			}
+			if len(blobs) > 0 {
+				if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
+					return fmt.Errorf("failed to create blobs for %s: %w", util.ShortID(commit.ID), err)
+				}
+			}
 		}
-		if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
-			return fmt.Errorf("failed to create blobs for %s: %w", util.ShortID(commit.ID), err)
-		}
+
+		progress.Update(end)
 	}
+	progress.Done()
 
 	// Update HEAD to remote head
 	remoteHeadCommit := remoteCommits[len(remoteCommits)-1]
@@ -554,12 +650,12 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 	}
 
 	// Now replay local commits
-	if len(localToReplay) > 0 {
+	if len(localCommits) > 0 {
 		fmt.Println()
 		fmt.Println("Replaying local commits...")
 
-		for i, oldCommit := range localToReplay {
-			fmt.Printf("  [%d/%d] Replaying: %s\n", i+1, len(localToReplay), firstLine(oldCommit.Message))
+		for i, oldCommit := range localCommits {
+			fmt.Printf("  [%d/%d] Replaying: %s\n", i+1, len(localCommits), firstLine(oldCommit.Message))
 
 			// Get blobs from the old commit
 			oldBlobs, err := r.DB.GetBlobsAtCommit(ctx, oldCommit.ID)
@@ -592,20 +688,23 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 				return fmt.Errorf("failed to replay commit: %w", err)
 			}
 
-			// Update blobs with new commit ID
-			for _, blob := range oldBlobs {
-				newBlob := &db.Blob{
-					Path:          blob.Path,
-					CommitID:      newCommitID,
-					Content:       blob.Content,
-					ContentHash:   blob.ContentHash,
-					Mode:          blob.Mode,
-					IsBinary:      blob.IsBinary,
-					IsSymlink:     blob.IsSymlink,
-					SymlinkTarget: blob.SymlinkTarget,
+			// Batch insert blobs with new commit ID (fix: was single CreateBlob)
+			if len(oldBlobs) > 0 {
+				replayedBlobs := make([]*db.Blob, len(oldBlobs))
+				for j, blob := range oldBlobs {
+					replayedBlobs[j] = &db.Blob{
+						Path:          blob.Path,
+						CommitID:      newCommitID,
+						Content:       blob.Content,
+						ContentHash:   blob.ContentHash,
+						Mode:          blob.Mode,
+						IsBinary:      blob.IsBinary,
+						IsSymlink:     blob.IsSymlink,
+						SymlinkTarget: blob.SymlinkTarget,
+					}
 				}
-				if err := r.DB.CreateBlob(ctx, newBlob); err != nil {
-					return fmt.Errorf("failed to replay blob: %w", err)
+				if err := r.DB.CreateBlobs(ctx, replayedBlobs); err != nil {
+					return fmt.Errorf("failed to replay blobs: %w", err)
 				}
 			}
 
@@ -645,7 +744,7 @@ func pullRebase(ctx context.Context, r *repo.Repository, remoteDB *db.DB, localH
 	}
 
 	fmt.Println()
-	fmt.Printf("%s Rebased %d commit(s)\n", styles.Successf("Successfully"), len(localToReplay))
+	fmt.Printf("%s Rebased %d commit(s)\n", styles.Successf("Successfully"), len(localCommits))
 	if headID != "" {
 		fmt.Printf("HEAD is now at %s\n", styles.Yellow(util.ShortID(headID)))
 	}

@@ -67,7 +67,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 			)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 
 	// Connect to remote first to verify
@@ -202,44 +202,48 @@ func runClone(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to init local database: %w", err)
 	}
 
-	// Get all commits from remote
+	// Get all commits from remote — no limit
 	if remoteHeadID != "" {
-		commits, err := remoteDB.GetCommitLogFrom(ctx, remoteHeadID, 100000)
+		commits, err := remoteDB.GetAllCommits(ctx)
 		if err != nil {
 			os.RemoveAll(absDir)
 			return err
 		}
 
-		// Reverse to get oldest first
-		for i, j := 0, len(commits)-1; i < j; i, j = i+1, j-1 {
-			commits[i], commits[j] = commits[j], commits[i]
-		}
+		// GetAllCommits returns oldest-first (ORDER BY id), no reversal needed
 
 		fmt.Printf("Cloning %d commit(s)...\n", len(commits))
 
-		// Copy commits and blobs
+		// Batched insertion: 100 commits per batch
+		const batchSize = 100
 		progress := ui.NewProgress("Cloning", len(commits))
-		for i, commit := range commits {
-			progress.Update(i)
-			fmt.Printf("\r\033[K  [%d/%d] %s %s\n", i+1, len(commits),
-				styles.Yellow(util.ShortID(commit.ID)), firstLine(commit.Message))
 
-			// Create commit locally
-			if err := r.DB.CreateCommit(ctx, commit); err != nil {
+		for i := 0; i < len(commits); i += batchSize {
+			end := min(i+batchSize, len(commits))
+			batch := commits[i:end]
+
+			// Batch insert commits
+			if err := r.DB.CreateCommitsBatch(ctx, batch); err != nil {
 				os.RemoveAll(absDir)
-				return fmt.Errorf("failed to create commit %s: %w", util.ShortID(commit.ID), err)
+				return fmt.Errorf("failed to create commits: %w", err)
 			}
 
-			// Get and create blobs
-			blobs, err := remoteDB.GetBlobsAtCommit(ctx, commit.ID)
-			if err != nil {
-				os.RemoveAll(absDir)
-				return err
+			// Insert blobs per commit
+			for _, commit := range batch {
+				blobs, err := remoteDB.GetBlobsAtCommit(ctx, commit.ID)
+				if err != nil {
+					os.RemoveAll(absDir)
+					return err
+				}
+				if len(blobs) > 0 {
+					if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
+						os.RemoveAll(absDir)
+						return fmt.Errorf("failed to create blobs for %s: %w", util.ShortID(commit.ID), err)
+					}
+				}
 			}
-			if err := r.DB.CreateBlobs(ctx, blobs); err != nil {
-				os.RemoveAll(absDir)
-				return fmt.Errorf("failed to create blobs for %s: %w", util.ShortID(commit.ID), err)
-			}
+
+			progress.Update(end)
 		}
 		progress.Done()
 

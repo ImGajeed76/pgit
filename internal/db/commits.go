@@ -60,6 +60,32 @@ func (db *DB) CreateCommitsBatch(ctx context.Context, commits []*Commit) error {
 	return err
 }
 
+// CreateCommitsBatchTx inserts multiple commits within an existing transaction.
+func (db *DB) CreateCommitsBatchTx(ctx context.Context, tx pgx.Tx, commits []*Commit) error {
+	if len(commits) == 0 {
+		return nil
+	}
+
+	rows := make([][]interface{}, len(commits))
+	for i, c := range commits {
+		rows[i] = []interface{}{
+			c.ID, c.ParentID, c.TreeHash, c.Message,
+			c.AuthorName, c.AuthorEmail, c.AuthoredAt,
+			c.CommitterName, c.CommitterEmail, c.CommittedAt,
+		}
+	}
+
+	_, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"pgit_commits"},
+		[]string{"id", "parent_id", "tree_hash", "message",
+			"author_name", "author_email", "authored_at",
+			"committer_name", "committer_email", "committed_at"},
+		pgx.CopyFromRows(rows),
+	)
+	return err
+}
+
 // GetCommit retrieves a commit by ID
 func (db *DB) GetCommit(ctx context.Context, id string) (*Commit, error) {
 	sql := `
@@ -186,6 +212,45 @@ func (db *DB) GetAllCommits(ctx context.Context) ([]*Commit, error) {
 	return commits, rows.Err()
 }
 
+// GetCommitsAfter returns all commits with ID > afterID, in chronological order (oldest first).
+// If afterID is empty, returns all commits (same as GetAllCommits).
+// Uses a forward scan on the xpatch delta chain — optimal access pattern.
+func (db *DB) GetCommitsAfter(ctx context.Context, afterID string) ([]*Commit, error) {
+	var query string
+	var args []interface{}
+
+	if afterID == "" {
+		query = `SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+		                committer_name, committer_email, committed_at
+		         FROM pgit_commits ORDER BY id`
+	} else {
+		query = `SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
+		                committer_name, committer_email, committed_at
+		         FROM pgit_commits WHERE id > $1 ORDER BY id`
+		args = []interface{}{afterID}
+	}
+
+	rows, err := db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var commits []*Commit
+	for rows.Next() {
+		c := &Commit{}
+		if err := rows.Scan(
+			&c.ID, &c.ParentID, &c.TreeHash, &c.Message,
+			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt,
+			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt,
+		); err != nil {
+			return nil, err
+		}
+		commits = append(commits, c)
+	}
+	return commits, rows.Err()
+}
+
 // CountCommits returns the total number of commits
 func (db *DB) CountCommits(ctx context.Context) (int, error) {
 	var count int
@@ -193,11 +258,38 @@ func (db *DB) CountCommits(ctx context.Context) (int, error) {
 	return count, err
 }
 
-// DeleteCommitsAfter deletes all commits after (and including) the given commit ID
-// This is used during the "rebuild on divergence" process
-func (db *DB) DeleteCommitsAfter(ctx context.Context, commitID string) error {
-	sql := `DELETE FROM pgit_commits WHERE id >= $1`
-	return db.Exec(ctx, sql, commitID)
+// DeleteCommits deletes the given commits from the xpatch chain by PK.
+// In xpatch, deleting a row cascade-deletes all rows with higher _xp_seq
+// in the same group. So deleting the earliest commit in the list effectively
+// truncates the chain from that point forward.
+//
+// The caller should pass ALL commit IDs that need to be removed (local-only
+// commits, plus any previously-pulled remote commits that are interleaved).
+// Subsequent deletes after the first cascade are harmless no-ops.
+//
+// After deletion, refreshes xpatch stats for the commits table.
+func (db *DB) DeleteCommits(ctx context.Context, commitIDs []string) error {
+	deleted := false
+	for _, id := range commitIDs {
+		// Check if it still exists (may have been cascade-deleted by a prior delete)
+		exists, err := db.CommitExists(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		if err := db.Exec(ctx, "DELETE FROM pgit_commits WHERE id = $1", id); err != nil {
+			return err
+		}
+		deleted = true
+	}
+
+	// Refresh xpatch stats after deletion (stats are invalidated by deletes)
+	if deleted {
+		_ = db.Exec(ctx, "SELECT xpatch.refresh_stats('pgit_commits')")
+	}
+	return nil
 }
 
 // CommitExists checks if a commit exists
