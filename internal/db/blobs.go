@@ -1210,7 +1210,7 @@ func (db *DB) searchBatchParallel(ctx context.Context, refs []searchRef, opts Se
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var resultCount atomic.Int64
-	var firstErr atomic.Value
+	var firstErr atomic.Pointer[error]
 
 	limit := int64(opts.Limit)
 	if limit <= 0 {
@@ -1237,7 +1237,7 @@ func (db *DB) searchBatchParallel(ctx context.Context, refs []searchRef, opts Se
 				// Single query per group: server-side regex on all versions
 				rows, err := db.Query(ctx, query, gid, opts.Pattern)
 				if err != nil {
-					firstErr.CompareAndSwap(nil, err)
+					firstErr.CompareAndSwap(nil, &err)
 					return
 				}
 
@@ -1251,7 +1251,7 @@ func (db *DB) searchBatchParallel(ctx context.Context, refs []searchRef, opts Se
 					var content []byte
 					if err := rows.Scan(&versionID, &content); err != nil {
 						rows.Close()
-						firstErr.CompareAndSwap(nil, err)
+						firstErr.CompareAndSwap(nil, &err)
 						return
 					}
 
@@ -1278,8 +1278,8 @@ func (db *DB) searchBatchParallel(ctx context.Context, refs []searchRef, opts Se
 
 	wg.Wait()
 
-	if errVal := firstErr.Load(); errVal != nil {
-		return nil, errVal.(error)
+	if errPtr := firstErr.Load(); errPtr != nil {
+		return nil, *errPtr
 	}
 
 	return allResults, nil
@@ -1330,7 +1330,7 @@ func (db *DB) searchPerVersion(ctx context.Context, refs []searchRef, opts Searc
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var resultCount atomic.Int64
-	var firstErr atomic.Value
+	var firstErr atomic.Pointer[error]
 
 	limit := int64(opts.Limit)
 	if limit <= 0 {
@@ -1386,8 +1386,8 @@ func (db *DB) searchPerVersion(ctx context.Context, refs []searchRef, opts Searc
 
 	wg.Wait()
 
-	if errVal := firstErr.Load(); errVal != nil {
-		return nil, errVal.(error)
+	if errPtr := firstErr.Load(); errPtr != nil {
+		return nil, *errPtr
 	}
 
 	return allResults, nil

@@ -886,8 +886,9 @@ func importBlobsParallel(
 	}
 	close(pathChan)
 
-	// Error handling
-	var firstErr atomic.Value
+	// Error handling — use atomic.Pointer[error] instead of atomic.Value
+	// to avoid panic on CompareAndSwap with uninitialized Value
+	var firstErr atomic.Pointer[error]
 	var wg sync.WaitGroup
 
 	for i := 0; i < workers; i++ {
@@ -929,7 +930,8 @@ func importBlobsParallel(
 					if be.Size > 0 {
 						_, err := tmpFile.ReadAt(content, be.Offset)
 						if err != nil {
-							firstErr.CompareAndSwap(nil, fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err))
+							readErr := fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err)
+							firstErr.CompareAndSwap(nil, &readErr)
 							return
 						}
 					}
@@ -961,7 +963,7 @@ func importBlobsParallel(
 				// Insert all blobs for this path (in chronological order)
 				if len(dbBlobs) > 0 {
 					if err := database.CreateBlobs(ctx, dbBlobs); err != nil {
-						firstErr.CompareAndSwap(nil, err)
+						firstErr.CompareAndSwap(nil, &err)
 						return
 					}
 				}
@@ -976,8 +978,8 @@ func importBlobsParallel(
 	wg.Wait()
 	progress.Done()
 
-	if err := firstErr.Load(); err != nil {
-		return err.(error)
+	if errPtr := firstErr.Load(); errPtr != nil {
+		return *errPtr
 	}
 
 	return nil

@@ -133,7 +133,7 @@ func GetContainerPort(runtime Runtime) (int, error) {
 		return 0, err
 	}
 
-	// Output format: "0.0.0.0:5433" or "[::]:5433"
+	// Output format: "127.0.0.1:5433" or "0.0.0.0:5433" or "[::]:5433"
 	parts := strings.Split(strings.TrimSpace(string(output)), ":")
 	if len(parts) < 2 {
 		return 0, fmt.Errorf("unexpected port format: %s", output)
@@ -196,11 +196,10 @@ func StartContainer(runtime Runtime, port int) error {
 	args := []string{
 		"run", "-d",
 		"--name", ContainerName,
-		"-p", fmt.Sprintf("%d:5432", port),
+		"-p", fmt.Sprintf("127.0.0.1:%d:5432", port),
 		"-v", fmt.Sprintf("%s:/var/lib/postgresql/data", VolumeName),
 		"--shm-size", shmSize,
 		"-e", "POSTGRES_PASSWORD=" + DefaultPassword,
-		"-e", "POSTGRES_HOST_AUTH_METHOD=trust", // Allow local connections without password
 		"--restart", "unless-stopped",
 		image,
 	}

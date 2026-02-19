@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -92,6 +93,7 @@ type rateSample struct {
 // Uses curve fitting (quadratic regression) to predict future rates
 // accounting for acceleration/deceleration patterns in the import
 type Progress struct {
+	mu        sync.Mutex
 	label     string
 	total     int
 	current   int
@@ -140,6 +142,8 @@ func NewProgress(label string, total int) *Progress {
 
 // Update updates the progress and renders
 func (p *Progress) Update(current int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	now := time.Now()
 
 	// Calculate instantaneous rate if enough time has passed
@@ -184,6 +188,8 @@ func (p *Progress) Update(current int) {
 
 // SetTotal updates the total (useful when discovered later)
 func (p *Progress) SetTotal(total int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.total = total
 }
 
@@ -270,6 +276,8 @@ func (p *Progress) formatETA() string {
 
 // Done finishes the progress bar and shows elapsed time
 func (p *Progress) Done() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	elapsed := time.Since(p.startTime)
 	p.current = p.total
 
