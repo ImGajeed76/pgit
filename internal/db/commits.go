@@ -309,6 +309,26 @@ func (db *DB) GetLatestCommitID(ctx context.Context) (string, error) {
 	return id, err
 }
 
+// GetAllCommitIDsOrdered returns all commit IDs in ascending ULID order.
+// Used for rebuilding markToULID mapping during import resume.
+func (db *DB) GetAllCommitIDsOrdered(ctx context.Context) ([]string, error) {
+	rows, err := db.Query(ctx, "SELECT id FROM pgit_commits ORDER BY id ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // FindCommonAncestor finds the common ancestor between two commits
 func (db *DB) FindCommonAncestor(ctx context.Context, commitA, commitB string) (string, error) {
 	sql := `

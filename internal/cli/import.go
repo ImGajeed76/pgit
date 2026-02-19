@@ -53,6 +53,8 @@ The current directory must be a pgit repository (run 'pgit init' first).`,
 	cmd.Flags().BoolP("force", "f", false, "Overwrite existing data in database")
 	cmd.Flags().StringP("branch", "b", "", "Branch to import (default: current branch, or interactive picker)")
 	cmd.Flags().String("remote", "", "Import directly into a remote database (e.g. 'origin'), skipping local container")
+	cmd.Flags().Bool("resume", false, "Resume a previously interrupted import")
+	cmd.Flags().String("fastexport", "", "Use a pre-generated git fast-export file instead of re-exporting")
 
 	return cmd
 }
@@ -151,6 +153,8 @@ func runImport(cmd *cobra.Command, args []string) error {
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	force, _ := cmd.Flags().GetBool("force")
+	resume, _ := cmd.Flags().GetBool("resume")
+	fastExportPath, _ := cmd.Flags().GetString("fastexport")
 
 	remoteName, _ := cmd.Flags().GetString("remote")
 	isRemote := remoteName != ""
@@ -203,13 +207,64 @@ func runImport(cmd *cobra.Command, args []string) error {
 		fmt.Println(styles.Yellow("Dry run mode - no changes will be made"))
 	}
 
-	// Check if database already has commits
+	// Check if database already has commits and determine resume state
 	var existingCommits int
 	_ = r.DB.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_commits").Scan(&existingCommits)
-	if existingCommits > 0 && !force {
-		return util.NewError("Database not empty").
-			WithMessage(fmt.Sprintf("Database already contains %d commits", existingCommits)).
-			WithSuggestion("pgit import --force  # Overwrite existing data")
+
+	resumeFromBlobs := false
+
+	if existingCommits > 0 && force {
+		// --force always wipes, handled below
+	} else if existingCommits > 0 && resume {
+		// --resume: validate we have a resumable state
+		importState, _ := r.DB.GetMetadata(ctx, "import_state")
+		importBranch, _ := r.DB.GetMetadata(ctx, "import_branch")
+		switch importState {
+		case "commits_done":
+			resumeFromBlobs = true
+			fmt.Printf("Resuming interrupted import (%s commits already inserted)\n",
+				ui.FormatCount(existingCommits))
+			if importBranch != "" {
+				fmt.Printf("Original import branch: %s\n", styles.Branch(importBranch))
+			}
+		case "complete":
+			return util.NewError("Import already complete").
+				WithMessage(fmt.Sprintf("Database contains %d commits from a completed import", existingCommits)).
+				WithSuggestion("pgit import --force  # Wipe and re-import from scratch")
+		default:
+			// No import_state — either partial commit phase or old version crash.
+			// Either way: skip already-inserted commits, continue from where we left off.
+			resumeFromBlobs = true
+			importBranch, _ := r.DB.GetMetadata(ctx, "import_branch")
+			fmt.Printf("Resuming interrupted import (%s commits found in database)\n",
+				ui.FormatCount(existingCommits))
+			if importBranch != "" {
+				fmt.Printf("Original import branch: %s\n", styles.Branch(importBranch))
+			}
+		}
+	} else if existingCommits > 0 {
+		// No --force, no --resume: tell user what to do
+		importState, _ := r.DB.GetMetadata(ctx, "import_state")
+		switch importState {
+		case "complete":
+			return util.NewError("Database not empty").
+				WithMessage(fmt.Sprintf("Database already contains %d commits from a completed import", existingCommits)).
+				WithSuggestion("pgit import --force  # Wipe and re-import from scratch")
+		case "commits_done":
+			return util.NewError("Interrupted import detected").
+				WithMessage(fmt.Sprintf("Database contains %d commits but blob import is incomplete", existingCommits)).
+				WithSuggestions(
+					"pgit import --resume  # Resume blob import",
+					"pgit import --force   # Wipe and start over",
+				)
+		default:
+			return util.NewError("Incomplete import detected").
+				WithMessage(fmt.Sprintf("Database contains %d commits but import did not finish", existingCommits)).
+				WithSuggestions(
+					"pgit import --resume  # Resume from where it left off",
+					"pgit import --force   # Wipe and start over",
+				)
+		}
 	}
 
 	// Determine branch
@@ -221,48 +276,68 @@ func runImport(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Branch: %s\n", styles.Branch(selectedBranch))
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 1: Export to temp file via git fast-export
+	// Step 1: Export to temp file via git fast-export (or use provided file)
 	// ═══════════════════════════════════════════════════════════════════════
 
-	spinner := ui.NewSpinner("Exporting git history")
-	spinner.Start()
+	var tmpPath string
+	ownsTmpFile := false // whether we should clean up the temp file
 
-	tmpPath, exportSize, err := exportToFile(gitPath, selectedBranch)
-	spinner.Stop()
-
-	if err != nil {
-		// Clean up temp file if it was created
-		if tmpPath != "" {
-			os.Remove(tmpPath)
+	if fastExportPath != "" {
+		// Use pre-generated fast-export file
+		info, err := os.Stat(fastExportPath)
+		if err != nil {
+			return util.NewError("Cannot read fast-export file").
+				WithMessage(fmt.Sprintf("File not found or not readable: %s", fastExportPath)).
+				WithSuggestion("Provide a valid fast-export file generated with:\n  git fast-export --reencode=yes --show-original-ids <branch> > export.stream")
 		}
-		// Check if the branch doesn't exist
-		if strings.Contains(err.Error(), "exit status 128") {
-			branches, branchErr := getGitBranches(gitPath)
-			if branchErr == nil && len(branches) > 0 {
-				var branchNames []string
-				for _, b := range branches {
-					branchNames = append(branchNames, b.Name)
-				}
-				return util.NewError(fmt.Sprintf("Branch '%s' not found", selectedBranch)).
-					WithMessage(fmt.Sprintf("Available branches: %s", strings.Join(branchNames, ", "))).
-					WithSuggestion(fmt.Sprintf("pgit import %s --branch %s", gitPath, branchNames[0]))
+		tmpPath = fastExportPath
+		fmt.Printf("Using fast-export file: %s (%s)\n", fastExportPath, formatBytes(info.Size()))
+	} else {
+		spinner := ui.NewSpinner("Exporting git history")
+		spinner.Start()
+
+		var exportSize int64
+		tmpPath, exportSize, err = exportToFile(gitPath, selectedBranch)
+		spinner.Stop()
+
+		if err != nil {
+			// Clean up temp file if it was created
+			if tmpPath != "" {
+				os.Remove(tmpPath)
 			}
+			// Check if the branch doesn't exist
+			if strings.Contains(err.Error(), "exit status 128") {
+				branches, branchErr := getGitBranches(gitPath)
+				if branchErr == nil && len(branches) > 0 {
+					var branchNames []string
+					for _, b := range branches {
+						branchNames = append(branchNames, b.Name)
+					}
+					return util.NewError(fmt.Sprintf("Branch '%s' not found", selectedBranch)).
+						WithMessage(fmt.Sprintf("Available branches: %s", strings.Join(branchNames, ", "))).
+						WithSuggestion(fmt.Sprintf("pgit import %s --branch %s", gitPath, branchNames[0]))
+				}
+			}
+			return fmt.Errorf("failed to export git history: %w", err)
 		}
-		return fmt.Errorf("failed to export git history: %w", err)
+		ownsTmpFile = true
+		fmt.Printf("Exported %s fast-export stream\n", formatBytes(exportSize))
+		fmt.Printf("Temp file: %s\n", styles.Mute(tmpPath))
 	}
-	defer os.Remove(tmpPath)
 
-	fmt.Printf("Exported %s fast-export stream\n", formatBytes(exportSize))
+	// Note: we do NOT defer os.Remove(tmpPath) here. If the import crashes,
+	// the temp file is preserved so the user can resume with --fastexport.
+	// It is cleaned up explicitly on successful completion at the end.
 
 	// ═══════════════════════════════════════════════════════════════════════
 	// Step 2: Index the fast-export stream (single pass)
 	// ═══════════════════════════════════════════════════════════════════════
 
-	spinner = ui.NewSpinner("Indexing fast-export stream")
-	spinner.Start()
+	idxSpinner := ui.NewSpinner("Indexing fast-export stream")
+	idxSpinner.Start()
 
 	commitEntries, blobIndex, err := indexFastExport(tmpPath)
-	spinner.Stop()
+	idxSpinner.Stop()
 
 	if err != nil {
 		return fmt.Errorf("failed to index fast-export: %w", err)
@@ -315,32 +390,168 @@ func runImport(cmd *cobra.Command, args []string) error {
 	pgitCommits, markToULID, pathOps := prepareCommits(commitEntries, blobIndex, tmpFile)
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 4: Insert commits (batch for speed)
+	// Step 3b + 4: Resume-aware commit handling
 	// ═══════════════════════════════════════════════════════════════════════
 
-	fmt.Println("\nImporting commits...")
+	if resumeFromBlobs {
+		// Some or all commits are already in the DB. Read them back and
+		// rebuild the markToULID mapping with the real ULIDs (freshly
+		// generated ones have different random entropy).
 
-	batchSize := 1000
-	commitProgress := ui.NewProgress("Commits", len(pgitCommits))
-
-	for i := 0; i < len(pgitCommits); i += batchSize {
-		end := i + batchSize
-		if end > len(pgitCommits) {
-			end = len(pgitCommits)
+		dbCommitIDs, err := r.DB.GetAllCommitIDsOrdered(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to read existing commits for resume: %w", err)
 		}
-		batch := pgitCommits[i:end]
 
-		if err := r.DB.CreateCommitsBatch(ctx, batch); err != nil {
+		if len(dbCommitIDs) > len(commitEntries) {
+			return util.NewError("Cannot resume — commit count mismatch").
+				WithMessage(fmt.Sprintf("Database has %d commits but fast-export has %d commits",
+					len(dbCommitIDs), len(commitEntries))).
+				WithSuggestion("The repository may have changed since the original import.\n  pgit import --force  # Wipe and start fresh")
+		}
+
+		// Rebuild markToULID: for already-inserted commits use real DB ULIDs,
+		// for remaining commits use the freshly generated ones from prepareCommits.
+		alreadyInserted := len(dbCommitIDs)
+		for i := 0; i < alreadyInserted; i++ {
+			markToULID[commitEntries[i].Mark] = dbCommitIDs[i]
+		}
+		// markToULID[i >= alreadyInserted] keeps the freshly generated ULIDs
+		// from prepareCommits — these are for commits we still need to insert.
+
+		// Rebuild pathOps with the corrected ULIDs
+		pathOps = make(map[string][]pathOp)
+		for _, ce := range commitEntries {
+			ulid := markToULID[ce.Mark]
+			for _, op := range ce.FileOps {
+				po := pathOp{
+					CommitID: ulid,
+					BlobMark: op.BlobMark,
+					Mode:     op.Mode,
+					IsDelete: op.Type == 'D',
+				}
+				pathOps[op.Path] = append(pathOps[op.Path], po)
+			}
+		}
+
+		// Update pgitCommits to use the real ULIDs (needed for HEAD/checkout)
+		for i := 0; i < alreadyInserted; i++ {
+			pgitCommits[i].ID = dbCommitIDs[i]
+			if pgitCommits[i].ParentID != nil {
+				parentMark := commitEntries[i].FromMark
+				if parentMark > 0 {
+					realParentID := markToULID[parentMark]
+					pgitCommits[i].ParentID = &realParentID
+				}
+			}
+		}
+		// For commits after alreadyInserted, fix their parent IDs too
+		// (the parent of commit alreadyInserted might be in the DB)
+		for i := alreadyInserted; i < len(pgitCommits); i++ {
+			if pgitCommits[i].ParentID != nil {
+				parentMark := commitEntries[i].FromMark
+				if parentMark > 0 {
+					realParentID := markToULID[parentMark]
+					pgitCommits[i].ParentID = &realParentID
+				}
+			}
+		}
+
+		remaining := len(commitEntries) - alreadyInserted
+		fmt.Printf("Rebuilt commit mapping: %s already inserted", ui.FormatCount(alreadyInserted))
+		if remaining > 0 {
+			fmt.Printf(", %s remaining\n", ui.FormatCount(remaining))
+		} else {
 			fmt.Println()
-			return fmt.Errorf("failed to insert commits batch: %w", err)
 		}
-		commitProgress.Update(end)
+
+		// Insert remaining commits if any
+		if remaining > 0 {
+			fmt.Println("\nImporting remaining commits...")
+
+			remainingCommits := pgitCommits[alreadyInserted:]
+			batchSize := 1000
+			commitProgress := ui.NewProgress("Commits", len(remainingCommits))
+
+			for i := 0; i < len(remainingCommits); i += batchSize {
+				end := i + batchSize
+				if end > len(remainingCommits) {
+					end = len(remainingCommits)
+				}
+				batch := remainingCommits[i:end]
+
+				if err := r.DB.CreateCommitsBatch(ctx, batch); err != nil {
+					fmt.Println()
+					return fmt.Errorf("failed to insert commits batch: %w", err)
+				}
+				commitProgress.Update(end)
+			}
+			commitProgress.Done()
+		}
+
+		// Mark commits as done (idempotent if already set)
+		_ = r.DB.SetMetadata(ctx, "import_state", "commits_done")
+	} else {
+		// Fresh import: insert all commits
+		_ = r.DB.SetMetadata(ctx, "import_branch", selectedBranch)
+		_ = r.DB.SetMetadata(ctx, "import_expected_commits", fmt.Sprintf("%d", len(pgitCommits)))
+
+		fmt.Println("\nImporting commits...")
+
+		batchSize := 1000
+		commitProgress := ui.NewProgress("Commits", len(pgitCommits))
+
+		for i := 0; i < len(pgitCommits); i += batchSize {
+			end := i + batchSize
+			if end > len(pgitCommits) {
+				end = len(pgitCommits)
+			}
+			batch := pgitCommits[i:end]
+
+			if err := r.DB.CreateCommitsBatch(ctx, batch); err != nil {
+				fmt.Println()
+				return fmt.Errorf("failed to insert commits batch: %w", err)
+			}
+			commitProgress.Update(end)
+		}
+		commitProgress.Done()
+
+		// Mark commits as done — this is the resume checkpoint
+		_ = r.DB.SetMetadata(ctx, "import_state", "commits_done")
 	}
-	commitProgress.Done()
 
 	// ═══════════════════════════════════════════════════════════════════════
 	// Step 5: Parallel blob import via ReadAt on temp file
 	// ═══════════════════════════════════════════════════════════════════════
+
+	// When resuming, filter out already-imported paths
+	if resumeFromBlobs {
+		importedPaths, err := r.DB.GetImportedPaths(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to query imported paths: %w", err)
+		}
+
+		if len(importedPaths) > 0 {
+			// Count ops being skipped
+			skippedOps := 0
+			for path, ops := range pathOps {
+				if importedPaths[path] {
+					skippedOps += len(ops)
+					delete(pathOps, path)
+				}
+			}
+
+			// Recalculate totalFileOps for remaining paths
+			totalFileOps = 0
+			for _, ops := range pathOps {
+				totalFileOps += len(ops)
+			}
+
+			fmt.Printf("\nResuming: %s paths already imported, %s paths remaining\n",
+				ui.FormatCount(len(importedPaths)),
+				ui.FormatCount(len(pathOps)))
+		}
+	}
 
 	fmt.Printf("\nImporting %s file versions across %s paths...\n",
 		ui.FormatCount(totalFileOps), ui.FormatCount(len(pathOps)))
@@ -388,6 +599,14 @@ func runImport(cmd *cobra.Command, args []string) error {
 				_ = os.WriteFile(absPath, blob.Content, os.FileMode(blob.Mode))
 			}
 		}
+	}
+
+	// Mark import as complete
+	_ = r.DB.SetMetadata(ctx, "import_state", "complete")
+
+	// Clean up temp file on success (preserved on crash for --fastexport reuse)
+	if ownsTmpFile {
+		os.Remove(tmpPath)
 	}
 
 	if isRemote {

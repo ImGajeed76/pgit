@@ -957,6 +957,28 @@ func (db *DB) GetAllPaths(ctx context.Context) ([]string, error) {
 	return db.GetAllPathsV2(ctx)
 }
 
+// GetImportedPaths returns the set of paths that have at least one file ref.
+// Used during import resume to skip paths whose blobs are already imported.
+func (db *DB) GetImportedPaths(ctx context.Context) (map[string]bool, error) {
+	rows, err := db.Query(ctx,
+		"SELECT DISTINCT p.path FROM pgit_paths p "+
+			"JOIN pgit_file_refs fr ON fr.group_id = p.group_id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]bool)
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		result[path] = true
+	}
+	return result, rows.Err()
+}
+
 // BlobExists checks if a blob exists at a specific commit.
 func (db *DB) BlobExists(ctx context.Context, path, commitID string) (bool, error) {
 	groupID, err := db.GetGroupIDByPath(ctx, path)
