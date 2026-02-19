@@ -1492,60 +1492,68 @@ func (db *DB) PreRegisterPaths(ctx context.Context, paths []string) (map[string]
 	return result, nil
 }
 
-// CreateBlobsBatchFast inserts multiple blobs for multiple paths in a single transaction.
-// Unlike CreateBlobs (which is per-path), this batches across paths.
-// pathToGroupID must be pre-populated via PreRegisterPaths.
-// versionCounters tracks the next version_id per group_id (caller manages this).
-// This skips the version_id MAX query by using caller-managed counters.
-func (db *DB) CreateBlobsBatchFast(ctx context.Context, blobs []*Blob, pathToGroupID map[string]int32, versionCounters map[int32]*int32) error {
+// CreateBlobsForGroup inserts all blobs for a single group (path) in one
+// transaction. Large groups are split into chunks of copyChunkSize, each
+// chunk getting its own COPY calls — but all within the same transaction
+// to keep xpatch's delta chain on one connection.
+//
+// groupID is the pre-registered group_id for this path.
+// versionCounter points to the caller-managed next version_id for this group.
+// onProgress is called after each chunk with the number of blobs in that chunk (may be nil).
+func (db *DB) CreateBlobsForGroup(ctx context.Context, blobs []*Blob, groupID int32, versionCounter *int32, onProgress func(int)) error {
 	if len(blobs) == 0 {
 		return nil
 	}
 
+	const copyChunkSize = 200
+
 	return db.WithTx(ctx, func(tx pgx.Tx) error {
-		var fileRefs []*FileRef
-		var contents []*Content
-
-		for _, b := range blobs {
-			groupID, ok := pathToGroupID[b.Path]
-			if !ok {
-				return fmt.Errorf("path not pre-registered: %s", b.Path)
+		for i := 0; i < len(blobs); i += copyChunkSize {
+			end := i + copyChunkSize
+			if end > len(blobs) {
+				end = len(blobs)
 			}
+			chunk := blobs[i:end]
 
-			// Atomically increment version counter for this group
-			counter := versionCounters[groupID]
-			*counter++
-			versionID := *counter
+			var fileRefs []*FileRef
+			var contents []*Content
 
-			fileRefs = append(fileRefs, &FileRef{
-				GroupID:       groupID,
-				CommitID:      b.CommitID,
-				VersionID:     versionID,
-				ContentHash:   b.ContentHash,
-				Mode:          b.Mode,
-				IsSymlink:     b.IsSymlink,
-				SymlinkTarget: b.SymlinkTarget,
-				IsBinary:      b.IsBinary,
-			})
+			for _, b := range chunk {
+				*versionCounter++
+				versionID := *versionCounter
 
-			if b.ContentHash != nil {
-				contents = append(contents, &Content{
-					GroupID:   groupID,
-					VersionID: versionID,
-					Content:   b.Content,
-					IsBinary:  b.IsBinary,
+				fileRefs = append(fileRefs, &FileRef{
+					GroupID:       groupID,
+					CommitID:      b.CommitID,
+					VersionID:     versionID,
+					ContentHash:   b.ContentHash,
+					Mode:          b.Mode,
+					IsSymlink:     b.IsSymlink,
+					SymlinkTarget: b.SymlinkTarget,
+					IsBinary:      b.IsBinary,
 				})
+
+				if b.ContentHash != nil {
+					contents = append(contents, &Content{
+						GroupID:   groupID,
+						VersionID: versionID,
+						Content:   b.Content,
+						IsBinary:  b.IsBinary,
+					})
+				}
 			}
-		}
 
-		// Batch insert file refs via COPY
-		if err := db.createFileRefsBatchTx(ctx, tx, fileRefs); err != nil {
-			return err
-		}
+			if err := db.createFileRefsBatchTx(ctx, tx, fileRefs); err != nil {
+				return err
+			}
 
-		// Batch insert contents via COPY
-		if err := db.createContentsBatchTx(ctx, tx, contents); err != nil {
-			return err
+			if err := db.createContentsBatchTx(ctx, tx, contents); err != nil {
+				return err
+			}
+
+			if onProgress != nil {
+				onProgress(len(chunk))
+			}
 		}
 
 		return nil

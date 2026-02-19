@@ -209,7 +209,17 @@ WHERE group_id = $1 AND version_id = $2
 | GUC | Default | Description |
 |-----|---------|-------------|
 | `pg_xpatch.cache_size_mb` | 256 | Total shared cache size (requires restart) |
-| `pg_xpatch.cache_max_entry_kb` | 256 | Max size per cached entry (runtime tunable) |
+| `pg_xpatch.cache_max_entries` | 65536 | Max entries in cache |
+| `pg_xpatch.cache_max_entry_kb` | 4096 | Max size per cached entry |
+| `pg_xpatch.cache_partitions` | 32 | Cache lock partitions (concurrency) |
+| `pg_xpatch.encode_threads` | 4 | Parallel delta encoding threads |
+| `pg_xpatch.insert_cache_slots` | 64 | FIFO slots for insert path cache |
+| `pg_xpatch.group_cache_size_mb` | 16 | Group max-seq cache |
+| `pg_xpatch.tid_cache_size_mb` | 16 | TID seq cache |
+| `pg_xpatch.seq_tid_cache_size_mb` | 16 | Seq-to-TID cache |
+
+These are configured via `pgit config --global container.xpatch_*` and applied
+at container startup. Changes require `pgit local destroy && pgit local start`.
 
 Monitor cache health:
 

@@ -210,7 +210,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	if err := r.DB.SetImportGUCs(ctx); err != nil {
 		fmt.Printf("Warning: failed to set import GUCs: %v\n", err)
 	}
-	defer r.DB.ResetImportGUCs(ctx)
+	defer func() { _ = r.DB.ResetImportGUCs(ctx) }()
 
 	fmt.Printf("Importing from: %s\n", styles.Cyan(gitPath))
 	fmt.Printf("Workers: %d\n", workers)
@@ -1077,11 +1077,6 @@ func readBytesAt(f *os.File, offset int64, n int) []byte {
 // Phase 5: Parallel blob import
 // ═══════════════════════════════════════════════════════════════════════════
 
-// pathBatch groups multiple paths for batched DB insertion.
-type pathBatch struct {
-	paths []string
-}
-
 // importBlobsParallel imports blobs grouped by path using parallel workers.
 // Each worker processes batches of paths for fewer, larger transactions.
 // Content is read from the temp file via ReadAt (safe for concurrent access).
@@ -1134,7 +1129,7 @@ func importBlobsParallel(
 	}
 
 	// Initialize version counters for each group
-	// For fresh imports: all start at 0 (CreateBlobsBatchFast increments before use)
+	// For fresh imports: all start at 0 (CreateBlobsForGroup increments before use)
 	// For resume: query existing max version_ids
 	versionCounters := make(map[int32]*int32, len(pathToGroupID))
 	if isResume {
@@ -1190,35 +1185,14 @@ func importBlobsParallel(
 	progress := ui.NewProgress("Blobs", totalOps)
 	var imported atomic.Int64
 
-	// Create batches of paths, capped by total blob count.
-	// Small batches = more parallelism. Large batches = fewer commits.
-	// Target: ~100 blobs per transaction — enough to amortize commit overhead
-	// without blocking a connection too long on delta encoding.
-	const maxBlobsPerBatch = 100
-	var batches []pathBatch
-	var currentBatch pathBatch
-	currentBlobCount := 0
-
+	// Send individual paths to workers. Each path = one transaction with
+	// one or more COPY calls inside it. This ensures all versions of a
+	// group go through the same connection and xpatch cache context.
+	pathChan := make(chan string, len(paths))
 	for _, p := range paths {
-		opCount := len(pathOpsMap[p])
-		// If a single path exceeds the limit, it gets its own batch
-		if currentBlobCount > 0 && currentBlobCount+opCount > maxBlobsPerBatch {
-			batches = append(batches, currentBatch)
-			currentBatch = pathBatch{}
-			currentBlobCount = 0
-		}
-		currentBatch.paths = append(currentBatch.paths, p)
-		currentBlobCount += opCount
+		pathChan <- p
 	}
-	if len(currentBatch.paths) > 0 {
-		batches = append(batches, currentBatch)
-	}
-
-	batchChan := make(chan pathBatch, len(batches))
-	for _, b := range batches {
-		batchChan <- b
-	}
-	close(batchChan)
+	close(pathChan)
 
 	var firstErr atomic.Pointer[error]
 	var wg sync.WaitGroup
@@ -1228,96 +1202,76 @@ func importBlobsParallel(
 		go func() {
 			defer wg.Done()
 
-			for batch := range batchChan {
+			for path := range pathChan {
 				if firstErr.Load() != nil {
 					return
 				}
 
-				// Flatten all ops for this batch with their path, preserving order.
-				// We stream content in sub-batches to avoid loading everything
-				// into memory at once (a path with 3,681 versions * 128KB = 460MB).
-				type flatOp struct {
-					path string
-					op   pathOp
-				}
-				var flatOps []flatOp
-				for _, path := range batch.paths {
-					for _, op := range pathOpsMap[path] {
-						flatOps = append(flatOps, flatOp{path: path, op: op})
-					}
-				}
+				ops := pathOpsMap[path]
+				groupID := pathToGroupID[path]
+				counter := versionCounters[groupID]
 
-				// Process in sub-batches of 200 — read content, insert, update progress
-				const subBatchSize = 200
-				for i := 0; i < len(flatOps); i += subBatchSize {
-					if firstErr.Load() != nil {
-						return
-					}
-					end := i + subBatchSize
-					if end > len(flatOps) {
-						end = len(flatOps)
+				// Build blobs for this path
+				dbBlobs := make([]*db.Blob, 0, len(ops))
+				for _, op := range ops {
+					if op.IsDelete {
+						dbBlobs = append(dbBlobs, &db.Blob{
+							Path:        path,
+							CommitID:    op.CommitID,
+							Content:     []byte{},
+							ContentHash: nil,
+							Mode:        0,
+							IsSymlink:   false,
+							IsBinary:    false,
+						})
+						continue
 					}
 
-					chunk := make([]*db.Blob, 0, end-i)
-					for _, fo := range flatOps[i:end] {
-						if fo.op.IsDelete {
-							chunk = append(chunk, &db.Blob{
-								Path:        fo.path,
-								CommitID:    fo.op.CommitID,
-								Content:     []byte{},
-								ContentHash: nil,
-								Mode:        0,
-								IsSymlink:   false,
-								IsBinary:    false,
-							})
-							continue
-						}
-
-						be, ok := blobIndex[fo.op.BlobMark]
-						if !ok {
-							continue
-						}
-
-						content := make([]byte, be.Size)
-						if be.Size > 0 {
-							_, err := tmpFile.ReadAt(content, be.Offset)
-							if err != nil {
-								readErr := fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err)
-								firstErr.CompareAndSwap(nil, &readErr)
-								return
-							}
-						}
-
-						isBinary := util.DetectBinary(content)
-						contentHash := util.HashBytesBlake3(content)
-
-						blob := &db.Blob{
-							Path:        fo.path,
-							CommitID:    fo.op.CommitID,
-							Content:     content,
-							ContentHash: contentHash,
-							Mode:        fo.op.Mode,
-							IsSymlink:   fo.op.Mode == 0120000,
-							IsBinary:    isBinary,
-						}
-
-						if blob.IsSymlink {
-							target := string(content)
-							blob.SymlinkTarget = &target
-						}
-
-						chunk = append(chunk, blob)
+					be, ok := blobIndex[op.BlobMark]
+					if !ok {
+						continue
 					}
 
-					if len(chunk) > 0 {
-						if err := database.CreateBlobsBatchFast(ctx, chunk, pathToGroupID, versionCounters); err != nil {
-							firstErr.CompareAndSwap(nil, &err)
+					content := make([]byte, be.Size)
+					if be.Size > 0 {
+						_, err := tmpFile.ReadAt(content, be.Offset)
+						if err != nil {
+							readErr := fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err)
+							firstErr.CompareAndSwap(nil, &readErr)
 							return
 						}
 					}
 
-					count := imported.Add(int64(len(chunk)))
-					progress.Update(int(count))
+					isBinary := util.DetectBinary(content)
+					contentHash := util.HashBytesBlake3(content)
+
+					blob := &db.Blob{
+						Path:        path,
+						CommitID:    op.CommitID,
+						Content:     content,
+						ContentHash: contentHash,
+						Mode:        op.Mode,
+						IsSymlink:   op.Mode == 0120000,
+						IsBinary:    isBinary,
+					}
+
+					if blob.IsSymlink {
+						target := string(content)
+						blob.SymlinkTarget = &target
+					}
+
+					dbBlobs = append(dbBlobs, blob)
+				}
+
+				// Insert all versions in one transaction (multiple COPY calls inside)
+				if len(dbBlobs) > 0 {
+					if err := database.CreateBlobsForGroup(ctx, dbBlobs, groupID, counter, func(n int) {
+						count := imported.Add(int64(n))
+						progress.Update(int(count))
+					}); err != nil {
+						firstErr.CompareAndSwap(nil, &err)
+						return
+					}
 				}
 			}
 		}()
