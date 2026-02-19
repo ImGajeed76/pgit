@@ -197,7 +197,7 @@ func (db *DB) createTextContentTable(ctx context.Context) error {
 		order_by => 'version_id',
 		delta_columns => ARRAY['content'],
 		keyframe_every => 100,
-		compress_depth => 50
+		compress_depth => 5
 	)`
 
 	_ = db.Exec(ctx, configSQL)
@@ -225,7 +225,7 @@ func (db *DB) createBinaryContentTable(ctx context.Context) error {
 		order_by => 'version_id',
 		delta_columns => ARRAY['content'],
 		keyframe_every => 100,
-		compress_depth => 50
+		compress_depth => 5
 	)`
 
 	_ = db.Exec(ctx, configSQL)

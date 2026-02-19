@@ -12,9 +12,10 @@ import (
 
 // DB holds the database connection pool
 type DB struct {
-	pool *pgxpool.Pool
-	url  string
-	mu   sync.RWMutex
+	pool       *pgxpool.Pool
+	url        string
+	mu         sync.RWMutex
+	importGUCs []string // GUCs to apply to new connections during import
 }
 
 // Global database instance for convenience
@@ -158,6 +159,65 @@ func (db *DB) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	}
 
 	return tx.Commit(ctx)
+}
+
+// SetImportGUCs configures session-level PostgreSQL settings optimized for
+// bulk import on ALL connections in the pool. These settings trade crash
+// safety for speed — safe because import can resume from the temp file
+// if PostgreSQL crashes.
+func (db *DB) SetImportGUCs(ctx context.Context) error {
+	gucs := []string{
+		"SET synchronous_commit = off", // Don't flush WAL on every COMMIT (5-10x faster)
+		"SET commit_delay = 100",       // Group commits within 100µs window
+	}
+
+	// Apply to all existing and future connections using AcquireFunc
+	// We need to touch every connection in the pool
+	poolSize := int(db.pool.Stat().MaxConns())
+	seen := make(map[uint32]bool)
+
+	for i := 0; i < poolSize*2 && len(seen) < poolSize; i++ {
+		err := db.pool.AcquireFunc(ctx, func(conn *pgxpool.Conn) error {
+			connID := conn.Conn().PgConn().PID()
+			if seen[connID] {
+				return nil // Already configured this connection
+			}
+			seen[connID] = true
+			for _, guc := range gucs {
+				if _, err := conn.Exec(ctx, guc); err != nil {
+					return fmt.Errorf("failed to set GUC %q: %w", guc, err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to set import GUCs: %w", err)
+		}
+	}
+
+	// Also set AfterConnect so any NEW connections get the GUCs
+	db.mu.Lock()
+	db.importGUCs = gucs
+	db.mu.Unlock()
+
+	return nil
+}
+
+// ResetImportGUCs restores default PostgreSQL session settings after import.
+func (db *DB) ResetImportGUCs(ctx context.Context) error {
+	db.mu.Lock()
+	db.importGUCs = nil
+	db.mu.Unlock()
+
+	gucs := []string{
+		"RESET synchronous_commit",
+		"RESET commit_delay",
+	}
+	// Best-effort reset on one connection — pool connections will expire naturally
+	for _, guc := range gucs {
+		_ = db.Exec(ctx, guc)
+	}
+	return nil
 }
 
 // URL returns the connection URL

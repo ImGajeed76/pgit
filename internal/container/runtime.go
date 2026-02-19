@@ -227,8 +227,43 @@ func StartContainer(runtime Runtime, port int) error {
 		if globalCfg.Container.MaxParallelPerGather > 0 {
 			args = append(args, "-c", fmt.Sprintf("max_parallel_workers_per_gather=%d", globalCfg.Container.MaxParallelPerGather))
 		}
+		// full_page_writes is a postmaster-level GUC — must be set at startup
+		args = append(args, "-c", "full_page_writes=off")
+		if globalCfg.Container.MaxWalSize != "" {
+			args = append(args, "-c", fmt.Sprintf("max_wal_size=%s", globalCfg.Container.MaxWalSize))
+		}
+		if globalCfg.Container.CheckpointTimeout != "" {
+			args = append(args, "-c", fmt.Sprintf("checkpoint_timeout=%s", globalCfg.Container.CheckpointTimeout))
+		}
+		if globalCfg.Container.WalBuffers != "" {
+			args = append(args, "-c", fmt.Sprintf("wal_buffers=%s", globalCfg.Container.WalBuffers))
+		}
 		if globalCfg.Container.XpatchCacheSizeMB > 0 {
 			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_size_mb=%d", globalCfg.Container.XpatchCacheSizeMB))
+		}
+		if globalCfg.Container.XpatchCacheMaxEntries > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_max_entries=%d", globalCfg.Container.XpatchCacheMaxEntries))
+		}
+		if globalCfg.Container.XpatchCacheMaxEntryKB > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_max_entry_kb=%d", globalCfg.Container.XpatchCacheMaxEntryKB))
+		}
+		if globalCfg.Container.XpatchCachePartitions > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_partitions=%d", globalCfg.Container.XpatchCachePartitions))
+		}
+		if globalCfg.Container.XpatchEncodeThreads > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.encode_threads=%d", globalCfg.Container.XpatchEncodeThreads))
+		}
+		if globalCfg.Container.XpatchInsertCacheSlots > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.insert_cache_slots=%d", globalCfg.Container.XpatchInsertCacheSlots))
+		}
+		if globalCfg.Container.XpatchGroupCacheSizeMB > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.group_cache_size_mb=%d", globalCfg.Container.XpatchGroupCacheSizeMB))
+		}
+		if globalCfg.Container.XpatchTidCacheSizeMB > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.tid_cache_size_mb=%d", globalCfg.Container.XpatchTidCacheSizeMB))
+		}
+		if globalCfg.Container.XpatchSeqTidCacheSizeMB > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.seq_tid_cache_size_mb=%d", globalCfg.Container.XpatchSeqTidCacheSizeMB))
 		}
 	}
 

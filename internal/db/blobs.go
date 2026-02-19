@@ -1415,6 +1415,143 @@ func (db *DB) searchPerVersion(ctx context.Context, refs []searchRef, opts Searc
 	return allResults, nil
 }
 
+// PreRegisterPaths inserts all paths into pgit_paths in a single transaction
+// and returns the complete path -> group_id mapping. This eliminates per-worker
+// path lookup queries during import. Paths that already exist are returned as-is.
+func (db *DB) PreRegisterPaths(ctx context.Context, paths []string) (map[string]int32, error) {
+	if len(paths) == 0 {
+		return make(map[string]int32), nil
+	}
+
+	result := make(map[string]int32, len(paths))
+
+	// First, get all existing paths in one query
+	rows, err := db.Query(ctx,
+		"SELECT group_id, path FROM pgit_paths WHERE path = ANY($1)",
+		paths,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query existing paths: %w", err)
+	}
+	for rows.Next() {
+		var groupID int32
+		var path string
+		if err := rows.Scan(&groupID, &path); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		result[path] = groupID
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Find missing paths
+	var missingPaths []string
+	for _, p := range paths {
+		if _, exists := result[p]; !exists {
+			missingPaths = append(missingPaths, p)
+		}
+	}
+
+	if len(missingPaths) == 0 {
+		return result, nil
+	}
+
+	// Insert missing paths in batches within a single transaction
+	const batchSize = 1000
+	err = db.WithTx(ctx, func(tx pgx.Tx) error {
+		for i := 0; i < len(missingPaths); i += batchSize {
+			end := i + batchSize
+			if end > len(missingPaths) {
+				end = len(missingPaths)
+			}
+			batch := missingPaths[i:end]
+
+			for _, path := range batch {
+				var groupID int32
+				err := tx.QueryRow(ctx,
+					`INSERT INTO pgit_paths (path) VALUES ($1)
+					 ON CONFLICT (path) DO UPDATE SET path = EXCLUDED.path
+					 RETURNING group_id`,
+					path,
+				).Scan(&groupID)
+				if err != nil {
+					return err
+				}
+				result[path] = groupID
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to register paths: %w", err)
+	}
+
+	return result, nil
+}
+
+// CreateBlobsBatchFast inserts multiple blobs for multiple paths in a single transaction.
+// Unlike CreateBlobs (which is per-path), this batches across paths.
+// pathToGroupID must be pre-populated via PreRegisterPaths.
+// versionCounters tracks the next version_id per group_id (caller manages this).
+// This skips the version_id MAX query by using caller-managed counters.
+func (db *DB) CreateBlobsBatchFast(ctx context.Context, blobs []*Blob, pathToGroupID map[string]int32, versionCounters map[int32]*int32) error {
+	if len(blobs) == 0 {
+		return nil
+	}
+
+	return db.WithTx(ctx, func(tx pgx.Tx) error {
+		var fileRefs []*FileRef
+		var contents []*Content
+
+		for _, b := range blobs {
+			groupID, ok := pathToGroupID[b.Path]
+			if !ok {
+				return fmt.Errorf("path not pre-registered: %s", b.Path)
+			}
+
+			// Atomically increment version counter for this group
+			counter := versionCounters[groupID]
+			*counter++
+			versionID := *counter
+
+			fileRefs = append(fileRefs, &FileRef{
+				GroupID:       groupID,
+				CommitID:      b.CommitID,
+				VersionID:     versionID,
+				ContentHash:   b.ContentHash,
+				Mode:          b.Mode,
+				IsSymlink:     b.IsSymlink,
+				SymlinkTarget: b.SymlinkTarget,
+				IsBinary:      b.IsBinary,
+			})
+
+			if b.ContentHash != nil {
+				contents = append(contents, &Content{
+					GroupID:   groupID,
+					VersionID: versionID,
+					Content:   b.Content,
+					IsBinary:  b.IsBinary,
+				})
+			}
+		}
+
+		// Batch insert file refs via COPY
+		if err := db.createFileRefsBatchTx(ctx, tx, fileRefs); err != nil {
+			return err
+		}
+
+		// Batch insert contents via COPY
+		if err := db.createContentsBatchTx(ctx, tx, contents); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
 // CountBlobs returns the total number of blob versions (file refs).
 func (db *DB) CountBlobs(ctx context.Context) (int64, error) {
 	return db.CountFileRefs(ctx)

@@ -37,8 +37,21 @@ type ContainerConfig struct {
 	MaxWorkerProcesses   int    `toml:"max_worker_processes" config:"container.max_worker_processes" default:"4" min:"1" max:"64" desc:"Max worker processes"`
 	MaxParallelPerGather int    `toml:"max_parallel_per_gather" config:"container.max_parallel_per_gather" default:"2" min:"0" max:"16" desc:"Workers per gather"`
 
+	// WAL / checkpoint tuning
+	MaxWalSize        string `toml:"max_wal_size" config:"container.max_wal_size" default:"4GB" desc:"Max WAL size before checkpoint"`
+	CheckpointTimeout string `toml:"checkpoint_timeout" config:"container.checkpoint_timeout" default:"30min" desc:"Time between automatic checkpoints"`
+	WalBuffers        string `toml:"wal_buffers" config:"container.wal_buffers" default:"64MB" desc:"WAL buffer size"`
+
 	// pg-xpatch extension settings
-	XpatchCacheSizeMB int `toml:"xpatch_cache_size_mb" config:"container.xpatch_cache_size_mb" default:"256" min:"16" max:"4096" desc:"xpatch content cache size in MB"`
+	XpatchCacheSizeMB       int `toml:"xpatch_cache_size_mb" config:"container.xpatch_cache_size_mb" default:"256" min:"1" max:"65536" desc:"xpatch content cache size in MB"`
+	XpatchCacheMaxEntries   int `toml:"xpatch_cache_max_entries" config:"container.xpatch_cache_max_entries" default:"65536" min:"1000" max:"2147483647" desc:"xpatch max cache entries"`
+	XpatchCacheMaxEntryKB   int `toml:"xpatch_cache_max_entry_kb" config:"container.xpatch_cache_max_entry_kb" default:"4096" min:"16" max:"2147483647" desc:"xpatch max single cache entry size in KB"`
+	XpatchCachePartitions   int `toml:"xpatch_cache_partitions" config:"container.xpatch_cache_partitions" default:"32" min:"1" max:"256" desc:"xpatch cache lock partitions"`
+	XpatchEncodeThreads     int `toml:"xpatch_encode_threads" config:"container.xpatch_encode_threads" default:"4" min:"0" max:"64" desc:"xpatch parallel delta encoding threads"`
+	XpatchInsertCacheSlots  int `toml:"xpatch_insert_cache_slots" config:"container.xpatch_insert_cache_slots" default:"64" min:"1" max:"2147483647" desc:"xpatch insert cache FIFO slots"`
+	XpatchGroupCacheSizeMB  int `toml:"xpatch_group_cache_size_mb" config:"container.xpatch_group_cache_size_mb" default:"16" min:"1" max:"2147483647" desc:"xpatch group max-seq cache in MB"`
+	XpatchTidCacheSizeMB    int `toml:"xpatch_tid_cache_size_mb" config:"container.xpatch_tid_cache_size_mb" default:"16" min:"1" max:"2147483647" desc:"xpatch TID seq cache in MB"`
+	XpatchSeqTidCacheSizeMB int `toml:"xpatch_seq_tid_cache_size_mb" config:"container.xpatch_seq_tid_cache_size_mb" default:"16" min:"1" max:"2147483647" desc:"xpatch seq-to-TID cache in MB"`
 }
 
 // ImportConfig contains default import settings
@@ -58,17 +71,28 @@ func DefaultGlobalConfig() *GlobalConfig {
 	// Users with more resources can increase via pgit config --global
 	return &GlobalConfig{
 		Container: ContainerConfig{
-			ShmSize:              "256m",
-			Port:                 5433,
-			Image:                "", // Empty means use default
-			MaxConnections:       100,
-			SharedBuffers:        "256MB",
-			WorkMem:              "16MB",
-			EffectiveCacheSize:   "1GB",
-			MaxParallelWorkers:   4,
-			MaxWorkerProcesses:   4,
-			MaxParallelPerGather: 2,
-			XpatchCacheSizeMB:    256,
+			ShmSize:                 "256m",
+			Port:                    5433,
+			Image:                   "", // Empty means use default
+			MaxConnections:          100,
+			SharedBuffers:           "256MB",
+			WorkMem:                 "16MB",
+			EffectiveCacheSize:      "1GB",
+			MaxParallelWorkers:      4,
+			MaxWorkerProcesses:      4,
+			MaxParallelPerGather:    2,
+			MaxWalSize:              "4GB",
+			CheckpointTimeout:       "30min",
+			WalBuffers:              "64MB",
+			XpatchCacheSizeMB:       256,
+			XpatchCacheMaxEntries:   65536,
+			XpatchCacheMaxEntryKB:   4096,
+			XpatchCachePartitions:   32,
+			XpatchEncodeThreads:     4,
+			XpatchInsertCacheSlots:  64,
+			XpatchGroupCacheSizeMB:  16,
+			XpatchTidCacheSizeMB:    16,
+			XpatchSeqTidCacheSizeMB: 16,
 		},
 		Import: ImportConfig{
 			Workers: workers,
@@ -143,8 +167,41 @@ func LoadGlobal() (*GlobalConfig, error) {
 	if cfg.Container.MaxParallelPerGather == 0 {
 		cfg.Container.MaxParallelPerGather = defaults.Container.MaxParallelPerGather
 	}
+	if cfg.Container.MaxWalSize == "" {
+		cfg.Container.MaxWalSize = defaults.Container.MaxWalSize
+	}
+	if cfg.Container.CheckpointTimeout == "" {
+		cfg.Container.CheckpointTimeout = defaults.Container.CheckpointTimeout
+	}
+	if cfg.Container.WalBuffers == "" {
+		cfg.Container.WalBuffers = defaults.Container.WalBuffers
+	}
 	if cfg.Container.XpatchCacheSizeMB == 0 {
 		cfg.Container.XpatchCacheSizeMB = defaults.Container.XpatchCacheSizeMB
+	}
+	if cfg.Container.XpatchCacheMaxEntries == 0 {
+		cfg.Container.XpatchCacheMaxEntries = defaults.Container.XpatchCacheMaxEntries
+	}
+	if cfg.Container.XpatchCacheMaxEntryKB == 0 {
+		cfg.Container.XpatchCacheMaxEntryKB = defaults.Container.XpatchCacheMaxEntryKB
+	}
+	if cfg.Container.XpatchCachePartitions == 0 {
+		cfg.Container.XpatchCachePartitions = defaults.Container.XpatchCachePartitions
+	}
+	if cfg.Container.XpatchEncodeThreads == 0 {
+		cfg.Container.XpatchEncodeThreads = defaults.Container.XpatchEncodeThreads
+	}
+	if cfg.Container.XpatchInsertCacheSlots == 0 {
+		cfg.Container.XpatchInsertCacheSlots = defaults.Container.XpatchInsertCacheSlots
+	}
+	if cfg.Container.XpatchGroupCacheSizeMB == 0 {
+		cfg.Container.XpatchGroupCacheSizeMB = defaults.Container.XpatchGroupCacheSizeMB
+	}
+	if cfg.Container.XpatchTidCacheSizeMB == 0 {
+		cfg.Container.XpatchTidCacheSizeMB = defaults.Container.XpatchTidCacheSizeMB
+	}
+	if cfg.Container.XpatchSeqTidCacheSizeMB == 0 {
+		cfg.Container.XpatchSeqTidCacheSizeMB = defaults.Container.XpatchSeqTidCacheSizeMB
 	}
 	if cfg.Import.Workers == 0 {
 		cfg.Import.Workers = defaults.Import.Workers

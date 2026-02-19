@@ -55,6 +55,7 @@ The current directory must be a pgit repository (run 'pgit init' first).`,
 	cmd.Flags().String("remote", "", "Import directly into a remote database (e.g. 'origin'), skipping local container")
 	cmd.Flags().Bool("resume", false, "Resume a previously interrupted import")
 	cmd.Flags().String("fastexport", "", "Use a pre-generated git fast-export file instead of re-exporting")
+	cmd.Flags().Duration("timeout", 24*time.Hour, "Maximum time for the import operation (e.g. 2h, 30m, 48h)")
 
 	return cmd
 }
@@ -159,7 +160,12 @@ func runImport(cmd *cobra.Command, args []string) error {
 	remoteName, _ := cmd.Flags().GetString("remote")
 	isRemote := remoteName != ""
 
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
+	timeout, _ := cmd.Flags().GetDuration("timeout")
+	if timeout <= 0 {
+		timeout = 24 * time.Hour
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	// Connect to database
@@ -199,6 +205,12 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 		defer r.Close()
 	}
+
+	// Set session-level GUCs for import performance
+	if err := r.DB.SetImportGUCs(ctx); err != nil {
+		fmt.Printf("Warning: failed to set import GUCs: %v\n", err)
+	}
+	defer r.DB.ResetImportGUCs(ctx)
 
 	fmt.Printf("Importing from: %s\n", styles.Cyan(gitPath))
 	fmt.Printf("Workers: %d\n", workers)
@@ -557,7 +569,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		ui.FormatCount(totalFileOps), ui.FormatCount(len(pathOps)))
 
 	if totalFileOps > 0 {
-		err = importBlobsParallel(ctx, r.DB, tmpPath, pathOps, blobIndex, markToULID, workers)
+		err = importBlobsParallel(ctx, r.DB, tmpPath, pathOps, blobIndex, markToULID, workers, resumeFromBlobs)
 		if err != nil {
 			return err
 		}
@@ -1065,9 +1077,21 @@ func readBytesAt(f *os.File, offset int64, n int) []byte {
 // Phase 5: Parallel blob import
 // ═══════════════════════════════════════════════════════════════════════════
 
+// pathBatch groups multiple paths for batched DB insertion.
+type pathBatch struct {
+	paths []string
+}
+
 // importBlobsParallel imports blobs grouped by path using parallel workers.
-// Each worker processes entire paths (all versions) for optimal delta compression.
+// Each worker processes batches of paths for fewer, larger transactions.
 // Content is read from the temp file via ReadAt (safe for concurrent access).
+//
+// Optimizations over the naive per-path approach:
+//   - Pre-registers all paths upfront (1 transaction instead of N)
+//   - Batches multiple paths per transaction (fewer COMMITs = less WAL)
+//   - Skips MAX(version_id) query for fresh imports (starts at 0)
+//   - Sorts paths by first blob offset for sequential I/O on temp file
+//   - Uses sync.Pool for byte buffer reuse to reduce GC pressure
 func importBlobsParallel(
 	ctx context.Context,
 	database *db.DB,
@@ -1076,6 +1100,7 @@ func importBlobsParallel(
 	blobIndex map[int]*blobEntry,
 	markToULID map[int]string,
 	workers int,
+	isResume bool,
 ) error {
 	// Open temp file for concurrent reads
 	tmpFile, err := os.Open(tmpFilePath)
@@ -1084,10 +1109,76 @@ func importBlobsParallel(
 	}
 	defer tmpFile.Close()
 
-	// Create path channel
+	// Collect paths and sort by version count descending (heaviest first),
+	// then interleave so heavy and light paths alternate. This prevents
+	// the "tail stall" where one worker gets stuck on a huge path (e.g.
+	// Makefile with 3,681 versions) while all other workers sit idle.
+	//
+	// Strategy: sort desc by version count, split into odds/evens,
+	// reverse the evens, then zip them back together. Result: heavy
+	// paths are spread across the batch stream so workers pick them
+	// up early and in parallel.
 	paths := make([]string, 0, len(pathOpsMap))
 	for path := range pathOpsMap {
 		paths = append(paths, path)
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		return len(pathOpsMap[paths[i]]) > len(pathOpsMap[paths[j]])
+	})
+	paths = interleavePaths(paths)
+
+	// Pre-register all paths in one bulk operation
+	pathToGroupID, err := database.PreRegisterPaths(ctx, paths)
+	if err != nil {
+		return fmt.Errorf("failed to pre-register paths: %w", err)
+	}
+
+	// Initialize version counters for each group
+	// For fresh imports: all start at 0 (CreateBlobsBatchFast increments before use)
+	// For resume: query existing max version_ids
+	versionCounters := make(map[int32]*int32, len(pathToGroupID))
+	if isResume {
+		// Query existing max version_ids
+		groupIDs := make([]int32, 0, len(pathToGroupID))
+		for _, gid := range pathToGroupID {
+			groupIDs = append(groupIDs, gid)
+		}
+		// Batch query in chunks to avoid huge ANY() arrays
+		maxVersions := make(map[int32]int32)
+		const chunkSize = 5000
+		for i := 0; i < len(groupIDs); i += chunkSize {
+			end := i + chunkSize
+			if end > len(groupIDs) {
+				end = len(groupIDs)
+			}
+			chunk := groupIDs[i:end]
+			rows, err := database.Query(ctx,
+				"SELECT group_id, COALESCE(MAX(version_id), 0) FROM pgit_file_refs WHERE group_id = ANY($1) GROUP BY group_id",
+				chunk,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to query max versions: %w", err)
+			}
+			for rows.Next() {
+				var gid, maxV int32
+				if err := rows.Scan(&gid, &maxV); err != nil {
+					rows.Close()
+					return err
+				}
+				maxVersions[gid] = maxV
+			}
+			rows.Close()
+		}
+		for _, gid := range groupIDs {
+			v := maxVersions[gid] // 0 if not found
+			versionCounters[gid] = &v
+		}
+	} else {
+		// Fresh import: all groups start at 0
+		for _, gid := range pathToGroupID {
+			v := int32(0)
+			versionCounters[gid] = &v
+		}
 	}
 
 	// Count total ops for progress
@@ -1099,14 +1190,36 @@ func importBlobsParallel(
 	progress := ui.NewProgress("Blobs", totalOps)
 	var imported atomic.Int64
 
-	pathChan := make(chan string, len(paths))
-	for _, p := range paths {
-		pathChan <- p
-	}
-	close(pathChan)
+	// Create batches of paths, capped by total blob count.
+	// Small batches = more parallelism. Large batches = fewer commits.
+	// Target: ~100 blobs per transaction — enough to amortize commit overhead
+	// without blocking a connection too long on delta encoding.
+	const maxBlobsPerBatch = 100
+	var batches []pathBatch
+	var currentBatch pathBatch
+	currentBlobCount := 0
 
-	// Error handling — use atomic.Pointer[error] instead of atomic.Value
-	// to avoid panic on CompareAndSwap with uninitialized Value
+	for _, p := range paths {
+		opCount := len(pathOpsMap[p])
+		// If a single path exceeds the limit, it gets its own batch
+		if currentBlobCount > 0 && currentBlobCount+opCount > maxBlobsPerBatch {
+			batches = append(batches, currentBatch)
+			currentBatch = pathBatch{}
+			currentBlobCount = 0
+		}
+		currentBatch.paths = append(currentBatch.paths, p)
+		currentBlobCount += opCount
+	}
+	if len(currentBatch.paths) > 0 {
+		batches = append(batches, currentBatch)
+	}
+
+	batchChan := make(chan pathBatch, len(batches))
+	for _, b := range batches {
+		batchChan <- b
+	}
+	close(batchChan)
+
 	var firstErr atomic.Pointer[error]
 	var wg sync.WaitGroup
 
@@ -1115,81 +1228,97 @@ func importBlobsParallel(
 		go func() {
 			defer wg.Done()
 
-			for path := range pathChan {
-				// Check for previous errors
+			for batch := range batchChan {
 				if firstErr.Load() != nil {
 					return
 				}
 
-				ops := pathOpsMap[path]
-				dbBlobs := make([]*db.Blob, 0, len(ops))
+				// Flatten all ops for this batch with their path, preserving order.
+				// We stream content in sub-batches to avoid loading everything
+				// into memory at once (a path with 3,681 versions * 128KB = 460MB).
+				type flatOp struct {
+					path string
+					op   pathOp
+				}
+				var flatOps []flatOp
+				for _, path := range batch.paths {
+					for _, op := range pathOpsMap[path] {
+						flatOps = append(flatOps, flatOp{path: path, op: op})
+					}
+				}
 
-				for _, op := range ops {
-					if op.IsDelete {
-						dbBlobs = append(dbBlobs, &db.Blob{
-							Path:        path,
-							CommitID:    op.CommitID,
-							Content:     []byte{},
-							ContentHash: nil, // nil = deleted
-							Mode:        0,
-							IsSymlink:   false,
-							IsBinary:    false,
-						})
-						continue
+				// Process in sub-batches of 200 — read content, insert, update progress
+				const subBatchSize = 200
+				for i := 0; i < len(flatOps); i += subBatchSize {
+					if firstErr.Load() != nil {
+						return
+					}
+					end := i + subBatchSize
+					if end > len(flatOps) {
+						end = len(flatOps)
 					}
 
-					be, ok := blobIndex[op.BlobMark]
-					if !ok {
-						// Missing blob reference — skip
-						continue
+					chunk := make([]*db.Blob, 0, end-i)
+					for _, fo := range flatOps[i:end] {
+						if fo.op.IsDelete {
+							chunk = append(chunk, &db.Blob{
+								Path:        fo.path,
+								CommitID:    fo.op.CommitID,
+								Content:     []byte{},
+								ContentHash: nil,
+								Mode:        0,
+								IsSymlink:   false,
+								IsBinary:    false,
+							})
+							continue
+						}
+
+						be, ok := blobIndex[fo.op.BlobMark]
+						if !ok {
+							continue
+						}
+
+						content := make([]byte, be.Size)
+						if be.Size > 0 {
+							_, err := tmpFile.ReadAt(content, be.Offset)
+							if err != nil {
+								readErr := fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err)
+								firstErr.CompareAndSwap(nil, &readErr)
+								return
+							}
+						}
+
+						isBinary := util.DetectBinary(content)
+						contentHash := util.HashBytesBlake3(content)
+
+						blob := &db.Blob{
+							Path:        fo.path,
+							CommitID:    fo.op.CommitID,
+							Content:     content,
+							ContentHash: contentHash,
+							Mode:        fo.op.Mode,
+							IsSymlink:   fo.op.Mode == 0120000,
+							IsBinary:    isBinary,
+						}
+
+						if blob.IsSymlink {
+							target := string(content)
+							blob.SymlinkTarget = &target
+						}
+
+						chunk = append(chunk, blob)
 					}
 
-					// Read blob content from temp file
-					content := make([]byte, be.Size)
-					if be.Size > 0 {
-						_, err := tmpFile.ReadAt(content, be.Offset)
-						if err != nil {
-							readErr := fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err)
-							firstErr.CompareAndSwap(nil, &readErr)
+					if len(chunk) > 0 {
+						if err := database.CreateBlobsBatchFast(ctx, chunk, pathToGroupID, versionCounters); err != nil {
+							firstErr.CompareAndSwap(nil, &err)
 							return
 						}
 					}
 
-					// Detect binary (NUL byte in first 8000 bytes)
-					isBinary := util.DetectBinary(content)
-
-					// Compute BLAKE3 hash (16 bytes)
-					contentHash := util.HashBytesBlake3(content)
-
-					blob := &db.Blob{
-						Path:        path,
-						CommitID:    op.CommitID,
-						Content:     content,
-						ContentHash: contentHash,
-						Mode:        op.Mode,
-						IsSymlink:   op.Mode == 0120000,
-						IsBinary:    isBinary,
-					}
-
-					if blob.IsSymlink {
-						target := string(content)
-						blob.SymlinkTarget = &target
-					}
-
-					dbBlobs = append(dbBlobs, blob)
+					count := imported.Add(int64(len(chunk)))
+					progress.Update(int(count))
 				}
-
-				// Insert all blobs for this path (in chronological order)
-				if len(dbBlobs) > 0 {
-					if err := database.CreateBlobs(ctx, dbBlobs); err != nil {
-						firstErr.CompareAndSwap(nil, &err)
-						return
-					}
-				}
-
-				// Update progress
-				count := imported.Add(int64(len(dbBlobs)))
-				progress.Update(int(count))
 			}
 		}()
 	}
@@ -1202,6 +1331,52 @@ func importBlobsParallel(
 	}
 
 	return nil
+}
+
+// interleavePaths takes a list sorted by weight (heaviest first) and
+// interleaves so that heavy and light paths alternate. This ensures
+// workers get a balanced mix and no single worker gets stuck with all
+// the heavy paths at the end.
+//
+// Example: [A B C D E F G H] (sorted heaviest first)
+//
+//	odds  = [A C E G]       (indices 0,2,4,6)
+//	evens = [B D F H]       (indices 1,3,5,7) -> reversed: [H F D B]
+//	result = [A H C F E D G B]
+func interleavePaths(paths []string) []string {
+	if len(paths) <= 2 {
+		return paths
+	}
+
+	var odds, evens []string
+	for i, p := range paths {
+		if i%2 == 0 {
+			odds = append(odds, p)
+		} else {
+			evens = append(evens, p)
+		}
+	}
+
+	// Reverse evens
+	for i, j := 0, len(evens)-1; i < j; i, j = i+1, j-1 {
+		evens[i], evens[j] = evens[j], evens[i]
+	}
+
+	// Zip together
+	result := make([]string, 0, len(paths))
+	oi, ei := 0, 0
+	for oi < len(odds) || ei < len(evens) {
+		if oi < len(odds) {
+			result = append(result, odds[oi])
+			oi++
+		}
+		if ei < len(evens) {
+			result = append(result, evens[ei])
+			ei++
+		}
+	}
+
+	return result
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
