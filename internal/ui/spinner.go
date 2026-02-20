@@ -214,6 +214,9 @@ func (p *Progress) render() {
 
 	pct := p.current * 100 / p.total
 
+	// Phase elapsed time
+	phaseElapsed := FormatDuration(time.Since(p.startTime))
+
 	// Non-TTY mode: print only at percentage milestones
 	if !p.isTTY {
 		milestone := (pct / 10) * 10 // Round down to nearest 10%
@@ -227,7 +230,7 @@ func (p *Progress) render() {
 			if eta != "" {
 				eta = " ETA " + eta
 			}
-			fmt.Printf("%s: %d%% [%d/%d]%s%s\n", p.label, pct, p.current, p.total, rate, eta)
+			fmt.Printf("%s: %d%% [%d/%d]%s%s (%s)\n", p.label, pct, p.current, p.total, rate, eta, phaseElapsed)
 		}
 		return
 	}
@@ -255,7 +258,9 @@ func (p *Progress) render() {
 		eta = " " + eta
 	}
 
-	suffix := lipgloss.NewStyle().Foreground(styles.Muted).Render(rate + eta)
+	suffix := lipgloss.NewStyle().Foreground(styles.Muted).Render(
+		fmt.Sprintf("%s%s (%s)", rate, eta, phaseElapsed),
+	)
 
 	// \r = return to start, \033[K = clear to end of line
 	fmt.Printf("\r\033[K%s %s %3d%% [%d/%d]%s", p.label, bar, pct, p.current, p.total, suffix)
