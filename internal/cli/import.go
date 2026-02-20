@@ -569,10 +569,36 @@ func runImport(cmd *cobra.Command, args []string) error {
 		ui.FormatCount(totalFileOps), ui.FormatCount(len(pathOps)))
 
 	if totalFileOps > 0 {
+		// Drop secondary indexes on pgit_file_refs before bulk import.
+		// Random ULID-based commit_id insertions cause massive B-tree
+		// degradation at scale (24M rows). Rebuilding after is O(n log n)
+		// in one pass vs O(n * log n) random page lookups during insert.
+		fmt.Print("Dropping file_refs indexes for bulk import...")
+		if err := r.DB.DropFileRefsIndexes(ctx); err != nil {
+			fmt.Printf(" warning: %v\n", err)
+		} else {
+			fmt.Println(" done")
+		}
+
 		err = importBlobsParallel(ctx, r.DB, tmpPath, pathOps, blobIndex, markToULID, workers, resumeFromBlobs)
 		if err != nil {
+			// Still try to recreate indexes even on error
+			fmt.Print("\nRebuilding file_refs indexes...")
+			if idxErr := r.DB.CreateFileRefsIndexes(ctx); idxErr != nil {
+				fmt.Printf(" warning: %v\n", idxErr)
+			} else {
+				fmt.Println(" done")
+			}
 			return err
 		}
+
+		// Rebuild indexes after bulk import
+		fmt.Print("Rebuilding file_refs indexes...")
+		rebuildStart := time.Now()
+		if err := r.DB.CreateFileRefsIndexes(ctx); err != nil {
+			return fmt.Errorf("failed to rebuild indexes: %w", err)
+		}
+		fmt.Printf(" done (%s)\n", time.Since(rebuildStart).Round(time.Second))
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════

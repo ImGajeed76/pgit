@@ -34,6 +34,28 @@ func Connect(ctx context.Context, url string) (*DB, error) {
 	config.MaxConnLifetime = time.Hour
 	config.MaxConnIdleTime = 30 * time.Minute
 
+	db := &DB{
+		url: url,
+	}
+
+	// Register AfterConnect hook to apply import GUCs to new connections.
+	// When importGUCs is set (during import), every new connection gets the
+	// session-level settings automatically — no more missed connections.
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		db.mu.RLock()
+		gucs := db.importGUCs
+		db.mu.RUnlock()
+
+		if len(gucs) > 0 {
+			for _, guc := range gucs {
+				if _, err := conn.Exec(ctx, guc); err != nil {
+					return fmt.Errorf("failed to set GUC %q on new connection: %w", guc, err)
+				}
+			}
+		}
+		return nil
+	}
+
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect: %w", err)
@@ -45,10 +67,7 @@ func Connect(ctx context.Context, url string) (*DB, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	db := &DB{
-		pool: pool,
-		url:  url,
-	}
+	db.pool = pool
 
 	return db, nil
 }

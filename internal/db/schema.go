@@ -262,6 +262,33 @@ func (db *DB) createSyncStateTable(ctx context.Context) error {
 	return nil
 }
 
+// DropFileRefsIndexes drops the secondary indexes on pgit_file_refs.
+// The primary key (group_id, commit_id) is kept for COPY conflict detection.
+// Call this before bulk import to avoid random B-tree insertions, then
+// call CreateFileRefsIndexes after import to rebuild them efficiently.
+func (db *DB) DropFileRefsIndexes(ctx context.Context) error {
+	if err := db.Exec(ctx, "DROP INDEX IF EXISTS idx_file_refs_commit"); err != nil {
+		return fmt.Errorf("failed to drop idx_file_refs_commit: %w", err)
+	}
+	if err := db.Exec(ctx, "DROP INDEX IF EXISTS idx_file_refs_version"); err != nil {
+		return fmt.Errorf("failed to drop idx_file_refs_version: %w", err)
+	}
+	return nil
+}
+
+// CreateFileRefsIndexes creates the secondary indexes on pgit_file_refs.
+// This is much faster than maintaining indexes during bulk insert because
+// PostgreSQL can sort and bulk-load the B-tree in a single pass.
+func (db *DB) CreateFileRefsIndexes(ctx context.Context) error {
+	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_commit ON pgit_file_refs(commit_id)"); err != nil {
+		return fmt.Errorf("failed to create idx_file_refs_commit: %w", err)
+	}
+	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_version ON pgit_file_refs(group_id, version_id)"); err != nil {
+		return fmt.Errorf("failed to create idx_file_refs_version: %w", err)
+	}
+	return nil
+}
+
 // SchemaExists checks if the pgit schema exists
 func (db *DB) SchemaExists(ctx context.Context) (bool, error) {
 	var exists bool

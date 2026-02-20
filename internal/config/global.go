@@ -47,7 +47,7 @@ type ContainerConfig struct {
 	XpatchCacheMaxEntries   int `toml:"xpatch_cache_max_entries" config:"container.xpatch_cache_max_entries" default:"65536" min:"1000" max:"2147483647" desc:"xpatch max cache entries"`
 	XpatchCacheMaxEntryKB   int `toml:"xpatch_cache_max_entry_kb" config:"container.xpatch_cache_max_entry_kb" default:"4096" min:"16" max:"2147483647" desc:"xpatch max single cache entry size in KB"`
 	XpatchCachePartitions   int `toml:"xpatch_cache_partitions" config:"container.xpatch_cache_partitions" default:"32" min:"1" max:"256" desc:"xpatch cache lock partitions"`
-	XpatchEncodeThreads     int `toml:"xpatch_encode_threads" config:"container.xpatch_encode_threads" default:"4" min:"0" max:"64" desc:"xpatch parallel delta encoding threads"`
+	XpatchEncodeThreads     int `toml:"xpatch_encode_threads" config:"container.xpatch_encode_threads" default:"0" min:"0" max:"64" desc:"xpatch parallel delta encoding threads (0=sequential)"`
 	XpatchInsertCacheSlots  int `toml:"xpatch_insert_cache_slots" config:"container.xpatch_insert_cache_slots" default:"64" min:"1" max:"2147483647" desc:"xpatch insert cache FIFO slots"`
 	XpatchGroupCacheSizeMB  int `toml:"xpatch_group_cache_size_mb" config:"container.xpatch_group_cache_size_mb" default:"16" min:"1" max:"2147483647" desc:"xpatch group max-seq cache in MB"`
 	XpatchTidCacheSizeMB    int `toml:"xpatch_tid_cache_size_mb" config:"container.xpatch_tid_cache_size_mb" default:"16" min:"1" max:"2147483647" desc:"xpatch TID seq cache in MB"`
@@ -88,7 +88,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 			XpatchCacheMaxEntries:   65536,
 			XpatchCacheMaxEntryKB:   4096,
 			XpatchCachePartitions:   32,
-			XpatchEncodeThreads:     4,
+			XpatchEncodeThreads:     0,
 			XpatchInsertCacheSlots:  64,
 			XpatchGroupCacheSizeMB:  16,
 			XpatchTidCacheSizeMB:    16,
@@ -188,9 +188,8 @@ func LoadGlobal() (*GlobalConfig, error) {
 	if cfg.Container.XpatchCachePartitions == 0 {
 		cfg.Container.XpatchCachePartitions = defaults.Container.XpatchCachePartitions
 	}
-	if cfg.Container.XpatchEncodeThreads == 0 {
-		cfg.Container.XpatchEncodeThreads = defaults.Container.XpatchEncodeThreads
-	}
+	// NOTE: XpatchEncodeThreads is NOT defaulted here because 0 is a valid
+	// value (sequential encoding). The default in DefaultGlobalConfig() is 0.
 	if cfg.Container.XpatchInsertCacheSlots == 0 {
 		cfg.Container.XpatchInsertCacheSlots = defaults.Container.XpatchInsertCacheSlots
 	}

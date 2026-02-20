@@ -250,9 +250,8 @@ func StartContainer(runtime Runtime, port int) error {
 		if globalCfg.Container.XpatchCachePartitions > 0 {
 			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_partitions=%d", globalCfg.Container.XpatchCachePartitions))
 		}
-		if globalCfg.Container.XpatchEncodeThreads > 0 {
-			args = append(args, "-c", fmt.Sprintf("pg_xpatch.encode_threads=%d", globalCfg.Container.XpatchEncodeThreads))
-		}
+		// Always pass encode_threads — 0 is a valid value (sequential encoding)
+		args = append(args, "-c", fmt.Sprintf("pg_xpatch.encode_threads=%d", globalCfg.Container.XpatchEncodeThreads))
 		if globalCfg.Container.XpatchInsertCacheSlots > 0 {
 			args = append(args, "-c", fmt.Sprintf("pg_xpatch.insert_cache_slots=%d", globalCfg.Container.XpatchInsertCacheSlots))
 		}
