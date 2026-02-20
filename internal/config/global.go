@@ -43,15 +43,16 @@ type ContainerConfig struct {
 	WalBuffers        string `toml:"wal_buffers" config:"container.wal_buffers" default:"64MB" desc:"WAL buffer size"`
 
 	// pg-xpatch extension settings
-	XpatchCacheSizeMB       int `toml:"xpatch_cache_size_mb" config:"container.xpatch_cache_size_mb" default:"256" min:"1" max:"65536" desc:"xpatch content cache size in MB"`
-	XpatchCacheMaxEntries   int `toml:"xpatch_cache_max_entries" config:"container.xpatch_cache_max_entries" default:"65536" min:"1000" max:"2147483647" desc:"xpatch max cache entries"`
-	XpatchCacheMaxEntryKB   int `toml:"xpatch_cache_max_entry_kb" config:"container.xpatch_cache_max_entry_kb" default:"4096" min:"16" max:"2147483647" desc:"xpatch max single cache entry size in KB"`
+	// pg-xpatch extension settings (limits match pg_xpatch.c GUC definitions)
+	XpatchCacheSizeMB       int `toml:"xpatch_cache_size_mb" config:"container.xpatch_cache_size_mb" default:"256" min:"1" desc:"xpatch content cache size in MB"`
+	XpatchCacheMaxEntries   int `toml:"xpatch_cache_max_entries" config:"container.xpatch_cache_max_entries" default:"65536" min:"1000" desc:"xpatch max cache entries"`
+	XpatchCacheMaxEntryKB   int `toml:"xpatch_cache_max_entry_kb" config:"container.xpatch_cache_max_entry_kb" default:"256" min:"16" desc:"xpatch max single cache entry size in KB"`
 	XpatchCachePartitions   int `toml:"xpatch_cache_partitions" config:"container.xpatch_cache_partitions" default:"32" min:"1" max:"256" desc:"xpatch cache lock partitions"`
 	XpatchEncodeThreads     int `toml:"xpatch_encode_threads" config:"container.xpatch_encode_threads" default:"0" min:"0" max:"64" desc:"xpatch parallel delta encoding threads (0=sequential)"`
-	XpatchInsertCacheSlots  int `toml:"xpatch_insert_cache_slots" config:"container.xpatch_insert_cache_slots" default:"64" min:"1" max:"2147483647" desc:"xpatch insert cache FIFO slots"`
-	XpatchGroupCacheSizeMB  int `toml:"xpatch_group_cache_size_mb" config:"container.xpatch_group_cache_size_mb" default:"16" min:"1" max:"2147483647" desc:"xpatch group max-seq cache in MB"`
-	XpatchTidCacheSizeMB    int `toml:"xpatch_tid_cache_size_mb" config:"container.xpatch_tid_cache_size_mb" default:"16" min:"1" max:"2147483647" desc:"xpatch TID seq cache in MB"`
-	XpatchSeqTidCacheSizeMB int `toml:"xpatch_seq_tid_cache_size_mb" config:"container.xpatch_seq_tid_cache_size_mb" default:"16" min:"1" max:"2147483647" desc:"xpatch seq-to-TID cache in MB"`
+	XpatchInsertCacheSlots  int `toml:"xpatch_insert_cache_slots" config:"container.xpatch_insert_cache_slots" default:"16" min:"1" desc:"xpatch insert cache FIFO slots"`
+	XpatchGroupCacheSizeMB  int `toml:"xpatch_group_cache_size_mb" config:"container.xpatch_group_cache_size_mb" default:"16" min:"1" desc:"xpatch group max-seq cache in MB"`
+	XpatchTidCacheSizeMB    int `toml:"xpatch_tid_cache_size_mb" config:"container.xpatch_tid_cache_size_mb" default:"16" min:"1" desc:"xpatch TID seq cache in MB"`
+	XpatchSeqTidCacheSizeMB int `toml:"xpatch_seq_tid_cache_size_mb" config:"container.xpatch_seq_tid_cache_size_mb" default:"16" min:"1" desc:"xpatch seq-to-TID cache in MB"`
 }
 
 // ImportConfig contains default import settings
@@ -86,10 +87,10 @@ func DefaultGlobalConfig() *GlobalConfig {
 			WalBuffers:              "64MB",
 			XpatchCacheSizeMB:       256,
 			XpatchCacheMaxEntries:   65536,
-			XpatchCacheMaxEntryKB:   4096,
+			XpatchCacheMaxEntryKB:   256,
 			XpatchCachePartitions:   32,
 			XpatchEncodeThreads:     0,
-			XpatchInsertCacheSlots:  64,
+			XpatchInsertCacheSlots:  16,
 			XpatchGroupCacheSizeMB:  16,
 			XpatchTidCacheSizeMB:    16,
 			XpatchSeqTidCacheSizeMB: 16,
