@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resolveBaseRef` uses the graph table for exact/partial ID matching instead of xpatch
 - `search.go` uses `GetCommitsBatchByRange` (contiguous range scan) instead of `GetCommitsBatch` (ANY scatter-read)
 - Connection pool `MaxConns` reduced from 64 to 32 to stay within PostgreSQL's default `max_connections=50`
-- Benchmark scorecard improved from 9-9-1 (v3) to 13-7 pgit wins; hugo compression fixed from 2.6x to 5.1x; import durations reduced 5-25x across the suite
+- Benchmark scorecard improved from 9-9-1 (v3) to 12-8 pgit wins; hugo compression fixed from 2.6x to 5.1x; import durations reduced 5-25x across the suite
 
 ### Removed
 

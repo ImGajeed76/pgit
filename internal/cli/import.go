@@ -599,7 +599,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// Step 4b: Compute path groups (union-find on content hashes)
+	// Step 5b: Compute path groups (union-find on content hashes)
 	// ═══════════════════════════════════════════════════════════════════════
 
 	fmt.Print("Computing path groups...")
@@ -1673,16 +1673,6 @@ func interleaveGroups[T any](items []T) []T {
 	return result
 }
 
-// interleavePaths takes a list sorted by weight (heaviest first) and
-// interleaves so that heavy and light paths alternate. This ensures
-// workers get a balanced mix and no single worker gets stuck with all
-// the heavy paths at the end.
-//
-// Example: [A B C D E F G H] (sorted heaviest first)
-//
-//	odds  = [A C E G]       (indices 0,2,4,6)
-//	evens = [B D F H]       (indices 1,3,5,7) -> reversed: [H F D B]
-//	result = [A H C F E D G B]
 // ═══════════════════════════════════════════════════════════════════════════
 // Branch selection
 // ═══════════════════════════════════════════════════════════════════════════

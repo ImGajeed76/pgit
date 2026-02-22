@@ -169,7 +169,7 @@ Since pgit is primarily a demo for pg-xpatch compression, Docker/Podman provides
 
 Benchmarked on [20 real repositories](BENCHMARK.md) across 6 languages (274k total commits). Comparing `git gc --aggressive` packfile vs pgit actual data (excluding indexes for both):
 
-**Scorecard: pgit 13 wins, git 7 wins** out of 20 repositories.
+**Scorecard: pgit 12 wins, git 8 wins** out of 20 repositories.
 
 | Repository | Commits | Raw Size | git --aggressive | pgit | Winner |
 |:-----------|--------:|---------:|-----------------:|-----:|:-------|
