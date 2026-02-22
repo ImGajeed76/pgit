@@ -154,6 +154,8 @@ sudo apk add --allow-untrusted pgit_*_linux_amd64.apk
 - **Docker** or **Podman** - Required for the local database container
 - **PostgreSQL with pg-xpatch** - Optional, only needed for remote operations (push/pull/clone)
 
+Default container settings are conservative. For faster imports and queries, see the [performance tuning guide](docs/performance-tuning.md).
+
 <details>
 <summary><strong>Why Docker instead of embedded PostgreSQL?</strong></summary>
 

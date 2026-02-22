@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Content deduplication within groups: `CreateBlobsForGroup` tracks content hashes and reuses existing version IDs when the same content appears at multiple paths in a group.
 - `pgit log --limit` alias for `--max-count`
 - git/git added to benchmark suite (20 repos, 274k total commits)
+- Performance tuning guide (`docs/performance-tuning.md`) with copy-paste profiles for small/medium/large machines
 
 ### Changed
 
