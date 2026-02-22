@@ -13,9 +13,9 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -40,6 +40,7 @@ Use --graph for ASCII commit graph visualization.`,
 	}
 
 	cmd.Flags().IntP("max-count", "n", 0, "Limit number of commits to show")
+	cmd.Flags().Int("limit", 0, "Alias for --max-count")
 	cmd.Flags().Bool("oneline", false, "Show each commit on one line (non-interactive)")
 	cmd.Flags().Bool("graph", false, "Show ASCII commit graph")
 	cmd.Flags().Bool("no-pager", false, "Disable interactive pager")
@@ -51,6 +52,9 @@ Use --graph for ASCII commit graph visualization.`,
 
 func runLog(cmd *cobra.Command, args []string) error {
 	maxCount, _ := cmd.Flags().GetInt("max-count")
+	if maxCount == 0 {
+		maxCount, _ = cmd.Flags().GetInt("limit")
+	}
 	oneline, _ := cmd.Flags().GetBool("oneline")
 	graph, _ := cmd.Flags().GetBool("graph")
 	noPager, _ := cmd.Flags().GetBool("no-pager")

@@ -8,12 +8,13 @@ import (
 )
 
 // SchemaVersion is the current schema version.
-// Version 3 introduces:
-// - Committer fields (committer_name, committer_email, committed_at)
-// - Renamed created_at -> authored_at
-// - Split content into pgit_text_content (TEXT) + pgit_binary_content (BYTEA)
-// - Added is_binary flag to pgit_file_refs
-const SchemaVersion = 3
+// Version 4 introduces:
+// - N:1 path-to-group mapping (multiple paths can share one delta group)
+// - path_id as PK in pgit_paths and pgit_file_refs
+// - group_id remains for delta compression grouping in content tables
+// - compress_depth increased to 10 for better deduplication
+// - Removed reset and resolve commands (v4 is append-only)
+const SchemaVersion = 4
 
 // InitSchema creates the pgit schema in the database
 func (db *DB) InitSchema(ctx context.Context) error {
@@ -70,6 +71,9 @@ func (db *DB) InitSchema(ctx context.Context) error {
 		return err
 	}
 	if err := db.createSyncStateTable(ctx); err != nil {
+		return err
+	}
+	if err := db.createCommitGraphTable(ctx); err != nil {
 		return err
 	}
 
@@ -136,10 +140,12 @@ func (db *DB) createCommitsTable(ctx context.Context) error {
 }
 
 // createPathsTable creates the path registry table.
+// In v4, path_id is the PK and group_id is a shared FK (N paths can share 1 group).
 func (db *DB) createPathsTable(ctx context.Context) error {
 	sql := `
 	CREATE TABLE IF NOT EXISTS pgit_paths (
-		group_id    INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+		path_id     INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+		group_id    INTEGER NOT NULL,
 		path        TEXT NOT NULL UNIQUE
 	)`
 
@@ -148,15 +154,17 @@ func (db *DB) createPathsTable(ctx context.Context) error {
 	}
 
 	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_paths_path ON pgit_paths(path)")
+	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_paths_group ON pgit_paths(group_id)")
 
 	return nil
 }
 
-// createFileRefsTable creates the file references table with is_binary flag.
+// createFileRefsTable creates the file references table.
+// In v4, PK is (path_id, commit_id). group_id is accessed via pgit_paths.
 func (db *DB) createFileRefsTable(ctx context.Context) error {
 	sql := `
 	CREATE TABLE IF NOT EXISTS pgit_file_refs (
-		group_id        INTEGER NOT NULL,
+		path_id         INTEGER NOT NULL,
 		commit_id       TEXT NOT NULL,
 		version_id      INTEGER NOT NULL,
 		content_hash    BYTEA,
@@ -164,7 +172,7 @@ func (db *DB) createFileRefsTable(ctx context.Context) error {
 		is_symlink      BOOLEAN NOT NULL DEFAULT FALSE,
 		symlink_target  TEXT,
 		is_binary       BOOLEAN NOT NULL DEFAULT FALSE,
-		PRIMARY KEY (group_id, commit_id)
+		PRIMARY KEY (path_id, commit_id)
 	)`
 
 	if err := db.Exec(ctx, sql); err != nil {
@@ -172,7 +180,7 @@ func (db *DB) createFileRefsTable(ctx context.Context) error {
 	}
 
 	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_commit ON pgit_file_refs(commit_id)")
-	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_version ON pgit_file_refs(group_id, version_id)")
+	_ = db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_version ON pgit_file_refs(path_id, version_id)")
 
 	return nil
 }
@@ -197,7 +205,7 @@ func (db *DB) createTextContentTable(ctx context.Context) error {
 		order_by => 'version_id',
 		delta_columns => ARRAY['content'],
 		keyframe_every => 100,
-		compress_depth => 5
+		compress_depth => 10
 	)`
 
 	_ = db.Exec(ctx, configSQL)
@@ -225,7 +233,7 @@ func (db *DB) createBinaryContentTable(ctx context.Context) error {
 		order_by => 'version_id',
 		delta_columns => ARRAY['content'],
 		keyframe_every => 100,
-		compress_depth => 5
+		compress_depth => 10
 	)`
 
 	_ = db.Exec(ctx, configSQL)
@@ -262,8 +270,87 @@ func (db *DB) createSyncStateTable(ctx context.Context) error {
 	return nil
 }
 
+// createCommitGraphTable creates the commit graph table for O(1) ancestry lookups.
+// This is a normal heap table (not xpatch) that stores the commit DAG structure
+// with binary lifting ancestor pointers for O(log N) ancestor traversal.
+// The xpatch pgit_commits table stores the heavy content (messages, author info);
+// this table stores only the lightweight graph structure.
+func (db *DB) createCommitGraphTable(ctx context.Context) error {
+	sql := `
+	CREATE TABLE IF NOT EXISTS pgit_commit_graph (
+		seq       SERIAL PRIMARY KEY,
+		id        TEXT NOT NULL UNIQUE,
+		depth     INTEGER NOT NULL,
+		ancestors INTEGER[]
+	)`
+
+	if err := db.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("failed to create pgit_commit_graph: %w", err)
+	}
+
+	return nil
+}
+
+// DropCommitGraphIndexes drops the secondary indexes on pgit_commit_graph.
+func (db *DB) DropCommitGraphIndexes(ctx context.Context) error {
+	// The PK (seq) and UNIQUE (id) are kept — only drop secondary indexes if any.
+	// Currently no secondary indexes beyond PK and UNIQUE constraint.
+	return nil
+}
+
+// CreateCommitGraphIndexes creates the secondary indexes on pgit_commit_graph.
+func (db *DB) CreateCommitGraphIndexes(ctx context.Context) error {
+	// PK (seq) and UNIQUE (id) are created with the table.
+	// No additional secondary indexes needed — queries use PK or id UNIQUE index.
+	return nil
+}
+
+// DropCommitsIndexes drops the secondary indexes on pgit_commits.
+func (db *DB) DropCommitsIndexes(ctx context.Context) error {
+	if err := db.Exec(ctx, "DROP INDEX IF EXISTS idx_commits_parent"); err != nil {
+		return fmt.Errorf("failed to drop idx_commits_parent: %w", err)
+	}
+	if err := db.Exec(ctx, "DROP INDEX IF EXISTS idx_commits_authored"); err != nil {
+		return fmt.Errorf("failed to drop idx_commits_authored: %w", err)
+	}
+	return nil
+}
+
+// CreateCommitsIndexes creates the secondary indexes on pgit_commits.
+func (db *DB) CreateCommitsIndexes(ctx context.Context) error {
+	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_parent ON pgit_commits(parent_id)"); err != nil {
+		return fmt.Errorf("failed to create idx_commits_parent: %w", err)
+	}
+	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_commits_authored ON pgit_commits(authored_at DESC)"); err != nil {
+		return fmt.Errorf("failed to create idx_commits_authored: %w", err)
+	}
+	return nil
+}
+
+// DropPathsIndexes drops the secondary indexes on pgit_paths.
+func (db *DB) DropPathsIndexes(ctx context.Context) error {
+	if err := db.Exec(ctx, "DROP INDEX IF EXISTS idx_paths_path"); err != nil {
+		return fmt.Errorf("failed to drop idx_paths_path: %w", err)
+	}
+	if err := db.Exec(ctx, "DROP INDEX IF EXISTS idx_paths_group"); err != nil {
+		return fmt.Errorf("failed to drop idx_paths_group: %w", err)
+	}
+	return nil
+}
+
+// CreatePathsIndexes creates the secondary indexes on pgit_paths.
+func (db *DB) CreatePathsIndexes(ctx context.Context) error {
+	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_paths_path ON pgit_paths(path)"); err != nil {
+		return fmt.Errorf("failed to create idx_paths_path: %w", err)
+	}
+	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_paths_group ON pgit_paths(group_id)"); err != nil {
+		return fmt.Errorf("failed to create idx_paths_group: %w", err)
+	}
+	return nil
+}
+
 // DropFileRefsIndexes drops the secondary indexes on pgit_file_refs.
-// The primary key (group_id, commit_id) is kept for COPY conflict detection.
+// The primary key (path_id, commit_id) is kept for COPY conflict detection.
 // Call this before bulk import to avoid random B-tree insertions, then
 // call CreateFileRefsIndexes after import to rebuild them efficiently.
 func (db *DB) DropFileRefsIndexes(ctx context.Context) error {
@@ -283,8 +370,47 @@ func (db *DB) CreateFileRefsIndexes(ctx context.Context) error {
 	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_commit ON pgit_file_refs(commit_id)"); err != nil {
 		return fmt.Errorf("failed to create idx_file_refs_commit: %w", err)
 	}
-	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_version ON pgit_file_refs(group_id, version_id)"); err != nil {
+	if err := db.Exec(ctx, "CREATE INDEX IF NOT EXISTS idx_file_refs_version ON pgit_file_refs(path_id, version_id)"); err != nil {
 		return fmt.Errorf("failed to create idx_file_refs_version: %w", err)
+	}
+	return nil
+}
+
+// DropAllIndexes drops all secondary indexes across all pgit tables.
+// Call this before bulk import to maximize insert throughput, then call
+// CreateAllIndexes after import to rebuild them efficiently in one pass.
+// Primary keys are kept (required for COPY conflict detection and xpatch).
+func (db *DB) DropAllIndexes(ctx context.Context) error {
+	if err := db.DropCommitsIndexes(ctx); err != nil {
+		return err
+	}
+	if err := db.DropCommitGraphIndexes(ctx); err != nil {
+		return err
+	}
+	if err := db.DropPathsIndexes(ctx); err != nil {
+		return err
+	}
+	if err := db.DropFileRefsIndexes(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CreateAllIndexes creates all secondary indexes across all pgit tables.
+// This is much faster than maintaining indexes during bulk insert because
+// PostgreSQL can sort and bulk-load each B-tree in a single pass.
+func (db *DB) CreateAllIndexes(ctx context.Context) error {
+	if err := db.CreateCommitsIndexes(ctx); err != nil {
+		return err
+	}
+	if err := db.CreateCommitGraphIndexes(ctx); err != nil {
+		return err
+	}
+	if err := db.CreatePathsIndexes(ctx); err != nil {
+		return err
+	}
+	if err := db.CreateFileRefsIndexes(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -346,6 +472,7 @@ func (db *DB) DropSchema(ctx context.Context) error {
 		"pgit_content", // Legacy v2 table
 		"pgit_file_refs",
 		"pgit_paths",
+		"pgit_commit_graph",
 		"pgit_commits",
 		// Legacy table from schema v1 (may not exist)
 		"pgit_blobs",

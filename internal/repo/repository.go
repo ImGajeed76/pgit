@@ -5,10 +5,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/imgajeed76/pgit/v3/internal/config"
-	"github.com/imgajeed76/pgit/v3/internal/container"
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/config"
+	"github.com/imgajeed76/pgit/v4/internal/container"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 )
 
 // Repository represents a pgit repository

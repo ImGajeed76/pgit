@@ -30,9 +30,9 @@ Need something custom? Everything is in PostgreSQL — write your own SQL:
 -- Same analysis as above, as raw SQL
 SELECT pa.path, pb.path, COUNT(*) as times_together
 FROM pgit_file_refs a
-JOIN pgit_paths pa ON pa.group_id = a.group_id
-JOIN pgit_file_refs b ON a.commit_id = b.commit_id AND a.group_id < b.group_id
-JOIN pgit_paths pb ON pb.group_id = b.group_id
+JOIN pgit_paths pa ON pa.path_id = a.path_id
+JOIN pgit_file_refs b ON a.commit_id = b.commit_id AND a.path_id < b.path_id
+JOIN pgit_paths pb ON pb.path_id = b.path_id
 GROUP BY pa.path, pb.path
 ORDER BY times_together DESC;
 ```
@@ -103,7 +103,7 @@ pgit sql "SELECT * FROM pgit_commits ORDER BY authored_at DESC LIMIT 10"
 -- Most frequently changed files
 SELECT p.path, COUNT(*) as versions
 FROM pgit_file_refs r
-JOIN pgit_paths p ON p.group_id = r.group_id
+JOIN pgit_paths p ON p.path_id = r.path_id
 GROUP BY p.path
 ORDER BY versions DESC
 LIMIT 10;
@@ -125,7 +125,7 @@ See `pgit sql examples` for more, or check [docs/xpatch-query-patterns.md](docs/
 ### Using Go (recommended)
 
 ```bash
-go install github.com/imgajeed76/pgit/v3/cmd/pgit@latest
+go install github.com/imgajeed76/pgit/v4/cmd/pgit@latest
 ```
 
 ### From GitHub Releases
@@ -207,6 +207,17 @@ Requirements: `git` and `pgit` on PATH, local container running (`pgit local sta
 
 </details>
 
+## v4 Changes
+
+pgit v4 focuses on its strength as a **repository analysis tool**. The storage layer
+now uses N:1 path-to-group mapping — files that share content (renames, copies,
+reverts) are grouped into the same delta compression chain, eliminating ~40% of
+duplicate storage.
+
+As part of this direction, `pgit reset` and `pgit resolve` have been removed.
+pgit is append-only by design: imported history is immutable, and the primary
+workflow is `import` → `analyze` / `sql` / `search`.
+
 ## Commands
 
 | Command | Description |
@@ -217,7 +228,6 @@ Requirements: `git` and `pgit` on PATH, local container running (`pgit local sta
 | `pgit mv <src> <dst>` | Move/rename a file and stage the change |
 | `pgit status` | Show working tree status |
 | `pgit commit -m "msg"` | Record changes to the repository |
-| `pgit reset [commit]` | Reset HEAD, index, and working tree |
 | `pgit log` | Show commit history (interactive) |
 | `pgit diff` | Show changes between commits, working tree, etc. |
 | `pgit show <commit>` | Show commit details |
@@ -232,7 +242,6 @@ Requirements: `git` and `pgit` on PATH, local container running (`pgit local sta
 | `pgit pull <remote>` | Pull from remote |
 | `pgit clone <url> [dir]` | Clone repository |
 | `pgit import <git-repo>` | Import from Git |
-| `pgit resolve <file>` | Mark merge conflicts as resolved |
 | `pgit config <key> [value]` | Get and set repository options |
 | `pgit clean` | Remove untracked files from working tree |
 | `pgit doctor` | Check system health and diagnose issues |

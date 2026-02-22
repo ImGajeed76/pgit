@@ -10,7 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
 )
 
 // ═══════════════════════════════════════════════════════════════════════════

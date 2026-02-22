@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 )
 
 // FileStatus represents the status of a file in the index

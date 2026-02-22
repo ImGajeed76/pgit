@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 )
 
 // connectForCommand connects to either the local or remote database.

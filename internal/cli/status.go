@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/config"
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/config"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -242,7 +242,7 @@ func printLongStatus(staged, unstaged []repo.FileChange, head *db.Commit) error 
 		if err == nil && mergeState.HasConflicts() {
 			fmt.Println()
 			fmt.Println(styles.Warningf("You have unmerged paths."))
-			fmt.Println(styles.MutedMsg("  (fix conflicts and run \"pgit resolve <file>\")"))
+			fmt.Println(styles.MutedMsg("  (fix conflicts, then \"pgit add <file>\" and \"pgit commit\")"))
 			fmt.Println()
 			fmt.Println("Unmerged paths:")
 			for _, f := range mergeState.ConflictedFiles {
@@ -260,7 +260,7 @@ func printLongStatus(staged, unstaged []repo.FileChange, head *db.Commit) error 
 	if len(staged) > 0 {
 		fmt.Println()
 		fmt.Println("Changes to be committed:")
-		fmt.Println(styles.MutedMsg("  (use \"pgit reset <file>...\" to unstage)"))
+		fmt.Println(styles.MutedMsg("  (use \"pgit rm --cached <file>...\" to unstage)"))
 		fmt.Println()
 
 		for _, c := range staged {

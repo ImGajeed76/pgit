@@ -17,12 +17,12 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/imgajeed76/pgit/v3/internal/config"
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/ui"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/config"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/ui"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -533,6 +533,39 @@ func runImport(cmd *cobra.Command, args []string) error {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
+	// Step 4b: Build and insert commit graph with binary lifting
+	// ═══════════════════════════════════════════════════════════════════════
+
+	graphState, _ := r.DB.GetMetadata(ctx, "import_graph_state")
+	if graphState != "done" {
+		fmt.Println("\nBuilding commit graph...")
+		graphEntries := buildCommitGraph(pgitCommits)
+		fmt.Printf("  %s entries, max depth %d\n",
+			ui.FormatCount(len(graphEntries)),
+			graphEntries[len(graphEntries)-1].Depth)
+
+		batchSize := 5000
+		graphProgress := ui.NewProgress("Graph", len(graphEntries))
+
+		for i := 0; i < len(graphEntries); i += batchSize {
+			end := i + batchSize
+			if end > len(graphEntries) {
+				end = len(graphEntries)
+			}
+			batch := graphEntries[i:end]
+
+			if err := r.DB.CreateCommitGraphBatch(ctx, batch); err != nil {
+				fmt.Println()
+				return fmt.Errorf("failed to insert commit graph batch: %w", err)
+			}
+			graphProgress.Update(end)
+		}
+		graphProgress.Done()
+
+		_ = r.DB.SetMetadata(ctx, "import_graph_state", "done")
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
 	// Step 5: Parallel blob import via ReadAt on temp file
 	// ═══════════════════════════════════════════════════════════════════════
 
@@ -565,26 +598,44 @@ func runImport(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("\nImporting %s file versions across %s paths...\n",
-		ui.FormatCount(totalFileOps), ui.FormatCount(len(pathOps)))
+	// ═══════════════════════════════════════════════════════════════════════
+	// Step 4b: Compute path groups (union-find on content hashes)
+	// ═══════════════════════════════════════════════════════════════════════
+
+	fmt.Print("Computing path groups...")
+	groupStart := time.Now()
+	pathToLocalGroup, groupCount := computePathGroups(tmpFile, pathOps, blobIndex)
+	fmt.Printf(" done (%s) — %s groups from %s paths\n",
+		time.Since(groupStart).Round(time.Millisecond),
+		ui.FormatCount(groupCount), ui.FormatCount(len(pathOps)))
+
+	// Build commitID → timestamp lookup for sorting within groups
+	commitTimestamps := make(map[string]int64, len(commitEntries))
+	for _, ce := range commitEntries {
+		ulid := markToULID[ce.Mark]
+		commitTimestamps[ulid] = ce.AuthorTimestamp
+	}
+
+	fmt.Printf("\nImporting %s file versions across %s paths (%s groups)...\n",
+		ui.FormatCount(totalFileOps), ui.FormatCount(len(pathOps)), ui.FormatCount(groupCount))
 
 	if totalFileOps > 0 {
-		// Drop secondary indexes on pgit_file_refs before bulk import.
+		// Drop ALL secondary indexes before bulk import.
 		// Random ULID-based commit_id insertions cause massive B-tree
-		// degradation at scale (24M rows). Rebuilding after is O(n log n)
+		// degradation at scale. Rebuilding after is O(n log n)
 		// in one pass vs O(n * log n) random page lookups during insert.
-		fmt.Print("Dropping file_refs indexes for bulk import...")
-		if err := r.DB.DropFileRefsIndexes(ctx); err != nil {
+		fmt.Print("Dropping indexes for bulk import...")
+		if err := r.DB.DropAllIndexes(ctx); err != nil {
 			fmt.Printf(" warning: %v\n", err)
 		} else {
 			fmt.Println(" done")
 		}
 
-		err = importBlobsParallel(ctx, r.DB, tmpPath, pathOps, blobIndex, markToULID, workers, resumeFromBlobs)
+		err = importBlobsParallel(ctx, r.DB, tmpPath, pathOps, blobIndex, markToULID, workers, resumeFromBlobs, pathToLocalGroup, commitTimestamps)
 		if err != nil {
 			// Still try to recreate indexes even on error
-			fmt.Print("\nRebuilding file_refs indexes...")
-			if idxErr := r.DB.CreateFileRefsIndexes(ctx); idxErr != nil {
+			fmt.Print("\nRebuilding indexes...")
+			if idxErr := r.DB.CreateAllIndexes(ctx); idxErr != nil {
 				fmt.Printf(" warning: %v\n", idxErr)
 			} else {
 				fmt.Println(" done")
@@ -592,10 +643,10 @@ func runImport(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		// Rebuild indexes after bulk import
-		fmt.Print("Rebuilding file_refs indexes...")
+		// Rebuild all indexes after bulk import
+		fmt.Print("Rebuilding indexes...")
 		rebuildStart := time.Now()
-		if err := r.DB.CreateFileRefsIndexes(ctx); err != nil {
+		if err := r.DB.CreateAllIndexes(ctx); err != nil {
 			return fmt.Errorf("failed to rebuild indexes: %w", err)
 		}
 		fmt.Printf(" done (%s)\n", time.Since(rebuildStart).Round(time.Second))
@@ -1086,6 +1137,75 @@ func prepareCommits(
 	return pgitCommits, markToULID, pathOpsMap
 }
 
+// buildCommitGraph constructs the pgit_commit_graph entries with binary lifting
+// ancestor pointers from the prepared commits slice. Each commit gets:
+//   - seq: 1-indexed import order
+//   - depth: distance from its root (root=0, child=parent_depth+1)
+//   - ancestors: binary lifting table where ancestors[k] = seq of the 2^k-th ancestor
+//
+// The binary lifting table enables O(log N) ancestry lookups for any depth N.
+func buildCommitGraph(commits []*db.Commit) []*db.CommitGraphEntry {
+	// Map commit ID → index in the commits slice (0-indexed)
+	idToIdx := make(map[string]int, len(commits))
+	for i, c := range commits {
+		idToIdx[c.ID] = i
+	}
+
+	entries := make([]*db.CommitGraphEntry, len(commits))
+
+	for i, c := range commits {
+		seq := int32(i + 1) // 1-indexed
+
+		var depth int32
+		var parentIdx int = -1
+
+		if c.ParentID != nil {
+			if idx, ok := idToIdx[*c.ParentID]; ok {
+				parentIdx = idx
+				depth = entries[idx].Depth + 1
+			}
+		}
+
+		// Build binary lifting ancestors.
+		// ancestors[0] = parent's seq (2^0 = 1 step)
+		// ancestors[k] = entries[ancestors[k-1]].ancestors[k-1] (2^k steps = two jumps of 2^(k-1))
+		var ancestors []int32
+		if parentIdx >= 0 {
+			// Maximum levels needed: log2(depth) + 1
+			maxLevel := 0
+			for d := depth; d > 0; d >>= 1 {
+				maxLevel++
+			}
+
+			ancestors = make([]int32, maxLevel)
+			ancestors[0] = entries[parentIdx].Seq // parent's seq
+
+			for k := 1; k < maxLevel; k++ {
+				// To find the 2^k-th ancestor, we jump from the 2^(k-1)-th ancestor
+				// by another 2^(k-1) steps.
+				prevAncestorSeq := ancestors[k-1]
+				prevAncestorEntry := entries[prevAncestorSeq-1] // seq is 1-indexed, slice is 0-indexed
+				if k-1 < len(prevAncestorEntry.Ancestors) {
+					ancestors[k] = prevAncestorEntry.Ancestors[k-1]
+				} else {
+					// Ran out of ancestors (reached root) — truncate
+					ancestors = ancestors[:k]
+					break
+				}
+			}
+		}
+
+		entries[i] = &db.CommitGraphEntry{
+			Seq:       seq,
+			ID:        c.ID,
+			Depth:     depth,
+			Ancestors: ancestors,
+		}
+	}
+
+	return entries
+}
+
 // readBytesAt reads exactly n bytes from f at the given offset.
 func readBytesAt(f *os.File, offset int64, n int) []byte {
 	if n <= 0 {
@@ -1100,19 +1220,166 @@ func readBytesAt(f *os.File, offset int64, n int) []byte {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Phase 4: Path grouping (union-find on content hashes)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// unionFind implements a disjoint-set data structure with path compression
+// and union by rank for efficient grouping of paths.
+type unionFind struct {
+	parent []int
+	rank   []int
+}
+
+func newUnionFind(n int) *unionFind {
+	uf := &unionFind{
+		parent: make([]int, n),
+		rank:   make([]int, n),
+	}
+	for i := range uf.parent {
+		uf.parent[i] = i
+	}
+	return uf
+}
+
+func (uf *unionFind) find(x int) int {
+	for uf.parent[x] != x {
+		uf.parent[x] = uf.parent[uf.parent[x]] // path compression
+		x = uf.parent[x]
+	}
+	return x
+}
+
+func (uf *unionFind) union(x, y int) {
+	rx, ry := uf.find(x), uf.find(y)
+	if rx == ry {
+		return
+	}
+	if uf.rank[rx] < uf.rank[ry] {
+		rx, ry = ry, rx
+	}
+	uf.parent[ry] = rx
+	if uf.rank[rx] == uf.rank[ry] {
+		uf.rank[rx]++
+	}
+}
+
+// computePathGroups analyzes content hashes from the fast-export temp file
+// and returns a map of path → local group index using union-find.
+// Paths sharing non-empty content (same BLAKE3 hash) are assigned the same group.
+//
+// Returns:
+//   - pathToGroup: map[path] → group index (0-based, contiguous)
+//   - groupCount: total number of distinct groups
+func computePathGroups(
+	tmpFile *os.File,
+	pathOpsMap map[string][]pathOp,
+	blobIndex map[int]*blobEntry,
+) (map[string]int, int) {
+	// Hash of empty content — excluded from grouping
+	emptyHash := string(util.HashBytesBlake3([]byte{}))
+
+	// Assign each path a numeric index
+	pathList := make([]string, 0, len(pathOpsMap))
+	pathIndex := make(map[string]int, len(pathOpsMap))
+	for path := range pathOpsMap {
+		pathIndex[path] = len(pathList)
+		pathList = append(pathList, path)
+	}
+
+	// Compute content hash for each blob mark (deduplicated — each mark only once)
+	markHash := make(map[int]string, len(blobIndex))
+	for mark, be := range blobIndex {
+		content := make([]byte, be.Size)
+		if be.Size > 0 {
+			_, err := tmpFile.ReadAt(content, be.Offset)
+			if err != nil {
+				continue // skip unreadable blobs
+			}
+		}
+		h := string(util.HashBytesBlake3(content))
+		markHash[mark] = h
+	}
+
+	// Build hash → [path indices] map, excluding empty hash and deletes
+	hashToPaths := make(map[string][]int)
+	for path, ops := range pathOpsMap {
+		pidx := pathIndex[path]
+		for _, op := range ops {
+			if op.IsDelete || op.BlobMark == 0 {
+				continue
+			}
+			h, ok := markHash[op.BlobMark]
+			if !ok || h == emptyHash {
+				continue
+			}
+			hashToPaths[h] = append(hashToPaths[h], pidx)
+		}
+	}
+
+	// Run union-find: group paths that share any non-empty hash
+	uf := newUnionFind(len(pathList))
+	for _, pathIndices := range hashToPaths {
+		if len(pathIndices) < 2 {
+			continue
+		}
+		// Deduplicate path indices for this hash
+		seen := make(map[int]bool, len(pathIndices))
+		var unique []int
+		for _, idx := range pathIndices {
+			if !seen[idx] {
+				seen[idx] = true
+				unique = append(unique, idx)
+			}
+		}
+		// Union all paths that share this hash
+		for i := 1; i < len(unique); i++ {
+			uf.union(unique[0], unique[i])
+		}
+	}
+
+	// Map union-find roots to contiguous group indices
+	rootToGroup := make(map[int]int)
+	groupCount := 0
+	pathToGroup := make(map[string]int, len(pathList))
+	for i, path := range pathList {
+		root := uf.find(i)
+		if _, exists := rootToGroup[root]; !exists {
+			rootToGroup[root] = groupCount
+			groupCount++
+		}
+		pathToGroup[path] = rootToGroup[root]
+	}
+
+	return pathToGroup, groupCount
+}
+
+// groupOp represents a single file operation within a group, annotated with
+// its path and commit timestamp for sorting.
+type groupOp struct {
+	Path      string
+	CommitID  string
+	BlobMark  int
+	Mode      int
+	IsDelete  bool
+	Timestamp int64 // commit author timestamp (for sorting)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Phase 5: Parallel blob import
 // ═══════════════════════════════════════════════════════════════════════════
 
-// importBlobsParallel imports blobs grouped by path using parallel workers.
-// Each worker processes batches of paths for fewer, larger transactions.
-// Content is read from the temp file via ReadAt (safe for concurrent access).
+// importBlobsParallel imports blobs grouped by content group using parallel workers.
+// In v4, paths sharing content (renames/copies) are grouped together and their
+// versions are interleaved by commit timestamp within the same delta chain.
 //
-// Optimizations over the naive per-path approach:
-//   - Pre-registers all paths upfront (1 transaction instead of N)
-//   - Batches multiple paths per transaction (fewer COMMITs = less WAL)
-//   - Skips MAX(version_id) query for fresh imports (starts at 0)
-//   - Sorts paths by first blob offset for sequential I/O on temp file
-//   - Uses sync.Pool for byte buffer reuse to reduce GC pressure
+// Each worker processes one group at a time — all paths in the group share
+// one version_id sequence and one transaction (for xpatch delta chain consistency).
+//
+// Optimizations:
+//   - Pre-registers all paths with group assignments upfront (1 transaction)
+//   - Distributes groups (not paths) to workers for correct version ordering
+//   - Sorts operations within each group by commit timestamp
+//   - Heavy groups are interleaved with light ones to prevent tail stall
 func importBlobsParallel(
 	ctx context.Context,
 	database *db.DB,
@@ -1122,6 +1389,8 @@ func importBlobsParallel(
 	markToULID map[int]string,
 	workers int,
 	isResume bool,
+	pathToLocalGroup map[string]int,
+	commitTimestamps map[string]int64,
 ) error {
 	// Open temp file for concurrent reads
 	tmpFile, err := os.Open(tmpFilePath)
@@ -1130,41 +1399,86 @@ func importBlobsParallel(
 	}
 	defer tmpFile.Close()
 
-	// Collect paths and sort by version count descending (heaviest first),
-	// then interleave so heavy and light paths alternate. This prevents
-	// the "tail stall" where one worker gets stuck on a huge path (e.g.
-	// Makefile with 3,681 versions) while all other workers sit idle.
-	//
-	// Strategy: sort desc by version count, split into odds/evens,
-	// reverse the evens, then zip them back together. Result: heavy
-	// paths are spread across the batch stream so workers pick them
-	// up early and in parallel.
+	// Collect all paths
 	paths := make([]string, 0, len(pathOpsMap))
 	for path := range pathOpsMap {
 		paths = append(paths, path)
 	}
-	sort.Slice(paths, func(i, j int) bool {
-		return len(pathOpsMap[paths[i]]) > len(pathOpsMap[paths[j]])
-	})
-	paths = interleavePaths(paths)
 
-	// Pre-register all paths in one bulk operation
-	pathToGroupID, err := database.PreRegisterPaths(ctx, paths)
+	// Pre-register all paths with their group assignments.
+	// pathToLocalGroup maps path → local group index (0-based).
+	// PreRegisterPaths converts these to database group_ids (auto-assigned per group).
+	pathRegistration, err := database.PreRegisterPaths(ctx, paths, pathToLocalGroup)
 	if err != nil {
 		return fmt.Errorf("failed to pre-register paths: %w", err)
 	}
 
-	// Initialize version counters for each group
-	// For fresh imports: all start at 0 (CreateBlobsForGroup increments before use)
-	// For resume: query existing max version_ids
-	versionCounters := make(map[int32]*int32, len(pathToGroupID))
-	if isResume {
-		// Query existing max version_ids
-		groupIDs := make([]int32, 0, len(pathToGroupID))
-		for _, gid := range pathToGroupID {
-			groupIDs = append(groupIDs, gid)
+	// Build group → []groupOp, collecting all operations across all paths in each group.
+	// Sort each group's ops by commit timestamp for optimal delta compression.
+	type groupInfo struct {
+		GroupID int32 // database group_id
+		Ops     []groupOp
+	}
+	groupMap := make(map[int]*groupInfo) // keyed by local group index
+	for path, ops := range pathOpsMap {
+		localGroup := pathToLocalGroup[path]
+		gi, exists := groupMap[localGroup]
+		if !exists {
+			gi = &groupInfo{GroupID: pathRegistration[path].GroupID}
+			groupMap[localGroup] = gi
 		}
-		// Batch query in chunks to avoid huge ANY() arrays
+		for _, op := range ops {
+			gi.Ops = append(gi.Ops, groupOp{
+				Path:      path,
+				CommitID:  op.CommitID,
+				BlobMark:  op.BlobMark,
+				Mode:      op.Mode,
+				IsDelete:  op.IsDelete,
+				Timestamp: commitTimestamps[op.CommitID],
+			})
+		}
+	}
+
+	// Sort each group's ops by timestamp, breaking ties by path (stable ordering)
+	for _, gi := range groupMap {
+		sort.SliceStable(gi.Ops, func(i, j int) bool {
+			if gi.Ops[i].Timestamp != gi.Ops[j].Timestamp {
+				return gi.Ops[i].Timestamp < gi.Ops[j].Timestamp
+			}
+			return gi.Ops[i].Path < gi.Ops[j].Path
+		})
+	}
+
+	// Collect groups sorted by operation count descending, then interleave
+	// to prevent tail stall (same strategy as v3 per-path interleaving).
+	type groupWork struct {
+		LocalGroup int
+		Info       *groupInfo
+	}
+	groups := make([]groupWork, 0, len(groupMap))
+	for lg, gi := range groupMap {
+		groups = append(groups, groupWork{LocalGroup: lg, Info: gi})
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		return len(groups[i].Info.Ops) > len(groups[j].Info.Ops)
+	})
+	groups = interleaveGroups(groups)
+
+	// Initialize version counters for each database group_id.
+	// For fresh imports: all start at 0 (incremented before use).
+	// For resume: query existing max version_ids.
+	versionCounters := make(map[int32]*int32, len(groupMap))
+	if isResume {
+		// Collect unique database group_ids
+		groupIDs := make([]int32, 0, len(groupMap))
+		seen := make(map[int32]bool)
+		for _, gi := range groupMap {
+			if !seen[gi.GroupID] {
+				seen[gi.GroupID] = true
+				groupIDs = append(groupIDs, gi.GroupID)
+			}
+		}
+		// Batch query max version_ids via JOIN through pgit_paths
 		maxVersions := make(map[int32]int32)
 		const chunkSize = 5000
 		for i := 0; i < len(groupIDs); i += chunkSize {
@@ -1174,7 +1488,11 @@ func importBlobsParallel(
 			}
 			chunk := groupIDs[i:end]
 			rows, err := database.Query(ctx,
-				"SELECT group_id, COALESCE(MAX(version_id), 0) FROM pgit_file_refs WHERE group_id = ANY($1) GROUP BY group_id",
+				`SELECT p.group_id, COALESCE(MAX(r.version_id), 0)
+				 FROM pgit_paths p
+				 JOIN pgit_file_refs r ON r.path_id = p.path_id
+				 WHERE p.group_id = ANY($1)
+				 GROUP BY p.group_id`,
 				chunk,
 			)
 			if err != nil {
@@ -1191,34 +1509,37 @@ func importBlobsParallel(
 			rows.Close()
 		}
 		for _, gid := range groupIDs {
-			v := maxVersions[gid] // 0 if not found
+			v := maxVersions[gid]
 			versionCounters[gid] = &v
 		}
 	} else {
 		// Fresh import: all groups start at 0
-		for _, gid := range pathToGroupID {
-			v := int32(0)
-			versionCounters[gid] = &v
+		seen := make(map[int32]bool)
+		for _, gi := range groupMap {
+			if !seen[gi.GroupID] {
+				seen[gi.GroupID] = true
+				v := int32(0)
+				versionCounters[gi.GroupID] = &v
+			}
 		}
 	}
 
 	// Count total ops for progress
 	totalOps := 0
-	for _, ops := range pathOpsMap {
-		totalOps += len(ops)
+	for _, gi := range groupMap {
+		totalOps += len(gi.Ops)
 	}
 
 	progress := ui.NewProgress("Blobs", totalOps)
 	var imported atomic.Int64
 
-	// Send individual paths to workers. Each path = one transaction with
-	// one or more COPY calls inside it. This ensures all versions of a
-	// group go through the same connection and xpatch cache context.
-	pathChan := make(chan string, len(paths))
-	for _, p := range paths {
-		pathChan <- p
+	// Send groups to workers. Each group = one transaction containing all
+	// paths in that group, with operations sorted by timestamp.
+	groupChan := make(chan groupWork, len(groups))
+	for _, g := range groups {
+		groupChan <- g
 	}
-	close(pathChan)
+	close(groupChan)
 
 	var firstErr atomic.Pointer[error]
 	var wg sync.WaitGroup
@@ -1228,21 +1549,20 @@ func importBlobsParallel(
 		go func() {
 			defer wg.Done()
 
-			for path := range pathChan {
+			for gw := range groupChan {
 				if firstErr.Load() != nil {
 					return
 				}
 
-				ops := pathOpsMap[path]
-				groupID := pathToGroupID[path]
-				counter := versionCounters[groupID]
+				gi := gw.Info
+				counter := versionCounters[gi.GroupID]
 
-				// Build blobs for this path
-				dbBlobs := make([]*db.Blob, 0, len(ops))
-				for _, op := range ops {
+				// Build blobs for this group (all paths, timestamp-ordered)
+				dbBlobs := make([]*db.Blob, 0, len(gi.Ops))
+				for _, op := range gi.Ops {
 					if op.IsDelete {
 						dbBlobs = append(dbBlobs, &db.Blob{
-							Path:        path,
+							Path:        op.Path,
 							CommitID:    op.CommitID,
 							Content:     []byte{},
 							ContentHash: nil,
@@ -1272,7 +1592,7 @@ func importBlobsParallel(
 					contentHash := util.HashBytesBlake3(content)
 
 					blob := &db.Blob{
-						Path:        path,
+						Path:        op.Path,
 						CommitID:    op.CommitID,
 						Content:     content,
 						ContentHash: contentHash,
@@ -1289,9 +1609,10 @@ func importBlobsParallel(
 					dbBlobs = append(dbBlobs, blob)
 				}
 
-				// Insert all versions in one transaction (multiple COPY calls inside)
+				// Insert all versions in one transaction.
+				// CreateBlobsForGroup handles COPY in chunks within the transaction.
 				if len(dbBlobs) > 0 {
-					if err := database.CreateBlobsForGroup(ctx, dbBlobs, groupID, counter, func(n int) {
+					if err := database.CreateBlobsForGroup(ctx, dbBlobs, gi.GroupID, counter, pathRegistration, func(n int) {
 						count := imported.Add(int64(n))
 						progress.Update(int(count))
 					}); err != nil {
@@ -1313,27 +1634,20 @@ func importBlobsParallel(
 	return nil
 }
 
-// interleavePaths takes a list sorted by weight (heaviest first) and
-// interleaves so that heavy and light paths alternate. This ensures
-// workers get a balanced mix and no single worker gets stuck with all
-// the heavy paths at the end.
-//
-// Example: [A B C D E F G H] (sorted heaviest first)
-//
-//	odds  = [A C E G]       (indices 0,2,4,6)
-//	evens = [B D F H]       (indices 1,3,5,7) -> reversed: [H F D B]
-//	result = [A H C F E D G B]
-func interleavePaths(paths []string) []string {
-	if len(paths) <= 2 {
-		return paths
+// interleaveGroups takes groups sorted by weight (heaviest first) and
+// interleaves so that heavy and light groups alternate. Same strategy as
+// interleavePaths but for group work units.
+func interleaveGroups[T any](items []T) []T {
+	if len(items) <= 2 {
+		return items
 	}
 
-	var odds, evens []string
-	for i, p := range paths {
+	var odds, evens []T
+	for i, item := range items {
 		if i%2 == 0 {
-			odds = append(odds, p)
+			odds = append(odds, item)
 		} else {
-			evens = append(evens, p)
+			evens = append(evens, item)
 		}
 	}
 
@@ -1343,7 +1657,7 @@ func interleavePaths(paths []string) []string {
 	}
 
 	// Zip together
-	result := make([]string, 0, len(paths))
+	result := make([]T, 0, len(items))
 	oi, ei := 0, 0
 	for oi < len(odds) || ei < len(evens) {
 		if oi < len(odds) {
@@ -1359,6 +1673,16 @@ func interleavePaths(paths []string) []string {
 	return result
 }
 
+// interleavePaths takes a list sorted by weight (heaviest first) and
+// interleaves so that heavy and light paths alternate. This ensures
+// workers get a balanced mix and no single worker gets stuck with all
+// the heavy paths at the end.
+//
+// Example: [A B C D E F G H] (sorted heaviest first)
+//
+//	odds  = [A C E G]       (indices 0,2,4,6)
+//	evens = [B D F H]       (indices 1,3,5,7) -> reversed: [H F D B]
+//	result = [A H C F E D G B]
 // ═══════════════════════════════════════════════════════════════════════════
 // Branch selection
 // ═══════════════════════════════════════════════════════════════════════════

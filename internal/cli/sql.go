@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/ui"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/ui/table"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/ui"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/ui/table"
 	"github.com/spf13/cobra"
 )
 
@@ -89,9 +89,10 @@ var pgitSchema = []schemaInfo{
 	},
 	{
 		Name:        "pgit_paths",
-		Description: "File paths with group IDs for delta compression grouping",
+		Description: "File paths with shared delta compression groups (N:1 path-to-group mapping)",
 		Columns: []columnInfo{
-			{"group_id", "INTEGER PRIMARY KEY", "Unique group ID for this path (auto-generated)"},
+			{"path_id", "INTEGER PRIMARY KEY", "Unique path identifier (auto-generated)"},
+			{"group_id", "INTEGER NOT NULL", "Delta compression group ID (multiple paths can share one group)"},
 			{"path", "TEXT UNIQUE", "File path relative to repository root"},
 		},
 	},
@@ -99,9 +100,9 @@ var pgitSchema = []schemaInfo{
 		Name:        "pgit_file_refs",
 		Description: "Links commits to file versions (which files exist in which commits)",
 		Columns: []columnInfo{
-			{"group_id", "INTEGER", "Reference to pgit_paths.group_id (part of PK)"},
+			{"path_id", "INTEGER", "Reference to pgit_paths.path_id (part of PK)"},
 			{"commit_id", "TEXT", "Reference to pgit_commits.id (part of PK)"},
-			{"version_id", "INTEGER", "Version number within the path group"},
+			{"version_id", "INTEGER", "Version number within the delta compression group"},
 			{"content_hash", "BYTEA", "BLAKE3 hash of file content (NULL = deleted)"},
 			{"mode", "INTEGER", "Unix file mode (permissions)"},
 			{"is_symlink", "BOOLEAN", "Whether this is a symlink"},
@@ -111,18 +112,18 @@ var pgitSchema = []schemaInfo{
 	},
 	{
 		Name:        "pgit_text_content",
-		Description: "Text file content, delta-compressed by pg-xpatch",
+		Description: "Text file content, delta-compressed by pg-xpatch (keyed by group_id, not path_id)",
 		Columns: []columnInfo{
-			{"group_id", "INTEGER", "Reference to pgit_paths.group_id (part of PK)"},
+			{"group_id", "INTEGER", "Delta compression group ID (part of PK, from pgit_paths.group_id)"},
 			{"version_id", "INTEGER", "Version number within the group (part of PK)"},
 			{"content", "TEXT", "Text file content (auto delta-compressed)"},
 		},
 	},
 	{
 		Name:        "pgit_binary_content",
-		Description: "Binary file content, delta-compressed by pg-xpatch",
+		Description: "Binary file content, delta-compressed by pg-xpatch (keyed by group_id, not path_id)",
 		Columns: []columnInfo{
-			{"group_id", "INTEGER", "Reference to pgit_paths.group_id (part of PK)"},
+			{"group_id", "INTEGER", "Delta compression group ID (part of PK, from pgit_paths.group_id)"},
 			{"version_id", "INTEGER", "Version number within the group (part of PK)"},
 			{"content", "BYTEA", "Binary file content (auto delta-compressed)"},
 		},
@@ -167,12 +168,12 @@ var exampleQueries = []struct {
 	{
 		Title:       "Most changed files",
 		Description: "Files with the most versions (see also: pgit analyze churn)",
-		Query:       "SELECT p.path, COUNT(*) as versions\nFROM pgit_file_refs r\nJOIN pgit_paths p ON p.group_id = r.group_id\nGROUP BY p.path\nORDER BY versions DESC\nLIMIT 10;",
+		Query:       "SELECT p.path, COUNT(*) as versions\nFROM pgit_file_refs r\nJOIN pgit_paths p ON p.path_id = r.path_id\nGROUP BY p.path\nORDER BY versions DESC\nLIMIT 10;",
 	},
 	{
 		Title:       "Files changed together",
 		Description: "File pairs frequently modified in the same commit (see also: pgit analyze coupling)",
-		Query:       "SELECT pa.path, pb.path, COUNT(*) as times_together\nFROM pgit_file_refs a\nJOIN pgit_paths pa ON pa.group_id = a.group_id\nJOIN pgit_file_refs b ON a.commit_id = b.commit_id AND a.group_id < b.group_id\nJOIN pgit_paths pb ON pb.group_id = b.group_id\nGROUP BY pa.path, pb.path\nORDER BY times_together DESC\nLIMIT 10;",
+		Query:       "SELECT pa.path, pb.path, COUNT(*) as times_together\nFROM pgit_file_refs a\nJOIN pgit_paths pa ON pa.path_id = a.path_id\nJOIN pgit_file_refs b ON a.commit_id = b.commit_id AND a.path_id < b.path_id\nJOIN pgit_paths pb ON pb.path_id = b.path_id\nGROUP BY pa.path, pb.path\nORDER BY times_together DESC\nLIMIT 10;",
 	},
 	{
 		Title:       "Commits by author",
@@ -187,7 +188,7 @@ var exampleQueries = []struct {
 	{
 		Title:       "Deleted files",
 		Description: "Files that were removed (content_hash is NULL when deleted)",
-		Query:       "SELECT DISTINCT p.path\nFROM pgit_file_refs r\nJOIN pgit_paths p ON p.group_id = r.group_id\nWHERE r.content_hash IS NULL\nORDER BY p.path;",
+		Query:       "SELECT DISTINCT p.path\nFROM pgit_file_refs r\nJOIN pgit_paths p ON p.path_id = r.path_id\nWHERE r.content_hash IS NULL\nORDER BY p.path;",
 	},
 	{
 		Title:       "Search commit messages",

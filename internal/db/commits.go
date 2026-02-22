@@ -251,7 +251,10 @@ func (db *DB) GetCommitsAfter(ctx context.Context, afterID string) ([]*Commit, e
 	return commits, rows.Err()
 }
 
-// CountCommits returns the total number of commits
+// CountCommits returns the total number of commits.
+//
+// Deprecated: This runs COUNT(*) on the xpatch table, requiring full chain
+// decompression. Use CountCommitsFromGraph instead (O(1) on heap table).
 func (db *DB) CountCommits(ctx context.Context) (int, error) {
 	var count int
 	err := db.QueryRow(ctx, "SELECT COUNT(*) FROM pgit_commits").Scan(&count)
@@ -329,7 +332,11 @@ func (db *DB) GetAllCommitIDsOrdered(ctx context.Context) ([]string, error) {
 	return ids, rows.Err()
 }
 
-// FindCommonAncestor finds the common ancestor between two commits
+// FindCommonAncestor finds the common ancestor between two commits.
+//
+// Deprecated: This uses a recursive CTE that is extremely hostile on xpatch tables
+// (each recursion step does a random PK decompress). For linear history, use the
+// pgit_commit_graph table with depth comparison instead. Currently unused.
 func (db *DB) FindCommonAncestor(ctx context.Context, commitA, commitB string) (string, error) {
 	sql := `
 	WITH RECURSIVE 

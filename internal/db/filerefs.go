@@ -8,8 +8,10 @@ import (
 
 // FileRef represents a file reference at a specific commit.
 // This is the metadata-only representation without actual content.
+// In v4, PathID replaces GroupID as the primary identifier. GroupID is accessed
+// via pgit_paths when needed for content table lookups.
 type FileRef struct {
-	GroupID       int32
+	PathID        int32
 	CommitID      string
 	VersionID     int32
 	ContentHash   []byte // 16 bytes BLAKE3, nil = deleted
@@ -19,11 +21,14 @@ type FileRef struct {
 	IsBinary      bool
 }
 
-// FileRefWithPath combines FileRef with resolved path.
+// FileRefWithPath combines FileRef with resolved path and group info.
 // Used when returning results that need the actual file path.
+// GroupID is included because it's needed for content table lookups
+// (content is keyed by group_id + version_id).
 type FileRefWithPath struct {
 	Path          string
-	GroupID       int32
+	PathID        int32
+	GroupID       int32 // From pgit_paths JOIN, needed for content lookups
 	CommitID      string
 	VersionID     int32
 	ContentHash   []byte
@@ -36,22 +41,22 @@ type FileRefWithPath struct {
 // CreateFileRef inserts a new file reference.
 func (db *DB) CreateFileRef(ctx context.Context, ref *FileRef) error {
 	sql := `
-	INSERT INTO pgit_file_refs (group_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary)
+	INSERT INTO pgit_file_refs (path_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
 	return db.Exec(ctx, sql,
-		ref.GroupID, ref.CommitID, ref.VersionID, ref.ContentHash,
+		ref.PathID, ref.CommitID, ref.VersionID, ref.ContentHash,
 		ref.Mode, ref.IsSymlink, ref.SymlinkTarget, ref.IsBinary)
 }
 
 // CreateFileRefTx inserts a new file reference within a transaction.
 func (db *DB) CreateFileRefTx(ctx context.Context, tx pgx.Tx, ref *FileRef) error {
 	sql := `
-	INSERT INTO pgit_file_refs (group_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary)
+	INSERT INTO pgit_file_refs (path_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
 	_, err := tx.Exec(ctx, sql,
-		ref.GroupID, ref.CommitID, ref.VersionID, ref.ContentHash,
+		ref.PathID, ref.CommitID, ref.VersionID, ref.ContentHash,
 		ref.Mode, ref.IsSymlink, ref.SymlinkTarget, ref.IsBinary)
 	return err
 }
@@ -65,7 +70,7 @@ func (db *DB) CreateFileRefsBatch(ctx context.Context, refs []*FileRef) error {
 	rows := make([][]interface{}, len(refs))
 	for i, ref := range refs {
 		rows[i] = []interface{}{
-			ref.GroupID, ref.CommitID, ref.VersionID, ref.ContentHash,
+			ref.PathID, ref.CommitID, ref.VersionID, ref.ContentHash,
 			ref.Mode, ref.IsSymlink, ref.SymlinkTarget, ref.IsBinary,
 		}
 	}
@@ -73,33 +78,33 @@ func (db *DB) CreateFileRefsBatch(ctx context.Context, refs []*FileRef) error {
 	_, err := db.pool.CopyFrom(
 		ctx,
 		pgx.Identifier{"pgit_file_refs"},
-		[]string{"group_id", "commit_id", "version_id", "content_hash", "mode", "is_symlink", "symlink_target", "is_binary"},
+		[]string{"path_id", "commit_id", "version_id", "content_hash", "mode", "is_symlink", "symlink_target", "is_binary"},
 		pgx.CopyFromRows(rows),
 	)
 	return err
 }
 
 // fileRefColumns is the standard column list for FileRef queries.
-const fileRefColumns = `group_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary`
+const fileRefColumns = `path_id, commit_id, version_id, content_hash, mode, is_symlink, symlink_target, is_binary`
 
 // scanFileRef scans a row into a FileRef.
 func scanFileRef(scanner interface{ Scan(dest ...any) error }) (*FileRef, error) {
 	ref := &FileRef{}
 	err := scanner.Scan(
-		&ref.GroupID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
+		&ref.PathID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
 		&ref.Mode, &ref.IsSymlink, &ref.SymlinkTarget, &ref.IsBinary,
 	)
 	return ref, err
 }
 
 // GetFileRef retrieves a specific file reference.
-func (db *DB) GetFileRef(ctx context.Context, groupID int32, commitID string) (*FileRef, error) {
+func (db *DB) GetFileRef(ctx context.Context, pathID int32, commitID string) (*FileRef, error) {
 	sql := `
 	SELECT ` + fileRefColumns + `
 	FROM pgit_file_refs
-	WHERE group_id = $1 AND commit_id = $2`
+	WHERE path_id = $1 AND commit_id = $2`
 
-	ref, err := scanFileRef(db.QueryRow(ctx, sql, groupID, commitID))
+	ref, err := scanFileRef(db.QueryRow(ctx, sql, pathID, commitID))
 
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -118,7 +123,7 @@ func (db *DB) GetFileRefsAtCommit(ctx context.Context, commitID string) ([]*File
 	SELECT ` + fileRefColumns + `
 	FROM pgit_file_refs
 	WHERE commit_id = $1
-	ORDER BY group_id`
+	ORDER BY path_id`
 
 	rows, err := db.Query(ctx, sql, commitID)
 	if err != nil {
@@ -141,9 +146,9 @@ func (db *DB) GetFileRefsAtCommit(ctx context.Context, commitID string) ([]*File
 // GetFileRefsAtCommitWithPaths retrieves file refs with resolved paths.
 func (db *DB) GetFileRefsAtCommitWithPaths(ctx context.Context, commitID string) ([]*FileRefWithPath, error) {
 	sql := `
-	SELECT p.path, r.group_id, r.commit_id, r.version_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, r.is_binary
+	SELECT p.path, p.path_id, p.group_id, r.commit_id, r.version_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, r.is_binary
 	FROM pgit_file_refs r
-	JOIN pgit_paths p ON p.group_id = r.group_id
+	JOIN pgit_paths p ON p.path_id = r.path_id
 	WHERE r.commit_id = $1
 	ORDER BY p.path`
 
@@ -157,7 +162,7 @@ func (db *DB) GetFileRefsAtCommitWithPaths(ctx context.Context, commitID string)
 	for rows.Next() {
 		ref := &FileRefWithPath{}
 		if err := rows.Scan(
-			&ref.Path, &ref.GroupID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
+			&ref.Path, &ref.PathID, &ref.GroupID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
 			&ref.Mode, &ref.IsSymlink, &ref.SymlinkTarget, &ref.IsBinary,
 		); err != nil {
 			return nil, err
@@ -173,16 +178,16 @@ func (db *DB) GetFileRefsAtCommitWithPaths(ctx context.Context, commitID string)
 func (db *DB) GetTreeRefsAtCommit(ctx context.Context, commitID string) ([]*FileRef, error) {
 	sql := `
 	WITH latest_versions AS (
-		SELECT DISTINCT ON (group_id)
+		SELECT DISTINCT ON (path_id)
 			` + fileRefColumns + `
 		FROM pgit_file_refs
 		WHERE commit_id <= $1
-		ORDER BY group_id, commit_id DESC
+		ORDER BY path_id, commit_id DESC
 	)
 	SELECT ` + fileRefColumns + `
 	FROM latest_versions
 	WHERE content_hash IS NOT NULL
-	ORDER BY group_id`
+	ORDER BY path_id`
 
 	rows, err := db.Query(ctx, sql, commitID)
 	if err != nil {
@@ -207,15 +212,15 @@ func (db *DB) GetTreeRefsAtCommit(ctx context.Context, commitID string) ([]*File
 func (db *DB) GetTreeRefsAtCommitWithPaths(ctx context.Context, commitID string) ([]*FileRefWithPath, error) {
 	sql := `
 	WITH latest_versions AS (
-		SELECT DISTINCT ON (r.group_id)
-			r.group_id, r.commit_id, r.version_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, r.is_binary
+		SELECT DISTINCT ON (r.path_id)
+			r.path_id, r.commit_id, r.version_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, r.is_binary
 		FROM pgit_file_refs r
 		WHERE r.commit_id <= $1
-		ORDER BY r.group_id, r.commit_id DESC
+		ORDER BY r.path_id, r.commit_id DESC
 	)
-	SELECT p.path, lv.group_id, lv.commit_id, lv.version_id, lv.content_hash, lv.mode, lv.is_symlink, lv.symlink_target, lv.is_binary
+	SELECT p.path, p.path_id, p.group_id, lv.commit_id, lv.version_id, lv.content_hash, lv.mode, lv.is_symlink, lv.symlink_target, lv.is_binary
 	FROM latest_versions lv
-	JOIN pgit_paths p ON p.group_id = lv.group_id
+	JOIN pgit_paths p ON p.path_id = lv.path_id
 	WHERE lv.content_hash IS NOT NULL
 	ORDER BY p.path`
 
@@ -229,7 +234,7 @@ func (db *DB) GetTreeRefsAtCommitWithPaths(ctx context.Context, commitID string)
 	for rows.Next() {
 		ref := &FileRefWithPath{}
 		if err := rows.Scan(
-			&ref.Path, &ref.GroupID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
+			&ref.Path, &ref.PathID, &ref.GroupID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
 			&ref.Mode, &ref.IsSymlink, &ref.SymlinkTarget, &ref.IsBinary,
 		); err != nil {
 			return nil, err
@@ -240,15 +245,15 @@ func (db *DB) GetTreeRefsAtCommitWithPaths(ctx context.Context, commitID string)
 	return refs, rows.Err()
 }
 
-// GetFileRefHistory retrieves all versions of a file by group_id.
-func (db *DB) GetFileRefHistory(ctx context.Context, groupID int32) ([]*FileRef, error) {
+// GetFileRefHistory retrieves all versions of a file by path_id.
+func (db *DB) GetFileRefHistory(ctx context.Context, pathID int32) ([]*FileRef, error) {
 	sql := `
 	SELECT ` + fileRefColumns + `
 	FROM pgit_file_refs
-	WHERE group_id = $1
+	WHERE path_id = $1
 	ORDER BY commit_id DESC`
 
-	rows, err := db.Query(ctx, sql, groupID)
+	rows, err := db.Query(ctx, sql, pathID)
 	if err != nil {
 		return nil, err
 	}
@@ -267,15 +272,15 @@ func (db *DB) GetFileRefHistory(ctx context.Context, groupID int32) ([]*FileRef,
 }
 
 // GetFileRefAtCommit retrieves a file ref at or before a specific commit.
-func (db *DB) GetFileRefAtCommit(ctx context.Context, groupID int32, commitID string) (*FileRef, error) {
+func (db *DB) GetFileRefAtCommit(ctx context.Context, pathID int32, commitID string) (*FileRef, error) {
 	sql := `
 	SELECT ` + fileRefColumns + `
 	FROM pgit_file_refs
-	WHERE group_id = $1 AND commit_id <= $2
+	WHERE path_id = $1 AND commit_id <= $2
 	ORDER BY commit_id DESC
 	LIMIT 1`
 
-	ref, err := scanFileRef(db.QueryRow(ctx, sql, groupID, commitID))
+	ref, err := scanFileRef(db.QueryRow(ctx, sql, pathID, commitID))
 
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -293,11 +298,16 @@ func (db *DB) GetFileRefAtCommit(ctx context.Context, groupID int32, commitID st
 }
 
 // GetNextVersionID returns the next version_id for a group.
-// This is used when creating new file refs.
+// This queries through pgit_paths to find all paths in the group,
+// then finds the max version_id across all of them.
+// This is used when creating new file refs outside of bulk import.
 func (db *DB) GetNextVersionID(ctx context.Context, groupID int32) (int32, error) {
 	var maxVersion *int32
 	err := db.QueryRow(ctx,
-		"SELECT MAX(version_id) FROM pgit_file_refs WHERE group_id = $1",
+		`SELECT MAX(r.version_id) 
+		 FROM pgit_file_refs r
+		 JOIN pgit_paths p ON p.path_id = r.path_id
+		 WHERE p.group_id = $1`,
 		groupID,
 	).Scan(&maxVersion)
 
@@ -313,10 +323,14 @@ func (db *DB) GetNextVersionID(ctx context.Context, groupID int32) (int32, error
 }
 
 // GetNextVersionIDTx returns the next version_id within a transaction.
+// Queries through pgit_paths to find the max version_id for the group.
 func (db *DB) GetNextVersionIDTx(ctx context.Context, tx pgx.Tx, groupID int32) (int32, error) {
 	var maxVersion *int32
 	err := tx.QueryRow(ctx,
-		"SELECT MAX(version_id) FROM pgit_file_refs WHERE group_id = $1",
+		`SELECT MAX(r.version_id)
+		 FROM pgit_file_refs r
+		 JOIN pgit_paths p ON p.path_id = r.path_id
+		 WHERE p.group_id = $1`,
 		groupID,
 	).Scan(&maxVersion)
 
@@ -337,7 +351,7 @@ func (db *DB) GetChangedFileRefs(ctx context.Context, fromCommit, toCommit strin
 	SELECT ` + fileRefColumns + `
 	FROM pgit_file_refs
 	WHERE commit_id > $1 AND commit_id <= $2
-	ORDER BY group_id, commit_id`
+	ORDER BY path_id, commit_id`
 
 	rows, err := db.Query(ctx, sql, fromCommit, toCommit)
 	if err != nil {
@@ -360,9 +374,9 @@ func (db *DB) GetChangedFileRefs(ctx context.Context, fromCommit, toCommit strin
 // GetChangedFileRefsWithPaths returns file refs with paths that changed between two commits.
 func (db *DB) GetChangedFileRefsWithPaths(ctx context.Context, fromCommit, toCommit string) ([]*FileRefWithPath, error) {
 	sql := `
-	SELECT p.path, r.group_id, r.commit_id, r.version_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, r.is_binary
+	SELECT p.path, p.path_id, p.group_id, r.commit_id, r.version_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target, r.is_binary
 	FROM pgit_file_refs r
-	JOIN pgit_paths p ON p.group_id = r.group_id
+	JOIN pgit_paths p ON p.path_id = r.path_id
 	WHERE r.commit_id > $1 AND r.commit_id <= $2
 	ORDER BY p.path, r.commit_id`
 
@@ -376,7 +390,7 @@ func (db *DB) GetChangedFileRefsWithPaths(ctx context.Context, fromCommit, toCom
 	for rows.Next() {
 		ref := &FileRefWithPath{}
 		if err := rows.Scan(
-			&ref.Path, &ref.GroupID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
+			&ref.Path, &ref.PathID, &ref.GroupID, &ref.CommitID, &ref.VersionID, &ref.ContentHash,
 			&ref.Mode, &ref.IsSymlink, &ref.SymlinkTarget, &ref.IsBinary,
 		); err != nil {
 			return nil, err
@@ -395,10 +409,10 @@ func (db *DB) CountFileRefs(ctx context.Context) (int64, error) {
 }
 
 // FileRefExists checks if a file ref exists at a specific commit.
-func (db *DB) FileRefExists(ctx context.Context, groupID int32, commitID string) (bool, error) {
+func (db *DB) FileRefExists(ctx context.Context, pathID int32, commitID string) (bool, error) {
 	var exists bool
 	err := db.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM pgit_file_refs WHERE group_id = $1 AND commit_id = $2)",
-		groupID, commitID).Scan(&exists)
+		"SELECT EXISTS(SELECT 1 FROM pgit_file_refs WHERE path_id = $1 AND commit_id = $2)",
+		pathID, commitID).Scan(&exists)
 	return exists, err
 }

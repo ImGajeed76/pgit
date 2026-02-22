@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
@@ -120,10 +120,10 @@ func showCommitDetails(ctx context.Context, r *repo.Repository, ref string, show
 
 	// Get parent content only for files changed in this commit.
 	// Instead of materializing the entire tree (7k+ files), we fetch only the
-	// specific files we need via scoped xpatch queries (group_id in WHERE).
+	// specific files we need via scoped xpatch queries (group_id resolved via path_id JOIN).
 	// Fetch parent content in parallel.
-	// Each file is a different group_id in xpatch, so parallel fetches
-	// across files are safe — they hit independent delta chains.
+	// Each file's content lives in a delta compression group in xpatch, so parallel
+	// fetches across files are safe — they hit independent delta chains.
 	var parentBlobs map[string][]byte
 	if commit.ParentID != nil {
 		parentBlobs = make(map[string][]byte)
@@ -264,24 +264,22 @@ func resolveCommitRef(ctx context.Context, r *repo.Repository, ref string) (stri
 		return "", err
 	}
 
-	// Walk back through ancestors if needed
-	for i := 0; i < ancestorCount; i++ {
-		commit, err := r.DB.GetCommit(ctx, commitID)
-		if err != nil {
-			return "", err
-		}
-		if commit == nil {
-			return "", util.ErrCommitNotFound
-		}
-		if commit.ParentID == nil {
-			return "", util.NewError("Cannot go back further").
-				WithMessage(fmt.Sprintf("Commit %s has no parent (root commit)", util.ShortID(commitID))).
-				WithSuggestion("Use a smaller ancestor number")
-		}
-		commitID = *commit.ParentID
+	if ancestorCount == 0 {
+		return commitID, nil
 	}
 
-	return commitID, nil
+	// Use binary lifting on the commit graph table for O(log N) ancestry.
+	// The graph table is a normal heap table with pre-computed power-of-2
+	// ancestor pointers, so HEAD~5000 takes ~13 B-tree lookups instead of
+	// 5000 xpatch decompressions.
+	ancestorID, err := r.DB.GetAncestorID(ctx, commitID, ancestorCount)
+	if err != nil {
+		return "", util.NewError("Cannot go back further").
+			WithMessage(fmt.Sprintf("Cannot resolve %s~%d: %v", baseRef, ancestorCount, err)).
+			WithSuggestion("Use a smaller ancestor number")
+	}
+
+	return ancestorID, nil
 }
 
 // parseAncestorNotation parses ref~N, ref^, ref^^, etc.
@@ -316,7 +314,9 @@ func parseAncestorNotation(ref string) (string, int) {
 	return ref, 0
 }
 
-// resolveBaseRef resolves a base reference (without ancestor notation) to a commit ID
+// resolveBaseRef resolves a base reference (without ancestor notation) to a commit ID.
+// Uses the heap-based pgit_commit_graph table for O(1) lookups instead of the xpatch
+// pgit_commits table, avoiding costly delta chain decompression.
 func resolveBaseRef(ctx context.Context, r *repo.Repository, ref string) (string, error) {
 	// Handle HEAD
 	if ref == "HEAD" {
@@ -333,17 +333,30 @@ func resolveBaseRef(ctx context.Context, r *repo.Repository, ref string) (string
 	// Normalize to uppercase for ULID matching
 	refUpper := strings.ToUpper(ref)
 
-	// Try exact match first
-	commit, err := r.DB.GetCommit(ctx, refUpper)
+	// Try exact match on the graph table (heap B-tree, instant)
+	exists, err := r.DB.CommitExistsInGraph(ctx, refUpper)
 	if err != nil {
 		return "", err
 	}
-	if commit != nil {
-		return commit.ID, nil
+	if exists {
+		return refUpper, nil
 	}
 
-	// Try partial match using SQL LIKE (much faster than loading all commits)
-	commit, err = r.DB.FindCommitByPartialID(ctx, refUpper)
+	// Try partial prefix match on the graph table (heap B-tree range scan)
+	fullID, err := r.DB.FindCommitByPartialIDInGraph(ctx, refUpper)
+	if err != nil {
+		var ambErr *db.AmbiguousCommitError
+		if errors.As(err, &ambErr) {
+			return "", formatAmbiguousError(ctx, r, ambErr)
+		}
+		return "", err
+	}
+	if fullID != "" {
+		return fullID, nil
+	}
+
+	// Fall back to suffix match on pgit_file_refs (normal table)
+	commit, err := r.DB.FindCommitByPartialID(ctx, refUpper)
 	if err != nil {
 		var ambErr *db.AmbiguousCommitError
 		if errors.As(err, &ambErr) {

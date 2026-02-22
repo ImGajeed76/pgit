@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 )
 
 // MergeState tracks the state of an in-progress merge/pull operation
@@ -154,25 +154,4 @@ func CreateConflictedFile(path string, localContent, remoteContent []byte, remot
 	_, _ = w.WriteString(ConflictMarkerEnd + " (" + remoteName + ")\n")
 
 	return w.Flush()
-}
-
-// HasConflictMarkers checks if a file contains conflict markers
-func HasConflictMarkers(path string) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == ConflictMarkerStart ||
-			line == ConflictMarkerMiddle ||
-			len(line) > len(ConflictMarkerEnd) && line[:len(ConflictMarkerEnd)] == ConflictMarkerEnd {
-			return true, nil
-		}
-	}
-
-	return false, scanner.Err()
 }

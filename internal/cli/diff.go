@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 )
@@ -210,10 +210,10 @@ func runCommitDiff(ctx context.Context, r *repo.Repository, fromRef, toRef strin
 		}
 
 		// Parallel fetch with concurrency cap.
-		// Each file is a different group_id in xpatch, so parallel fetches
-		// across files are safe — they hit independent delta chains.
-		// Within each file, old and new fetches are sequential to benefit
-		// from intra-group cache warming.
+		// Each file's content lives in a delta compression group in xpatch,
+		// so parallel fetches across files are safe — they hit independent
+		// delta chains. Within each file, old and new fetches are sequential
+		// to benefit from intra-group cache warming.
 		g, gCtx := errgroup.WithContext(ctx)
 		g.SetLimit(15)
 

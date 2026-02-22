@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -74,7 +74,6 @@ func init() {
 		newAddCmd(),
 		newRmCmd(),
 		newMvCmd(),
-		newResetCmd(),
 		newStatusCmd(),
 		newCommitCmd(),
 		newLogCmd(),
@@ -85,7 +84,6 @@ func init() {
 		newRemoteCmd(),
 		newPushCmd(),
 		newPullCmd(),
-		newResolveCmd(),
 		newCloneCmd(),
 		newImportCmd(),
 		newSQLCmd(),

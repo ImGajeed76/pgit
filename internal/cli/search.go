@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/ui"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/ui"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -155,7 +155,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 			commitIDs = append(commitIDs, sr.CommitID)
 		}
 	}
-	commitMap, _ := r.DB.GetCommitsBatch(ctx, commitIDs)
+	commitMap, _ := r.DB.GetCommitsBatchByRange(ctx, commitIDs)
 
 	getCommitTime := func(cid string) time.Time {
 		if c, ok := commitMap[cid]; ok {

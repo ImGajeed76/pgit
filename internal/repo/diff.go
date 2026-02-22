@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 

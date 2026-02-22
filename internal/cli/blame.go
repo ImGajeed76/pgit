@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -63,14 +63,14 @@ func runBlame(cmd *cobra.Command, args []string) error {
 
 	// Get file ref history (metadata only, from pgit_file_refs — normal table, fast).
 	// Ordered by commit_id DESC (newest first).
-	groupID, err := r.DB.GetGroupIDByPath(ctx, path)
+	pathID, groupID, err := r.DB.GetPathIDAndGroupIDByPath(ctx, path)
 	if err != nil {
 		return err
 	}
-	if groupID == 0 {
+	if pathID == 0 {
 		return util.ErrFileNotFound
 	}
-	refs, err := r.DB.GetFileRefHistory(ctx, groupID)
+	refs, err := r.DB.GetFileRefHistory(ctx, pathID)
 	if err != nil {
 		return err
 	}

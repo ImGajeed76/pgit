@@ -7,13 +7,13 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/config"
-	"github.com/imgajeed76/pgit/v3/internal/db"
-	"github.com/imgajeed76/pgit/v3/internal/merge"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/ui"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/config"
+	"github.com/imgajeed76/pgit/v4/internal/db"
+	"github.com/imgajeed76/pgit/v4/internal/merge"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/ui"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/spf13/cobra"
 )
 
@@ -37,7 +37,7 @@ With --rebase, pgit will:
 3. Reset to remote HEAD
 4. Replay local commits on top of remote (creating new commit IDs)
 
-Use 'pgit resolve <file>' to mark conflicts as resolved, then commit.`,
+Fix conflicts manually, then 'pgit add <file>' and 'pgit commit' to complete the merge.`,
 		RunE: runPull,
 	}
 
@@ -71,7 +71,8 @@ func runPull(cmd *cobra.Command, args []string) error {
 		return util.NewError("Unresolved conflicts from previous pull").
 			WithMessage("Conflicted files:"+conflictList).
 			WithSuggestions(
-				"pgit resolve <file>    # Mark file as resolved",
+				"# Fix conflicts in the listed files, then:",
+				"pgit add <file>        # Stage resolved file",
 				"pgit commit -m \"...\"   # Complete the merge",
 			)
 	}
@@ -732,7 +733,6 @@ func pullDiverged(ctx context.Context, r *repo.Repository, remoteDB *db.DB, loca
 		}
 		fmt.Println()
 		fmt.Println("Fix the conflicts, then:")
-		fmt.Println("  pgit resolve <file>    # Mark file as resolved")
 		fmt.Println("  pgit add <file>        # Stage resolved file")
 		fmt.Println("  pgit commit -m \"...\"   # Complete the merge")
 	} else if len(autoMergedFiles) > 0 || len(localOnlyFiles) > 0 {

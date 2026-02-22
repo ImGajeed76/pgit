@@ -23,8 +23,8 @@ sub-millisecond. The cache is shared across all connections.
 | Table | Grouping | Description |
 |-------|----------|-------------|
 | `pgit_commits` | Single group | All commits in one delta chain |
-| `pgit_text_content` | One group per file path | Text file content versions |
-| `pgit_binary_content` | One group per binary file | Binary file content versions |
+| `pgit_text_content` | One group per content identity (paths sharing identical content share a group) | Text file content versions |
+| `pgit_binary_content` | One group per content identity | Binary file content versions |
 
 Querying these tables has decompression cost. Every rule below exists to
 minimize how much of the delta chain gets decompressed.
@@ -33,8 +33,8 @@ minimize how much of the delta chain gets decompressed.
 
 | Table | Description |
 |-------|-------------|
-| `pgit_file_refs` | File version metadata. PK: `(group_id, commit_id)`. Also: version_id, content_hash, mode, is_symlink, symlink_target, is_binary |
-| `pgit_paths` | group_id -> file path |
+| `pgit_file_refs` | File version metadata. PK: `(path_id, commit_id)`. Also: version_id, content_hash, mode, is_symlink, symlink_target, is_binary |
+| `pgit_paths` | path_id (PK) + group_id (shared compression group) -> file path |
 | `pgit_refs` | Ref name -> commit_id (e.g., HEAD) |
 | `pgit_metadata` | Repository key-value store |
 | `pgit_sync_state` | Remote sync tracking (remote_name, last_commit_id, synced_at) |
@@ -196,10 +196,11 @@ need actual file content or commit messages.
 -- Good: metadata from normal tables, zero xpatch cost
 SELECT p.path, r.commit_id, r.version_id, r.content_hash
 FROM pgit_file_refs r
-JOIN pgit_paths p ON p.group_id = r.group_id
+JOIN pgit_paths p ON p.path_id = r.path_id
 WHERE r.commit_id > $1 AND r.commit_id <= $2
 
 -- Then fetch content only for the specific rows you need
+-- (resolve group_id from pgit_paths.group_id via path_id)
 SELECT content FROM pgit_text_content
 WHERE group_id = $1 AND version_id = $2
 ```

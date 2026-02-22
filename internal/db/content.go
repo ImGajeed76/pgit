@@ -3,7 +3,7 @@ package db
 import (
 	"context"
 
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -442,16 +442,19 @@ func (db *DB) CountContents(ctx context.Context) (int64, error) {
 
 // GetContentForFileRef retrieves content for a file ref.
 // Returns nil for deleted refs (ContentHash == nil) since they have no content row.
-func (db *DB) GetContentForFileRef(ctx context.Context, ref *FileRef) ([]byte, error) {
+// In v4, groupID must be provided since FileRef no longer carries it.
+func (db *DB) GetContentForFileRef(ctx context.Context, ref *FileRef, groupID int32) ([]byte, error) {
 	if ref == nil || ref.ContentHash == nil {
 		return nil, nil
 	}
-	return db.GetContent(ctx, ref.GroupID, ref.VersionID, ref.IsBinary)
+	return db.GetContent(ctx, groupID, ref.VersionID, ref.IsBinary)
 }
 
 // GetContentsForFileRefs retrieves content for multiple file refs.
 // Skips deleted refs (ContentHash == nil) since they have no content row.
-func (db *DB) GetContentsForFileRefs(ctx context.Context, refs []*FileRef) (map[ContentKey][]byte, error) {
+// In v4, groupID must be provided since FileRef no longer carries it.
+// All refs must belong to the same group.
+func (db *DB) GetContentsForFileRefs(ctx context.Context, refs []*FileRef, groupID int32) (map[ContentKey][]byte, error) {
 	if len(refs) == 0 {
 		return make(map[ContentKey][]byte), nil
 	}
@@ -462,7 +465,7 @@ func (db *DB) GetContentsForFileRefs(ctx context.Context, refs []*FileRef) (map[
 		if ref.ContentHash == nil {
 			continue // deleted — no content row exists
 		}
-		k := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		k := ContentKey{GroupID: groupID, VersionID: ref.VersionID}
 		keys = append(keys, k)
 		if ref.IsBinary {
 			isBinaryMap[k] = true

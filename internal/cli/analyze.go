@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/ui"
-	"github.com/imgajeed76/pgit/v3/internal/ui/table"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/ui"
+	"github.com/imgajeed76/pgit/v4/internal/ui/table"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -259,7 +259,7 @@ func runAnalyzeChurn(cmd *cobra.Command, args []string) error {
 	rows, err := r.DB.Query(ctx, `
 		SELECT p.path, COUNT(*) as versions
 		FROM pgit_file_refs r
-		JOIN pgit_paths p ON p.group_id = r.group_id
+		JOIN pgit_paths p ON p.path_id = r.path_id
 		GROUP BY p.path
 	`)
 	if err != nil {
@@ -347,9 +347,9 @@ func runAnalyzeCoupling(cmd *cobra.Command, args []string) error {
 	spinner := ui.NewSpinner("Analyzing file coupling")
 	spinner.Start()
 
-	// Step 1: Fetch all (commit_id, group_id) pairs from heap table
+	// Step 1: Fetch all (commit_id, path_id) pairs from heap table
 	rows, err := r.DB.Query(ctx, `
-		SELECT commit_id, group_id
+		SELECT commit_id, path_id
 		FROM pgit_file_refs
 		ORDER BY commit_id
 	`)
@@ -358,22 +358,22 @@ func runAnalyzeCoupling(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Build commit -> []group_id map
+	// Build commit -> []path_id map
 	commitFiles := make(map[string][]int32)
 	for rows.Next() {
 		var commitID string
-		var groupID int32
-		if err := rows.Scan(&commitID, &groupID); err != nil {
+		var pathID int32
+		if err := rows.Scan(&commitID, &pathID); err != nil {
 			rows.Close()
 			spinner.Stop()
 			return err
 		}
-		commitFiles[commitID] = append(commitFiles[commitID], groupID)
+		commitFiles[commitID] = append(commitFiles[commitID], pathID)
 	}
 	rows.Close()
 
-	// Step 2: Fetch group_id -> path mapping
-	pathRows, err := r.DB.Query(ctx, `SELECT group_id, path FROM pgit_paths`)
+	// Step 2: Fetch path_id -> path mapping
+	pathRows, err := r.DB.Query(ctx, `SELECT path_id, path FROM pgit_paths`)
 	if err != nil {
 		spinner.Stop()
 		return err
@@ -381,14 +381,14 @@ func runAnalyzeCoupling(cmd *cobra.Command, args []string) error {
 
 	pathMap := make(map[int32]string)
 	for pathRows.Next() {
-		var groupID int32
+		var pathID int32
 		var path string
-		if err := pathRows.Scan(&groupID, &path); err != nil {
+		if err := pathRows.Scan(&pathID, &path); err != nil {
 			pathRows.Close()
 			spinner.Stop()
 			return err
 		}
-		pathMap[groupID] = path
+		pathMap[pathID] = path
 	}
 	pathRows.Close()
 
@@ -398,16 +398,16 @@ func runAnalyzeCoupling(cmd *cobra.Command, args []string) error {
 	}
 	pairCounts := make(map[pair]int)
 
-	for _, groupIDs := range commitFiles {
-		if len(groupIDs) < 2 || len(groupIDs) > maxFiles {
+	for _, pathIDs := range commitFiles {
+		if len(pathIDs) < 2 || len(pathIDs) > maxFiles {
 			continue
 		}
 		// Sort for consistent pair ordering
-		sort.Slice(groupIDs, func(i, j int) bool { return groupIDs[i] < groupIDs[j] })
+		sort.Slice(pathIDs, func(i, j int) bool { return pathIDs[i] < pathIDs[j] })
 		// Generate all pairs
-		for i := 0; i < len(groupIDs); i++ {
-			for j := i + 1; j < len(groupIDs); j++ {
-				p := pair{groupIDs[i], groupIDs[j]}
+		for i := 0; i < len(pathIDs); i++ {
+			for j := i + 1; j < len(pathIDs); j++ {
+				p := pair{pathIDs[i], pathIDs[j]}
 				pairCounts[p]++
 			}
 		}
@@ -507,7 +507,7 @@ func runAnalyzeHotspots(cmd *cobra.Command, args []string) error {
 	rows, err := r.DB.Query(ctx, `
 		SELECT p.path, COUNT(*) as versions
 		FROM pgit_file_refs r
-		JOIN pgit_paths p ON p.group_id = r.group_id
+		JOIN pgit_paths p ON p.path_id = r.path_id
 		GROUP BY p.path
 	`)
 	if err != nil {
@@ -989,7 +989,7 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 
 	// Step 2: Scan file_refs (heap table, fast) and resolve authors
 	refRows, err := r.DB.Query(ctx, `
-		SELECT group_id, commit_id
+		SELECT path_id, commit_id
 		FROM pgit_file_refs
 	`)
 	if err != nil {
@@ -997,12 +997,12 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// group_id -> set of authors
+	// path_id -> set of authors
 	fileAuthors := make(map[int32]map[string]bool)
 	for refRows.Next() {
-		var groupID int32
+		var pathID int32
 		var commitID string
-		if err := refRows.Scan(&groupID, &commitID); err != nil {
+		if err := refRows.Scan(&pathID, &commitID); err != nil {
 			refRows.Close()
 			spinner.Stop()
 			return err
@@ -1011,15 +1011,15 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 		if !ok {
 			continue
 		}
-		if fileAuthors[groupID] == nil {
-			fileAuthors[groupID] = make(map[string]bool)
+		if fileAuthors[pathID] == nil {
+			fileAuthors[pathID] = make(map[string]bool)
 		}
-		fileAuthors[groupID][author] = true
+		fileAuthors[pathID][author] = true
 	}
 	refRows.Close()
 
-	// Step 3: Fetch group_id -> path mapping
-	pathRows, err := r.DB.Query(ctx, `SELECT group_id, path FROM pgit_paths`)
+	// Step 3: Fetch path_id -> path mapping
+	pathRows, err := r.DB.Query(ctx, `SELECT path_id, path FROM pgit_paths`)
 	if err != nil {
 		spinner.Stop()
 		return err
@@ -1027,14 +1027,14 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 
 	pathMap := make(map[int32]string)
 	for pathRows.Next() {
-		var groupID int32
+		var pathID int32
 		var path string
-		if err := pathRows.Scan(&groupID, &path); err != nil {
+		if err := pathRows.Scan(&pathID, &path); err != nil {
 			pathRows.Close()
 			spinner.Stop()
 			return err
 		}
-		pathMap[groupID] = path
+		pathMap[pathID] = path
 	}
 	pathRows.Close()
 
@@ -1047,8 +1047,8 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 		authorList string
 	}
 	var results []busFactorEntry
-	for groupID, authors := range fileAuthors {
-		path, ok := pathMap[groupID]
+	for pathID, authors := range fileAuthors {
+		path, ok := pathMap[pathID]
 		if !ok {
 			continue
 		}

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/imgajeed76/pgit/v3/internal/util"
+	"github.com/imgajeed76/pgit/v4/internal/util"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -41,11 +41,28 @@ func (db *DB) CreateBlob(ctx context.Context, b *Blob) error {
 }
 
 // createBlobTx inserts a blob within a transaction.
+// For single-blob inserts (commit, add), paths get their own group (pathID == groupID).
 func (db *DB) createBlobTx(ctx context.Context, tx pgx.Tx, b *Blob) error {
-	// 1. Get or create path -> group_id
-	groupID, err := db.GetOrCreatePathTx(ctx, tx, b.Path)
+	// 1. Get or create path -> (pathID, groupID)
+	// For non-import operations, each path gets its own group.
+	// Pass groupID=0 as placeholder; GetOrCreatePathTx will return existing group
+	// if path exists, or we handle it below.
+	pathID, groupID, err := db.GetOrCreatePathTx(ctx, tx, b.Path, 0)
 	if err != nil {
 		return err
+	}
+
+	// If this is a new path (groupID=0 from placeholder), assign pathID as groupID
+	if groupID == 0 {
+		// Update the path's group_id to be its own path_id (singleton group)
+		_, err = tx.Exec(ctx,
+			"UPDATE pgit_paths SET group_id = $1 WHERE path_id = $2",
+			pathID, pathID,
+		)
+		if err != nil {
+			return err
+		}
+		groupID = pathID
 	}
 
 	// 2. Get next version_id for this group
@@ -56,7 +73,7 @@ func (db *DB) createBlobTx(ctx context.Context, tx pgx.Tx, b *Blob) error {
 
 	// 3. Create file ref
 	ref := &FileRef{
-		GroupID:       groupID,
+		PathID:        pathID,
 		CommitID:      b.CommitID,
 		VersionID:     versionID,
 		ContentHash:   b.ContentHash,
@@ -93,90 +110,18 @@ func (db *DB) CreateBlobs(ctx context.Context, blobs []*Blob) error {
 	}
 
 	return db.WithTx(ctx, func(tx pgx.Tx) error {
-		// Collect all unique paths
-		pathSet := make(map[string]bool)
-		for _, b := range blobs {
-			pathSet[b.Path] = true
-		}
-		paths := make([]string, 0, len(pathSet))
-		for p := range pathSet {
-			paths = append(paths, p)
-		}
-
-		// Batch get/create paths
-		pathToGroupID, err := db.getOrCreatePathsBatchTx(ctx, tx, paths)
-		if err != nil {
-			return err
-		}
-
-		// Group blobs by path to assign sequential version IDs
-		blobsByPath := make(map[string][]*Blob)
-		for _, b := range blobs {
-			blobsByPath[b.Path] = append(blobsByPath[b.Path], b)
-		}
-
-		// Get current max version_id for each group
-		groupIDs := make([]int32, 0, len(pathToGroupID))
-		for _, gid := range pathToGroupID {
-			groupIDs = append(groupIDs, gid)
-		}
-		maxVersions, err := db.getMaxVersionIDsBatchTx(ctx, tx, groupIDs)
-		if err != nil {
-			return err
-		}
-
-		// Prepare batch inserts
-		var fileRefs []*FileRef
-		var contents []*Content
-
-		for path, pathBlobs := range blobsByPath {
-			groupID := pathToGroupID[path]
-			baseVersion := maxVersions[groupID]
-
-			for i, b := range pathBlobs {
-				versionID := baseVersion + int32(i) + 1
-
-				fileRefs = append(fileRefs, &FileRef{
-					GroupID:       groupID,
-					CommitID:      b.CommitID,
-					VersionID:     versionID,
-					ContentHash:   b.ContentHash,
-					Mode:          b.Mode,
-					IsSymlink:     b.IsSymlink,
-					SymlinkTarget: b.SymlinkTarget,
-					IsBinary:      b.IsBinary,
-				})
-
-				// Only create content entries for non-deleted files.
-				// Deleted files (ContentHash == nil) only need a file ref.
-				if b.ContentHash != nil {
-					contents = append(contents, &Content{
-						GroupID:   groupID,
-						VersionID: versionID,
-						Content:   b.Content,
-						IsBinary:  b.IsBinary,
-					})
-				}
-			}
-		}
-
-		// Batch insert file refs
-		if err := db.createFileRefsBatchTx(ctx, tx, fileRefs); err != nil {
-			return err
-		}
-
-		// Batch insert contents (splits into text/binary internally)
-		if err := db.createContentsBatchTx(ctx, tx, contents); err != nil {
-			return err
-		}
-
-		return nil
+		return db.createBlobsBatchTx(ctx, tx, blobs)
 	})
 }
 
 // CreateBlobsTx inserts multiple blobs within an existing transaction.
 // Same logic as CreateBlobs but uses the provided tx instead of creating its own.
 func (db *DB) CreateBlobsTx(ctx context.Context, tx pgx.Tx, blobs []*Blob) error {
+	return db.createBlobsBatchTx(ctx, tx, blobs)
+}
+
+// createBlobsBatchTx is the shared implementation for batch blob insertion.
+func (db *DB) createBlobsBatchTx(ctx context.Context, tx pgx.Tx, blobs []*Blob) error {
 	if len(blobs) == 0 {
 		return nil
 	}
@@ -191,8 +136,8 @@ func (db *DB) CreateBlobsTx(ctx context.Context, tx pgx.Tx, blobs []*Blob) error
 		paths = append(paths, p)
 	}
 
-	// Batch get/create paths
-	pathToGroupID, err := db.getOrCreatePathsBatchTx(ctx, tx, paths)
+	// Batch get/create paths (returns PathIDs with both pathID and groupID)
+	pathReg, err := db.getOrCreatePathsBatchTx(ctx, tx, paths)
 	if err != nil {
 		return err
 	}
@@ -204,9 +149,13 @@ func (db *DB) CreateBlobsTx(ctx context.Context, tx pgx.Tx, blobs []*Blob) error
 	}
 
 	// Get current max version_id for each group
-	groupIDs := make([]int32, 0, len(pathToGroupID))
-	for _, gid := range pathToGroupID {
-		groupIDs = append(groupIDs, gid)
+	groupIDs := make([]int32, 0, len(pathReg))
+	seen := make(map[int32]bool)
+	for _, ids := range pathReg {
+		if !seen[ids.GroupID] {
+			seen[ids.GroupID] = true
+			groupIDs = append(groupIDs, ids.GroupID)
+		}
 	}
 	maxVersions, err := db.getMaxVersionIDsBatchTx(ctx, tx, groupIDs)
 	if err != nil {
@@ -218,14 +167,14 @@ func (db *DB) CreateBlobsTx(ctx context.Context, tx pgx.Tx, blobs []*Blob) error
 	var contents []*Content
 
 	for path, pathBlobs := range blobsByPath {
-		groupID := pathToGroupID[path]
-		baseVersion := maxVersions[groupID]
+		ids := pathReg[path]
+		baseVersion := maxVersions[ids.GroupID]
 
 		for i, b := range pathBlobs {
 			versionID := baseVersion + int32(i) + 1
 
 			fileRefs = append(fileRefs, &FileRef{
-				GroupID:       groupID,
+				PathID:        ids.PathID,
 				CommitID:      b.CommitID,
 				VersionID:     versionID,
 				ContentHash:   b.ContentHash,
@@ -237,7 +186,7 @@ func (db *DB) CreateBlobsTx(ctx context.Context, tx pgx.Tx, blobs []*Blob) error
 
 			if b.ContentHash != nil {
 				contents = append(contents, &Content{
-					GroupID:   groupID,
+					GroupID:   ids.GroupID,
 					VersionID: versionID,
 					Content:   b.Content,
 					IsBinary:  b.IsBinary,
@@ -280,7 +229,10 @@ func (db *DB) DeleteBlobsForCommits(ctx context.Context, commitIDs []string) err
 
 	for _, cid := range commitIDs {
 		rows, err := db.Query(ctx,
-			"SELECT group_id, version_id, is_binary FROM pgit_file_refs WHERE commit_id = $1", cid)
+			`SELECT p.group_id, r.version_id, r.is_binary
+			 FROM pgit_file_refs r
+			 JOIN pgit_paths p ON p.path_id = r.path_id
+			 WHERE r.commit_id = $1`, cid)
 		if err != nil {
 			return fmt.Errorf("failed to query file_refs for commit %s: %w", cid, err)
 		}
@@ -344,16 +296,18 @@ func (db *DB) DeleteBlobsForCommits(ctx context.Context, commitIDs []string) err
 }
 
 // getOrCreatePathsBatchTx handles multiple paths within a transaction.
-func (db *DB) getOrCreatePathsBatchTx(ctx context.Context, tx pgx.Tx, paths []string) (map[string]int32, error) {
+// For non-import operations, each new path gets its own group (singleton).
+// Returns a map of path -> PathIDs.
+func (db *DB) getOrCreatePathsBatchTx(ctx context.Context, tx pgx.Tx, paths []string) (map[string]PathIDs, error) {
 	if len(paths) == 0 {
-		return make(map[string]int32), nil
+		return make(map[string]PathIDs), nil
 	}
 
-	result := make(map[string]int32, len(paths))
+	result := make(map[string]PathIDs, len(paths))
 
 	// First, try to get all existing paths
 	rows, err := tx.Query(ctx,
-		"SELECT group_id, path FROM pgit_paths WHERE path = ANY($1)",
+		"SELECT path_id, group_id, path FROM pgit_paths WHERE path = ANY($1)",
 		paths,
 	)
 	if err != nil {
@@ -361,13 +315,13 @@ func (db *DB) getOrCreatePathsBatchTx(ctx context.Context, tx pgx.Tx, paths []st
 	}
 
 	for rows.Next() {
-		var groupID int32
+		var pathID, groupID int32
 		var path string
-		if err := rows.Scan(&groupID, &path); err != nil {
+		if err := rows.Scan(&pathID, &groupID, &path); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		result[path] = groupID
+		result[path] = PathIDs{PathID: pathID, GroupID: groupID}
 	}
 	rows.Close()
 
@@ -375,20 +329,29 @@ func (db *DB) getOrCreatePathsBatchTx(ctx context.Context, tx pgx.Tx, paths []st
 		return nil, err
 	}
 
-	// Insert missing paths
+	// Insert missing paths (each new path gets its own singleton group)
+	// First, get max group_id for assigning new groups
+	var maxGroupID int32
+	err = tx.QueryRow(ctx, "SELECT COALESCE(MAX(group_id), 0) FROM pgit_paths").Scan(&maxGroupID)
+	if err != nil {
+		return nil, err
+	}
+	nextGroupID := maxGroupID + 1
+
 	for _, path := range paths {
 		if _, exists := result[path]; !exists {
-			var groupID int32
+			var pathID, groupID int32
 			err := tx.QueryRow(ctx,
-				`INSERT INTO pgit_paths (path) VALUES ($1)
+				`INSERT INTO pgit_paths (group_id, path) VALUES ($1, $2)
 				 ON CONFLICT (path) DO UPDATE SET path = EXCLUDED.path
-				 RETURNING group_id`,
-				path,
-			).Scan(&groupID)
+				 RETURNING path_id, group_id`,
+				nextGroupID, path,
+			).Scan(&pathID, &groupID)
 			if err != nil {
 				return nil, err
 			}
-			result[path] = groupID
+			result[path] = PathIDs{PathID: pathID, GroupID: groupID}
+			nextGroupID++
 		}
 	}
 
@@ -396,6 +359,7 @@ func (db *DB) getOrCreatePathsBatchTx(ctx context.Context, tx pgx.Tx, paths []st
 }
 
 // getMaxVersionIDsBatchTx gets max version_id for each group_id.
+// In v4, file_refs no longer has group_id, so we JOIN through pgit_paths.
 func (db *DB) getMaxVersionIDsBatchTx(ctx context.Context, tx pgx.Tx, groupIDs []int32) (map[int32]int32, error) {
 	result := make(map[int32]int32)
 
@@ -404,7 +368,11 @@ func (db *DB) getMaxVersionIDsBatchTx(ctx context.Context, tx pgx.Tx, groupIDs [
 	}
 
 	rows, err := tx.Query(ctx,
-		"SELECT group_id, COALESCE(MAX(version_id), 0) FROM pgit_file_refs WHERE group_id = ANY($1) GROUP BY group_id",
+		`SELECT p.group_id, COALESCE(MAX(r.version_id), 0)
+		 FROM pgit_paths p
+		 LEFT JOIN pgit_file_refs r ON r.path_id = p.path_id
+		 WHERE p.group_id = ANY($1)
+		 GROUP BY p.group_id`,
 		groupIDs,
 	)
 	if err != nil {
@@ -439,7 +407,7 @@ func (db *DB) createFileRefsBatchTx(ctx context.Context, tx pgx.Tx, refs []*File
 	rows := make([][]interface{}, len(refs))
 	for i, ref := range refs {
 		rows[i] = []interface{}{
-			ref.GroupID, ref.CommitID, ref.VersionID, ref.ContentHash,
+			ref.PathID, ref.CommitID, ref.VersionID, ref.ContentHash,
 			ref.Mode, ref.IsSymlink, ref.SymlinkTarget, ref.IsBinary,
 		}
 	}
@@ -447,7 +415,7 @@ func (db *DB) createFileRefsBatchTx(ctx context.Context, tx pgx.Tx, refs []*File
 	_, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"pgit_file_refs"},
-		[]string{"group_id", "commit_id", "version_id", "content_hash", "mode", "is_symlink", "symlink_target", "is_binary"},
+		[]string{"path_id", "commit_id", "version_id", "content_hash", "mode", "is_symlink", "symlink_target", "is_binary"},
 		pgx.CopyFromRows(rows),
 	)
 	return err
@@ -520,17 +488,17 @@ func (db *DB) createContentsBatchTx(ctx context.Context, tx pgx.Tx, contents []*
 
 // GetBlob retrieves a specific blob by path and commit.
 func (db *DB) GetBlob(ctx context.Context, path, commitID string) (*Blob, error) {
-	// Get group_id for path
-	groupID, err := db.GetGroupIDByPath(ctx, path)
+	// Get (pathID, groupID) for path
+	pathID, groupID, err := db.GetPathIDAndGroupIDByPath(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	if groupID == 0 {
+	if pathID == 0 {
 		return nil, nil // Path doesn't exist
 	}
 
-	// Get file ref
-	ref, err := db.GetFileRef(ctx, groupID, commitID)
+	// Get file ref by pathID
+	ref, err := db.GetFileRef(ctx, pathID, commitID)
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +507,8 @@ func (db *DB) GetBlob(ctx context.Context, path, commitID string) (*Blob, error)
 	}
 
 	// Get content from the correct table based on is_binary
-	content, err := db.GetContent(ctx, ref.GroupID, ref.VersionID, ref.IsBinary)
+	// Content is keyed by (group_id, version_id)
+	content, err := db.GetContent(ctx, groupID, ref.VersionID, ref.IsBinary)
 	if err != nil {
 		return nil, err
 	}
@@ -613,13 +582,13 @@ func (db *DB) GetBlobsAtCommit(ctx context.Context, commitID string) ([]*Blob, e
 func (db *DB) GetTreeAtCommit(ctx context.Context, commitID string) ([]*Blob, error) {
 	// Step 1: Get tree refs with paths and is_binary
 	sql := `
-	SELECT DISTINCT ON (r.group_id)
+	SELECT DISTINCT ON (r.path_id)
 		p.path, r.commit_id, r.content_hash, r.mode, r.is_symlink, r.symlink_target,
-		r.group_id, r.version_id, r.is_binary
+		p.group_id, r.version_id, r.is_binary
 	FROM pgit_file_refs r
-	JOIN pgit_paths p ON p.group_id = r.group_id
+	JOIN pgit_paths p ON p.path_id = r.path_id
 	WHERE r.commit_id <= $1
-	ORDER BY r.group_id, r.commit_id DESC`
+	ORDER BY r.path_id, r.commit_id DESC`
 
 	rows, err := db.Query(ctx, sql, commitID)
 	if err != nil {
@@ -745,17 +714,17 @@ func (db *DB) GetCurrentTreeMetadata(ctx context.Context) ([]*Blob, error) {
 // GetFileHistory retrieves all versions of a file.
 // Uses a two-step approach: get refs, then batch-fetch content from both tables.
 func (db *DB) GetFileHistory(ctx context.Context, path string) ([]*Blob, error) {
-	// Get group_id for path
-	groupID, err := db.GetGroupIDByPath(ctx, path)
+	// Get (pathID, groupID) for path
+	pathID, groupID, err := db.GetPathIDAndGroupIDByPath(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	if groupID == 0 {
+	if pathID == 0 {
 		return nil, nil
 	}
 
-	// Get all file refs for this group
-	refs, err := db.GetFileRefHistory(ctx, groupID)
+	// Get all file refs for this path
+	refs, err := db.GetFileRefHistory(ctx, pathID)
 	if err != nil {
 		return nil, err
 	}
@@ -765,13 +734,14 @@ func (db *DB) GetFileHistory(ctx context.Context, path string) ([]*Blob, error) 
 	}
 
 	// Batch fetch content (only for non-deleted refs)
+	// Content is keyed by (group_id, version_id) — groupID from paths table
 	keys := make([]ContentKey, 0, len(refs))
 	isBinaryMap := make(map[ContentKey]bool)
 	for _, ref := range refs {
 		if ref.ContentHash == nil {
 			continue // deleted — no content row exists
 		}
-		k := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		k := ContentKey{GroupID: groupID, VersionID: ref.VersionID}
 		keys = append(keys, k)
 		if ref.IsBinary {
 			isBinaryMap[k] = true
@@ -786,7 +756,7 @@ func (db *DB) GetFileHistory(ctx context.Context, path string) ([]*Blob, error) 
 	// Build blobs
 	blobs := make([]*Blob, len(refs))
 	for i, ref := range refs {
-		key := ContentKey{GroupID: ref.GroupID, VersionID: ref.VersionID}
+		key := ContentKey{GroupID: groupID, VersionID: ref.VersionID}
 		blobs[i] = &Blob{
 			Path:          path,
 			CommitID:      ref.CommitID,
@@ -805,17 +775,17 @@ func (db *DB) GetFileHistory(ctx context.Context, path string) ([]*Blob, error) 
 // GetFileAtCommit retrieves a file at a specific commit (or the latest version before it).
 // Uses file ref lookup + content fetch from the correct table.
 func (db *DB) GetFileAtCommit(ctx context.Context, path, commitID string) (*Blob, error) {
-	// Get group_id for path
-	groupID, err := db.GetGroupIDByPath(ctx, path)
+	// Get (pathID, groupID) for path
+	pathID, groupID, err := db.GetPathIDAndGroupIDByPath(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	if groupID == 0 {
+	if pathID == 0 {
 		return nil, nil
 	}
 
 	// Get file ref at or before this commit
-	ref, err := db.GetFileRefAtCommit(ctx, groupID, commitID)
+	ref, err := db.GetFileRefAtCommit(ctx, pathID, commitID)
 	if err != nil {
 		return nil, err
 	}
@@ -824,7 +794,8 @@ func (db *DB) GetFileAtCommit(ctx context.Context, path, commitID string) (*Blob
 	}
 
 	// Get content from the correct table
-	content, err := db.GetContent(ctx, ref.GroupID, ref.VersionID, ref.IsBinary)
+	// Content is keyed by (group_id, version_id)
+	content, err := db.GetContent(ctx, groupID, ref.VersionID, ref.IsBinary)
 	if err != nil {
 		return nil, err
 	}
@@ -962,7 +933,7 @@ func (db *DB) GetAllPaths(ctx context.Context) ([]string, error) {
 func (db *DB) GetImportedPaths(ctx context.Context) (map[string]bool, error) {
 	rows, err := db.Query(ctx,
 		"SELECT DISTINCT p.path FROM pgit_paths p "+
-			"JOIN pgit_file_refs fr ON fr.group_id = p.group_id")
+			"JOIN pgit_file_refs fr ON fr.path_id = p.path_id")
 	if err != nil {
 		return nil, err
 	}
@@ -981,30 +952,30 @@ func (db *DB) GetImportedPaths(ctx context.Context) (map[string]bool, error) {
 
 // BlobExists checks if a blob exists at a specific commit.
 func (db *DB) BlobExists(ctx context.Context, path, commitID string) (bool, error) {
-	groupID, err := db.GetGroupIDByPath(ctx, path)
+	pathID, _, err := db.GetPathIDAndGroupIDByPath(ctx, path)
 	if err != nil {
 		return false, err
 	}
-	if groupID == 0 {
+	if pathID == 0 {
 		return false, nil
 	}
 
-	return db.FileRefExists(ctx, groupID, commitID)
+	return db.FileRefExists(ctx, pathID, commitID)
 }
 
 // FileExistsInTree checks if a file exists (is not deleted) in the tree at a commit.
 // This finds the latest version of the file at or before commitID and checks if it's not deleted.
 func (db *DB) FileExistsInTree(ctx context.Context, path, commitID string) (bool, error) {
-	groupID, err := db.GetGroupIDByPath(ctx, path)
+	pathID, _, err := db.GetPathIDAndGroupIDByPath(ctx, path)
 	if err != nil {
 		return false, err
 	}
-	if groupID == 0 {
+	if pathID == 0 {
 		return false, nil // Path never existed
 	}
 
 	// Get the latest file ref at or before this commit
-	ref, err := db.GetFileRefAtCommit(ctx, groupID, commitID)
+	ref, err := db.GetFileRefAtCommit(ctx, pathID, commitID)
 	if err != nil {
 		return false, err
 	}
@@ -1112,9 +1083,9 @@ func (db *DB) getSearchFileRefs(ctx context.Context, pathPattern, commitID strin
 	whereClause := strings.Join(whereClauses, " AND ")
 
 	sql := fmt.Sprintf(`
-		SELECT r.group_id, r.version_id, r.commit_id, p.path
+		SELECT p.group_id, r.version_id, r.commit_id, p.path
 		FROM pgit_file_refs r
-		JOIN pgit_paths p ON p.group_id = r.group_id
+		JOIN pgit_paths p ON p.path_id = r.path_id
 		WHERE %s`, whereClause)
 
 	rows, err := db.Query(ctx, sql, args...)
@@ -1152,12 +1123,12 @@ func (db *DB) getTreeSearchRefs(ctx context.Context, commitID, pathPattern strin
 	}
 
 	sql := fmt.Sprintf(`
-		SELECT DISTINCT ON (r.group_id)
-			r.group_id, r.version_id, r.commit_id, p.path
+		SELECT DISTINCT ON (r.path_id)
+			p.group_id, r.version_id, r.commit_id, p.path
 		FROM pgit_file_refs r
-		JOIN pgit_paths p ON p.group_id = r.group_id
+		JOIN pgit_paths p ON p.path_id = r.path_id
 		WHERE r.commit_id <= $1 AND r.content_hash IS NOT NULL AND r.is_binary = FALSE %s
-		ORDER BY r.group_id, r.commit_id DESC`, pathFilter)
+		ORDER BY r.path_id, r.commit_id DESC`, pathFilter)
 
 	rows, err := db.Query(ctx, sql, args...)
 	if err != nil {
@@ -1415,32 +1386,37 @@ func (db *DB) searchPerVersion(ctx context.Context, refs []searchRef, opts Searc
 	return allResults, nil
 }
 
-// PreRegisterPaths inserts all paths into pgit_paths in a single transaction
-// and returns the complete path -> group_id mapping. This eliminates per-worker
+// PreRegisterPaths inserts all paths into pgit_paths with their group assignments
+// and returns the complete path -> PathIDs mapping. This eliminates per-worker
 // path lookup queries during import. Paths that already exist are returned as-is.
-func (db *DB) PreRegisterPaths(ctx context.Context, paths []string) (map[string]int32, error) {
+//
+// pathToLocalGroup maps each path to a local group index (0-based, from union-find).
+// Paths with the same local group index get the same database group_id.
+// The first path in each local group determines the database group_id (auto-assigned
+// by PostgreSQL's IDENTITY column), and subsequent paths in the group reuse it.
+func (db *DB) PreRegisterPaths(ctx context.Context, paths []string, pathToLocalGroup map[string]int) (map[string]PathIDs, error) {
 	if len(paths) == 0 {
-		return make(map[string]int32), nil
+		return make(map[string]PathIDs), nil
 	}
 
-	result := make(map[string]int32, len(paths))
+	result := make(map[string]PathIDs, len(paths))
 
 	// First, get all existing paths in one query
 	rows, err := db.Query(ctx,
-		"SELECT group_id, path FROM pgit_paths WHERE path = ANY($1)",
+		"SELECT path_id, group_id, path FROM pgit_paths WHERE path = ANY($1)",
 		paths,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query existing paths: %w", err)
 	}
 	for rows.Next() {
-		var groupID int32
+		var pathID, groupID int32
 		var path string
-		if err := rows.Scan(&groupID, &path); err != nil {
+		if err := rows.Scan(&pathID, &groupID, &path); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		result[path] = groupID
+		result[path] = PathIDs{PathID: pathID, GroupID: groupID}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -1459,7 +1435,53 @@ func (db *DB) PreRegisterPaths(ctx context.Context, paths []string) (map[string]
 		return result, nil
 	}
 
-	// Insert missing paths in batches within a single transaction
+	// Assign database group_ids for each local group.
+	// Strategy: for each local group, the first path inserted gets a new path_id
+	// (from IDENTITY). We use that path_id as the group_id for the whole group.
+	// This is because group_id is NOT auto-generated — we control it.
+	//
+	// Two-pass approach:
+	// Pass 1: Insert the first path of each local group to get auto-assigned path_ids,
+	//         then use those path_ids as group_ids.
+	// Pass 2: Insert remaining paths in each group with the assigned group_id.
+	//
+	// Simpler approach: pre-compute group_ids using a counter, then insert all paths.
+	// We use a sequence query to get a block of group_ids.
+
+	// Find unique local groups among missing paths
+	localGroupPaths := make(map[int][]string) // localGroup → paths
+	for _, path := range missingPaths {
+		lg := pathToLocalGroup[path]
+		localGroupPaths[lg] = append(localGroupPaths[lg], path)
+	}
+
+	// Check if any local group already has some paths registered (for resume).
+	// If so, reuse their group_id.
+	localGroupToDBGroup := make(map[int]int32)
+	for _, path := range paths {
+		if reg, exists := result[path]; exists {
+			lg := pathToLocalGroup[path]
+			localGroupToDBGroup[lg] = reg.GroupID
+		}
+	}
+
+	// For groups that don't have a database group_id yet, assign sequential ones.
+	// We use a simple counter starting from MAX(group_id)+1.
+	var maxGroupID int32
+	err = db.QueryRow(ctx, "SELECT COALESCE(MAX(group_id), 0) FROM pgit_paths").Scan(&maxGroupID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get max group_id: %w", err)
+	}
+
+	nextGroupID := maxGroupID + 1
+	for lg := range localGroupPaths {
+		if _, exists := localGroupToDBGroup[lg]; !exists {
+			localGroupToDBGroup[lg] = nextGroupID
+			nextGroupID++
+		}
+	}
+
+	// Insert all missing paths with their group_ids
 	const batchSize = 1000
 	err = db.WithTx(ctx, func(tx pgx.Tx) error {
 		for i := 0; i < len(missingPaths); i += batchSize {
@@ -1470,17 +1492,19 @@ func (db *DB) PreRegisterPaths(ctx context.Context, paths []string) (map[string]
 			batch := missingPaths[i:end]
 
 			for _, path := range batch {
-				var groupID int32
+				lg := pathToLocalGroup[path]
+				groupID := localGroupToDBGroup[lg]
+				var pathID int32
 				err := tx.QueryRow(ctx,
-					`INSERT INTO pgit_paths (path) VALUES ($1)
+					`INSERT INTO pgit_paths (group_id, path) VALUES ($1, $2)
 					 ON CONFLICT (path) DO UPDATE SET path = EXCLUDED.path
-					 RETURNING group_id`,
-					path,
-				).Scan(&groupID)
+					 RETURNING path_id, group_id`,
+					groupID, path,
+				).Scan(&pathID, &groupID)
 				if err != nil {
 					return err
 				}
-				result[path] = groupID
+				result[path] = PathIDs{PathID: pathID, GroupID: groupID}
 			}
 		}
 		return nil
@@ -1492,20 +1516,27 @@ func (db *DB) PreRegisterPaths(ctx context.Context, paths []string) (map[string]
 	return result, nil
 }
 
-// CreateBlobsForGroup inserts all blobs for a single group (path) in one
-// transaction. Large groups are split into chunks of copyChunkSize, each
-// chunk getting its own COPY calls — but all within the same transaction
-// to keep xpatch's delta chain on one connection.
+// CreateBlobsForGroup inserts all blobs for a single content group in one
+// transaction. In v4, a group may contain multiple paths (renames/copies).
+// Large groups are split into chunks of copyChunkSize, each chunk getting
+// its own COPY calls — but all within the same transaction to keep xpatch's
+// delta chain on one connection.
 //
-// groupID is the pre-registered group_id for this path.
+// groupID is the database group_id for content tables.
 // versionCounter points to the caller-managed next version_id for this group.
+// pathReg maps path → PathIDs for resolving each blob's path_id.
 // onProgress is called after each chunk with the number of blobs in that chunk (may be nil).
-func (db *DB) CreateBlobsForGroup(ctx context.Context, blobs []*Blob, groupID int32, versionCounter *int32, onProgress func(int)) error {
+func (db *DB) CreateBlobsForGroup(ctx context.Context, blobs []*Blob, groupID int32, versionCounter *int32, pathReg map[string]PathIDs, onProgress func(int)) error {
 	if len(blobs) == 0 {
 		return nil
 	}
 
 	const copyChunkSize = 200
+
+	// Track content hash → version_id within this group so that duplicate
+	// content (renames, copies, reverts) reuses the existing version_id
+	// instead of creating a new content row.
+	hashToVersion := make(map[string]int32, len(blobs))
 
 	return db.WithTx(ctx, func(tx pgx.Tx) error {
 		for i := 0; i < len(blobs); i += copyChunkSize {
@@ -1519,11 +1550,38 @@ func (db *DB) CreateBlobsForGroup(ctx context.Context, blobs []*Blob, groupID in
 			var contents []*Content
 
 			for _, b := range chunk {
-				*versionCounter++
-				versionID := *versionCounter
+				// Look up path_id from the pre-registration map
+				pathIDs := pathReg[b.Path]
+
+				var versionID int32
+				if b.ContentHash != nil {
+					hashKey := string(b.ContentHash)
+					if existing, ok := hashToVersion[hashKey]; ok {
+						// Same content already stored in this group — reuse version_id,
+						// skip content insert.
+						versionID = existing
+					} else {
+						// New content — assign next version_id and store it.
+						*versionCounter++
+						versionID = *versionCounter
+						hashToVersion[hashKey] = versionID
+
+						contents = append(contents, &Content{
+							GroupID:   groupID,
+							VersionID: versionID,
+							Content:   b.Content,
+							IsBinary:  b.IsBinary,
+						})
+					}
+				} else {
+					// Deletion — no content to store, but still needs a version_id
+					// for the file_ref. Deletions are unique events (no dedup).
+					*versionCounter++
+					versionID = *versionCounter
+				}
 
 				fileRefs = append(fileRefs, &FileRef{
-					GroupID:       groupID,
+					PathID:        pathIDs.PathID,
 					CommitID:      b.CommitID,
 					VersionID:     versionID,
 					ContentHash:   b.ContentHash,
@@ -1532,15 +1590,6 @@ func (db *DB) CreateBlobsForGroup(ctx context.Context, blobs []*Blob, groupID in
 					SymlinkTarget: b.SymlinkTarget,
 					IsBinary:      b.IsBinary,
 				})
-
-				if b.ContentHash != nil {
-					contents = append(contents, &Content{
-						GroupID:   groupID,
-						VersionID: versionID,
-						Content:   b.Content,
-						IsBinary:  b.IsBinary,
-					})
-				}
 			}
 
 			if err := db.createFileRefsBatchTx(ctx, tx, fileRefs); err != nil {

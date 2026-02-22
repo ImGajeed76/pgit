@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/container"
-	"github.com/imgajeed76/pgit/v3/internal/repo"
-	"github.com/imgajeed76/pgit/v3/internal/ui/styles"
+	"github.com/imgajeed76/pgit/v4/internal/container"
+	"github.com/imgajeed76/pgit/v4/internal/repo"
+	"github.com/imgajeed76/pgit/v4/internal/ui/styles"
 	"github.com/spf13/cobra"
 )
 

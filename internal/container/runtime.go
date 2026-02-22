@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imgajeed76/pgit/v3/internal/config"
+	"github.com/imgajeed76/pgit/v4/internal/config"
 )
 
 // Runtime represents a container runtime (Docker or Podman)

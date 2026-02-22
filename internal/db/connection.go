@@ -28,8 +28,11 @@ func Connect(ctx context.Context, url string) (*DB, error) {
 		return nil, fmt.Errorf("invalid connection URL: %w", err)
 	}
 
-	// Configure pool - aggressive settings for local dev
-	config.MaxConns = 64
+	// Configure pool. MaxConns must stay below PostgreSQL's max_connections
+	// (default 50 on many setups, minus reserved_connections). 32 leaves
+	// headroom for superuser connections, pg_xpatch background workers,
+	// and other clients.
+	config.MaxConns = 32
 	config.MinConns = 4
 	config.MaxConnLifetime = time.Hour
 	config.MaxConnIdleTime = 30 * time.Minute
