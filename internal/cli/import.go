@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,7 +49,7 @@ The current directory must be a pgit repository (run 'pgit init' first).`,
 		RunE: runImport,
 	}
 
-	cmd.Flags().IntP("workers", "w", 0, "Number of parallel workers (default 4, max 16)")
+	cmd.Flags().IntP("workers", "w", 0, "Number of parallel workers (default from config, capped at CPU count)")
 	cmd.Flags().BoolP("dry-run", "n", false, "Show what would be imported without actually importing")
 	cmd.Flags().BoolP("force", "f", false, "Overwrite existing data in database")
 	cmd.Flags().StringP("branch", "b", "", "Branch to import (default: current branch, or interactive picker)")
@@ -147,9 +148,11 @@ func runImport(cmd *cobra.Command, args []string) error {
 			workers = 4
 		}
 	}
-	// Cap at 16 (pg-xpatch insert cache slot limit)
-	if workers > 16 {
-		workers = 16
+	// Cap at number of available CPUs — more workers than cores just adds contention.
+	// The old cap of 16 was based on the default xpatch_insert_cache_slots, but that
+	// setting is configurable and exceeding it only degrades cache hits, not correctness.
+	if maxCPU := runtime.NumCPU(); workers > maxCPU {
+		workers = maxCPU
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.1] - 2026-02-22
+
+### Fixed
+
+- Remove artificial 16-worker cap on `pgit import`. The limit was based on the default `xpatch_insert_cache_slots=16`, but that setting is configurable and exceeding it only degrades cache hit rate, not correctness. Workers are now capped at CPU count instead.
+- Remove `max:"16"` validation on `import.workers` config, allowing any value above 1.
+
 ## [4.1.0] - 2026-02-22
 
 ### Changed

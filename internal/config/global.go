@@ -57,7 +57,7 @@ type ContainerConfig struct {
 
 // ImportConfig contains default import settings
 type ImportConfig struct {
-	Workers int `toml:"workers" config:"import.workers" default:"3" min:"1" max:"16" desc:"Default import workers"`
+	Workers int `toml:"workers" config:"import.workers" default:"3" min:"1" desc:"Default import workers"`
 }
 
 // DefaultGlobalConfig returns a new global config with default values
