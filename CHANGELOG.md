@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resolveBaseRef` uses the graph table for exact/partial ID matching instead of xpatch
 - `search.go` uses `GetCommitsBatchByRange` (contiguous range scan) instead of `GetCommitsBatch` (ANY scatter-read)
 - Connection pool `MaxConns` reduced from 64 to 32 to stay within PostgreSQL's default `max_connections=50`
+- Benchmark scorecard improved from 9-9-1 (v3) to 13-7 pgit wins; hugo compression fixed from 2.6x to 5.1x; import durations reduced 5-25x across the suite
 
 ### Removed
 
@@ -244,7 +245,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shell completions (bash, zsh, fish, PowerShell)
 - GoReleaser: multi-platform binaries, Homebrew, deb/rpm/apk packages
 
-[Unreleased]: https://github.com/ImGajeed76/pgit/compare/v3.3.2...HEAD
+[Unreleased]: https://github.com/ImGajeed76/pgit/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/ImGajeed76/pgit/compare/v3.3.2...v4.0.0
 [3.3.2]: https://github.com/ImGajeed76/pgit/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/ImGajeed76/pgit/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/ImGajeed76/pgit/compare/v3.2.0...v3.3.0
