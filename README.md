@@ -165,20 +165,20 @@ Since pgit is primarily a demo for pg-xpatch compression, Docker/Podman provides
 
 ## Compression: pgit vs git
 
-Benchmarked on [19 real repositories](BENCHMARK.md) across 6 languages (193k total commits). Comparing `git gc --aggressive` packfile vs pgit actual data (excluding indexes for both):
+Benchmarked on [20 real repositories](BENCHMARK.md) across 6 languages (274k total commits). Comparing `git gc --aggressive` packfile vs pgit actual data (excluding indexes for both):
 
-**Scorecard: pgit 9 wins, git 9 wins, 1 tie.**
+**Scorecard: pgit 13 wins, git 7 wins** out of 20 repositories.
 
 | Repository | Commits | Raw Size | git --aggressive | pgit | Winner |
 |:-----------|--------:|---------:|-----------------:|-----:|:-------|
-| serde | 4,352 | 203.5 MB | 5.6 MB | 3.9 MB | pgit (30%) |
-| fzf | 3,482 | 209.2 MB | 3.4 MB | 2.7 MB | pgit (21%) |
-| curl | 37,818 | 3.3 GB | 48.4 MB | 45.0 MB | pgit (7%) |
-| cargo | 21,833 | 1.2 GB | 29.8 MB | 30.3 MB | git (2%) |
-| prettier | 11,084 | 2.0 GB | 66.2 MB | 96.4 MB | git (46%) |
-| hugo | 9,520 | 569.3 MB | 108.8 MB | 222.9 MB | git (105%) |
+| fzf | 3,499 | 213.3 MB | 3.5 MB | 3.0 MB | pgit (16%) |
+| core | 6,930 | 598.9 MB | 11.6 MB | 11.2 MB | pgit (4%) |
+| curl | 37,860 | 3.3 GB | 48.4 MB | 49.3 MB | git (2%) |
+| git | 79,765 | 7.3 GB | 90.6 MB | 111.3 MB | git (23%) |
+| prettier | 11,084 | 2.0 GB | 66.1 MB | 91.1 MB | git (38%) |
+| hugo | 9,538 | 570.6 MB | 108.8 MB | 111.0 MB | git (2%) |
 
-See the [full benchmark results](BENCHMARK.md) for all 19 repositories with detailed per-repo breakdowns, charts, and methodology.
+See the [full benchmark results](BENCHMARK.md) for all 20 repositories with detailed per-repo breakdowns, charts, and methodology.
 
 pgit uses [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression with zstd. Results vary by repository — pgit tends to win on source-code-heavy repos with incremental changes, while git wins on repos with large vendored dependencies or binary assets.
 
@@ -191,11 +191,11 @@ pgit includes `pgit-bench`, a CLI tool that benchmarks compression against git o
 # Build the benchmark tool
 go build -o pgit-bench ./cmd/pgit-bench/
 
-# Run against the curated repo list (19 repos, ~50 min at 3 parallel)
+# Run against the curated repo list (20 repos, ~8 min at --parallel 3)
 ./pgit-bench --file bench_repos.txt --parallel 3 --report BENCHMARK.md
 ```
 
-The repo list in [`bench_repos.txt`](bench_repos.txt) covers 19 projects across 6 languages (Rust, Go, Python, JavaScript, TypeScript, C) — from small utilities like jq (1.9k commits) to large projects like curl (38k commits).
+The repo list in [`bench_repos.txt`](bench_repos.txt) covers 20 projects across 6 languages (Rust, Go, Python, JavaScript, TypeScript, C) — from small utilities like jq (1.9k commits) to large projects like git (80k commits).
 
 You can also benchmark individual repos:
 

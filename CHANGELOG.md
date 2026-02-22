@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - N:1 path-to-group mapping: multiple file paths can now share one delta compression group, deduplicating content from renames, copies, and reverts. Reduces content rows by 40% and raw storage by 30% on git.git.
 - Content deduplication within groups: `CreateBlobsForGroup` tracks content hashes and reuses existing version IDs when the same content appears at multiple paths in a group.
 - `pgit log --limit` alias for `--max-count`
+- git/git added to benchmark suite (20 repos, 274k total commits)
 
 ### Changed
 
@@ -38,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Connection pool exhaustion (`too many clients already`) during import checkout phase
 - Stale references to `pgit resolve` in `status.go` and `pull.go` help text
 - `.goreleaser.yml` ldflags referencing v3 instead of v4
+- pgit-bench chart Y-axis labels (now shows "Size (MB)" and "Ratio (raw / stored, x)")
+- pgit-bench `--json <file>` now shows progress output (only suppresses when JSON goes to stdout)
+- pgit-bench `collectPgitStats` now includes `pgit_commit_graph` table and index sizes
 
 ## [3.3.2] - 2026-02-20
 

@@ -93,7 +93,15 @@ func main() {
 
 	// ─── Single repo JSON-only mode ───────────────────────────────────
 	if !multiRepo && args.jsonMode && args.reportPath == "" {
-		result, err := benchmarkRepoQuiet(args.repoURLs[0], args.branch)
+		var result *benchResult
+		var err error
+		if args.jsonPath != "" {
+			// JSON going to file — stdout is free, show progress
+			result, err = benchmarkRepoInteractive(args.repoURLs[0], args.branch)
+		} else {
+			// JSON going to stdout — must be quiet
+			result, err = benchmarkRepoQuiet(args.repoURLs[0], args.branch)
+		}
 		if err != nil {
 			fatalMsg("Benchmark failed: %v", err)
 		}
@@ -114,7 +122,7 @@ func main() {
 		if err := writeMarkdownReport(args.reportPath, results); err != nil {
 			fatalMsg("Failed to write report: %v", err)
 		}
-		if !args.jsonMode {
+		if !quietMode {
 			fmt.Printf("\n  %s\n\n", styles.SuccessMsg(fmt.Sprintf("Report written to %s", args.reportPath)))
 		}
 	}
@@ -277,8 +285,10 @@ type cliArgs struct {
 	parallel   int
 }
 
-// jsonMode controls whether terminal output is suppressed
-var jsonMode bool
+// quietMode suppresses terminal output. True only when JSON goes to stdout
+// (no file path), so stdout remains clean for the JSON payload.
+// When --json <file>, stdout is free and progress output is shown.
+var quietMode bool
 
 func parseArgs() cliArgs {
 	args := cliArgs{parallel: 2}
@@ -298,12 +308,13 @@ func parseArgs() cliArgs {
 			}
 		case "--json", "-j":
 			args.jsonMode = true
-			jsonMode = true
 			// Check if next arg is a path (not a flag, not a URL)
 			if i+1 < len(osArgs) && !strings.HasPrefix(osArgs[i+1], "-") && !strings.HasPrefix(osArgs[i+1], "http") {
 				i++
 				args.jsonPath = osArgs[i]
 			}
+			// Only suppress terminal output when JSON goes to stdout
+			quietMode = args.jsonMode && args.jsonPath == ""
 		case "--report", "-r":
 			if i+1 < len(osArgs) {
 				i++
@@ -795,7 +806,7 @@ func (p *repoProgress) renderNonTTY(idx int) string {
 func runMultiRepo(args cliArgs) []benchResult {
 	total := len(args.repoURLs)
 
-	if !jsonMode {
+	if !quietMode {
 		fmt.Println()
 		fmt.Printf("%s %s\n", render(stAccent.Bold(true), "pgit-bench"), render(stDim, "- multi-repo compression benchmark"))
 		fmt.Println(render(stDim, "════════════════════════════════════════════════════════════"))
@@ -810,7 +821,7 @@ func runMultiRepo(args cliArgs) []benchResult {
 
 	// Start progress display goroutine (TTY only)
 	var progressDone chan struct{}
-	if !jsonMode && isTTY {
+	if !quietMode && isTTY {
 		progressDone = make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(500 * time.Millisecond)
@@ -844,7 +855,7 @@ func runMultiRepo(args cliArgs) []benchResult {
 			progress.setRunning(idx, "starting")
 
 			// Non-TTY: print "started" line
-			if !jsonMode && !isTTY {
+			if !quietMode && !isTTY {
 				fmt.Println(progress.renderNonTTY(idx))
 			}
 
@@ -865,7 +876,7 @@ func runMultiRepo(args cliArgs) []benchResult {
 			}
 
 			// Non-TTY: print completion/failure line
-			if !jsonMode && !isTTY {
+			if !quietMode && !isTTY {
 				fmt.Println(progress.renderNonTTY(idx))
 			}
 		}(i, repoURL)
@@ -873,7 +884,7 @@ func runMultiRepo(args cliArgs) []benchResult {
 
 	wg.Wait()
 
-	if !jsonMode && isTTY {
+	if !quietMode && isTTY {
 		close(progressDone)
 		time.Sleep(100 * time.Millisecond) // let final render complete
 	}
@@ -887,7 +898,7 @@ func runMultiRepo(args cliArgs) []benchResult {
 	}
 
 	// Print summary table to terminal
-	if !jsonMode {
+	if !quietMode {
 		fmt.Println()
 		printSummaryTable(results)
 	}
@@ -1033,7 +1044,8 @@ func writeMarkdownReport(path string, results []benchResult) error {
 		p("### Stored Size")
 		p("")
 		sizeChart := buildQuickChart(good,
-			"Stored Size (MB) — lower is better",
+			"Stored Size — lower is better",
+			"Size (MB)",
 			func(r benchResult) float64 { return float64(r.GitAggressivePackfileBytes) / (1024 * 1024) },
 			func(r benchResult) float64 { return float64(r.PgitActualDataBytes) / (1024 * 1024) },
 			"%.1f",
@@ -1048,6 +1060,7 @@ func writeMarkdownReport(path string, results []benchResult) error {
 		p("")
 		ratioChart := buildQuickChart(good,
 			"Compression Ratio — higher is better",
+			"Ratio (raw / stored, x)",
 			func(r benchResult) float64 { return r.CompressionRatioGitAggressive },
 			func(r benchResult) float64 { return r.CompressionRatioData },
 			"%.1f",
@@ -1176,7 +1189,7 @@ func writeMarkdownReport(path string, results []benchResult) error {
 
 // buildQuickChart generates a QuickChart.io URL for a grouped bar chart
 // comparing git aggressive vs pgit actual data.
-func buildQuickChart(results []benchResult, title string,
+func buildQuickChart(results []benchResult, title, yAxisLabel string,
 	gitFn, pgitFn func(benchResult) float64, valueFmt string) string {
 
 	var labels []string
@@ -1191,11 +1204,12 @@ func buildQuickChart(results []benchResult, title string,
 
 	// Build Chart.js config (shorthand syntax supported by QuickChart)
 	config := fmt.Sprintf(
-		"{type:'bar',data:{labels:[%s],datasets:[{label:'git aggressive',data:[%s],backgroundColor:'#3B82F6'},{label:'pgit actual data',data:[%s],backgroundColor:'#7C3AED'}]},options:{title:{display:true,text:'%s'},plugins:{datalabels:{display:true,anchor:'end',align:'top',font:{size:8}}}}}",
+		"{type:'bar',data:{labels:[%s],datasets:[{label:'git aggressive',data:[%s],backgroundColor:'#3B82F6'},{label:'pgit actual data',data:[%s],backgroundColor:'#7C3AED'}]},options:{title:{display:true,text:'%s'},scales:{yAxes:[{scaleLabel:{display:true,labelString:'%s'},ticks:{beginAtZero:true}}]},plugins:{datalabels:{display:true,anchor:'end',align:'top',font:{size:8}}}}}",
 		strings.Join(labels, ","),
 		strings.Join(gitData, ","),
 		strings.Join(pgitData, ","),
 		title,
+		yAxisLabel,
 	)
 
 	return fmt.Sprintf("https://quickchart.io/chart?w=900&h=400&c=%s", url.PathEscape(config))
@@ -1477,6 +1491,32 @@ func collectPgitStats(dir string) pgitStats {
 		stats.normalTables = append(stats.normalTables, n)
 	}
 
+	// Normal table: pgit_commit_graph
+	out = pgitSQL(dir, `
+		SELECT COUNT(*), SUM(4 + octet_length(id) + 4 + COALESCE(octet_length(ancestors::text), 0)) FROM pgit_commit_graph
+	`)
+	for _, line := range nonEmptyLines(out) {
+		cols := strings.Split(line, "\t")
+		if len(cols) != 2 {
+			continue
+		}
+		n := pgitNormalTableStats{tableName: "pgit_commit_graph"}
+		n.rowCount, _ = strconv.ParseInt(cols[0], 10, 64)
+		rawBytes := cols[1]
+		if rawBytes == "" {
+			n.rawDataBytes = 0
+		} else {
+			n.rawDataBytes, _ = strconv.ParseInt(rawBytes, 10, 64)
+		}
+		for _, t := range stats.tables {
+			if t.name == "pgit_commit_graph" {
+				n.totalBytes = t.totalBytes
+				break
+			}
+		}
+		stats.normalTables = append(stats.normalTables, n)
+	}
+
 	// Normal table: pgit_metadata
 	out = pgitSQL(dir, `
 		SELECT COUNT(*), SUM(octet_length(key) + octet_length(value)) FROM pgit_metadata
@@ -1509,6 +1549,7 @@ func collectPgitStats(dir string) pgitStats {
 		FROM pg_index
 		WHERE indrelid IN (
 			'pgit_commits'::regclass,
+			'pgit_commit_graph'::regclass,
 			'pgit_paths'::regclass,
 			'pgit_file_refs'::regclass,
 			'pgit_text_content'::regclass,
