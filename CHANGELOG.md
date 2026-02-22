@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-02-22
+
+### Changed
+
+- **Import pipeline optimizations** targeting Linux kernel scale (1.3M commits, 24M file versions):
+  - **Path grouping 30x faster**: `computePathGroups` now uses git's `original-oid` SHA-1 as content identity instead of re-reading every blob from disk and hashing with BLAKE3 (2.06s → 67ms on git.git)
+  - **Streaming blob import**: Workers now read blob content on demand in chunks of 1000 instead of pre-loading entire groups into memory. Peak memory per worker is bounded to O(1000 * avg_blob_size) instead of O(total_group_size). Prevents OOM on files with hundreds of thousands of versions.
+  - **Parallel index creation**: All secondary indexes are now built concurrently using errgroup. At scale (24M file_refs rows), the two file_refs indexes dominate — building them in parallel roughly halves the index rebuild phase.
+  - **COPY for path registration**: `PreRegisterPaths` uses bulk COPY instead of per-row INSERT, eliminating ~70K round-trips for a typical import.
+  - **Flat commit graph slice**: `buildCommitGraph` uses `[]CommitGraphEntry` instead of `[]*CommitGraphEntry`, avoiding 1.3M individual heap allocations at Linux kernel scale.
+  - **COPY chunk size 200 → 1000**: Reduces per-COPY overhead by 5x for large groups.
+  - **Aggressive memory release**: Commit messages, FileOps slices, and commitEntries are nil'd after each phase completes, freeing ~2-10GB before the memory-intensive blob import begins.
+  - **Temp file moved to .pgit/**: Fast-export stream is written to the repository's `.pgit/` directory instead of `/tmp` (tmpfs), preventing "no space left on device" on repos with streams exceeding tmpfs capacity (e.g. Linux kernel at 50-100GB).
+
 ## [4.0.0] - 2026-02-22
 
 ### Added

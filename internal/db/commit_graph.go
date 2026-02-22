@@ -21,13 +21,15 @@ type CommitGraphEntry struct {
 // CreateCommitGraphBatch inserts multiple commit graph entries using COPY.
 // Entries must have Seq values assigned (typically by SERIAL on insert),
 // but since we compute ancestors in Go before insert, we use explicit seq values.
-func (db *DB) CreateCommitGraphBatch(ctx context.Context, entries []*CommitGraphEntry) error {
+// Accepts a flat slice (not pointers) to reduce heap allocations.
+func (db *DB) CreateCommitGraphBatch(ctx context.Context, entries []CommitGraphEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
 	rows := make([][]interface{}, len(entries))
-	for i, e := range entries {
+	for i := range entries {
+		e := &entries[i]
 		rows[i] = []interface{}{e.Seq, e.ID, e.Depth, e.Ancestors}
 	}
 

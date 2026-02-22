@@ -1481,70 +1481,87 @@ func (db *DB) PreRegisterPaths(ctx context.Context, paths []string, pathToLocalG
 		}
 	}
 
-	// Insert all missing paths with their group_ids
-	const batchSize = 1000
-	err = db.WithTx(ctx, func(tx pgx.Tx) error {
-		for i := 0; i < len(missingPaths); i += batchSize {
-			end := i + batchSize
-			if end > len(missingPaths) {
-				end = len(missingPaths)
-			}
-			batch := missingPaths[i:end]
+	// Bulk insert all missing paths using COPY.
+	// path_id is GENERATED ALWAYS AS IDENTITY, so we only provide (group_id, path).
+	copyRows := make([][]interface{}, len(missingPaths))
+	for i, path := range missingPaths {
+		lg := pathToLocalGroup[path]
+		groupID := localGroupToDBGroup[lg]
+		copyRows[i] = []interface{}{groupID, path}
+	}
 
-			for _, path := range batch {
-				lg := pathToLocalGroup[path]
-				groupID := localGroupToDBGroup[lg]
-				var pathID int32
-				err := tx.QueryRow(ctx,
-					`INSERT INTO pgit_paths (group_id, path) VALUES ($1, $2)
-					 ON CONFLICT (path) DO UPDATE SET path = EXCLUDED.path
-					 RETURNING path_id, group_id`,
-					groupID, path,
-				).Scan(&pathID, &groupID)
-				if err != nil {
-					return err
-				}
-				result[path] = PathIDs{PathID: pathID, GroupID: groupID}
-			}
-		}
-		return nil
-	})
+	_, err = db.pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"pgit_paths"},
+		[]string{"group_id", "path"},
+		pgx.CopyFromRows(copyRows),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to register paths: %w", err)
+		return nil, fmt.Errorf("failed to bulk register paths: %w", err)
+	}
+
+	// Read back the auto-generated path_ids for the newly inserted paths.
+	rows, err = db.Query(ctx,
+		"SELECT path_id, group_id, path FROM pgit_paths WHERE path = ANY($1)",
+		missingPaths,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read back registered paths: %w", err)
+	}
+	for rows.Next() {
+		var pathID, groupID int32
+		var path string
+		if err := rows.Scan(&pathID, &groupID, &path); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		result[path] = PathIDs{PathID: pathID, GroupID: groupID}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return result, nil
 }
 
+// CopyChunkSize is the number of blobs processed per COPY call within a
+// group transaction. Increasing this reduces per-COPY overhead but increases
+// memory per worker (each worker holds at most CopyChunkSize blobs at a time).
+const CopyChunkSize = 1000
+
 // CreateBlobsForGroup inserts all blobs for a single content group in one
 // transaction. In v4, a group may contain multiple paths (renames/copies).
-// Large groups are split into chunks of copyChunkSize, each chunk getting
-// its own COPY calls — but all within the same transaction to keep xpatch's
+//
+// Instead of accepting a pre-built slice of all blobs, this function takes a
+// nextChunk callback that yields up to CopyChunkSize blobs per call. This
+// allows the caller to read blob content from disk on demand, keeping memory
+// usage bounded to O(CopyChunkSize * avg_blob_size) per worker instead of
+// O(total_group_size).
+//
+// The callback must return (nil, nil) or (empty slice, nil) when exhausted.
+// All chunks are processed within the same transaction to keep xpatch's
 // delta chain on one connection.
 //
 // groupID is the database group_id for content tables.
 // versionCounter points to the caller-managed next version_id for this group.
 // pathReg maps path → PathIDs for resolving each blob's path_id.
 // onProgress is called after each chunk with the number of blobs in that chunk (may be nil).
-func (db *DB) CreateBlobsForGroup(ctx context.Context, blobs []*Blob, groupID int32, versionCounter *int32, pathReg map[string]PathIDs, onProgress func(int)) error {
-	if len(blobs) == 0 {
-		return nil
-	}
-
-	const copyChunkSize = 200
-
+func (db *DB) CreateBlobsForGroup(ctx context.Context, nextChunk func() ([]*Blob, error), groupID int32, versionCounter *int32, pathReg map[string]PathIDs, onProgress func(int)) error {
 	// Track content hash → version_id within this group so that duplicate
 	// content (renames, copies, reverts) reuses the existing version_id
-	// instead of creating a new content row.
-	hashToVersion := make(map[string]int32, len(blobs))
+	// instead of creating a new content row. Persists across all chunks.
+	hashToVersion := make(map[string]int32)
 
 	return db.WithTx(ctx, func(tx pgx.Tx) error {
-		for i := 0; i < len(blobs); i += copyChunkSize {
-			end := i + copyChunkSize
-			if end > len(blobs) {
-				end = len(blobs)
+		for {
+			chunk, err := nextChunk()
+			if err != nil {
+				return err
 			}
-			chunk := blobs[i:end]
+			if len(chunk) == 0 {
+				break
+			}
 
 			var fileRefs []*FileRef
 			var contents []*Content

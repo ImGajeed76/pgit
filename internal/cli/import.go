@@ -309,7 +309,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		spinner.Start()
 
 		var exportSize int64
-		tmpPath, exportSize, err = exportToFile(gitPath, selectedBranch)
+		tmpPath, exportSize, err = exportToFile(gitPath, selectedBranch, util.PgitPath(r.Root))
 		spinner.Stop()
 
 		if err != nil {
@@ -565,6 +565,15 @@ func runImport(cmd *cobra.Command, args []string) error {
 		_ = r.DB.SetMetadata(ctx, "import_graph_state", "done")
 	}
 
+	// Save HEAD commit info before releasing pgitCommits.
+	// Only the ID and message are needed for SetHead + final output.
+	headCommitID := pgitCommits[len(pgitCommits)-1].ID
+	headCommitMsg := pgitCommits[len(pgitCommits)-1].Message
+
+	// Free commit objects — messages and struct overhead no longer needed.
+	// At Linux kernel scale this releases ~4-8GB of message strings.
+	pgitCommits = nil
+
 	// ═══════════════════════════════════════════════════════════════════════
 	// Step 5: Parallel blob import via ReadAt on temp file
 	// ═══════════════════════════════════════════════════════════════════════
@@ -604,7 +613,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 
 	fmt.Print("Computing path groups...")
 	groupStart := time.Now()
-	pathToLocalGroup, groupCount := computePathGroups(tmpFile, pathOps, blobIndex)
+	pathToLocalGroup, groupCount := computePathGroups(pathOps, blobIndex)
 	fmt.Printf(" done (%s) — %s groups from %s paths\n",
 		time.Since(groupStart).Round(time.Millisecond),
 		ui.FormatCount(groupCount), ui.FormatCount(len(pathOps)))
@@ -615,6 +624,14 @@ func runImport(cmd *cobra.Command, args []string) error {
 		ulid := markToULID[ce.Mark]
 		commitTimestamps[ulid] = ce.AuthorTimestamp
 	}
+
+	// Free commitEntries — no longer needed after building commitTimestamps.
+	// Save totalCommits for the final summary message.
+	totalCommits := len(commitEntries)
+	for i := range commitEntries {
+		commitEntries[i].FileOps = nil // release []fileOp slices
+	}
+	commitEntries = nil //nolint:ineffassign // intentional: allow GC to collect ~1.4GB of commit data
 
 	fmt.Printf("\nImporting %s file versions across %s paths (%s groups)...\n",
 		ui.FormatCount(totalFileOps), ui.FormatCount(len(pathOps)), ui.FormatCount(groupCount))
@@ -656,8 +673,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 	// Step 6: Set HEAD
 	// ═══════════════════════════════════════════════════════════════════════
 
-	latestCommit := pgitCommits[len(pgitCommits)-1]
-	if err := r.DB.SetHead(ctx, latestCommit.ID); err != nil {
+	if err := r.DB.SetHead(ctx, headCommitID); err != nil {
 		return fmt.Errorf("failed to set HEAD: %w", err)
 	}
 
@@ -667,7 +683,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 
 	if !isRemote {
 		fmt.Printf("\nChecking out files...\n")
-		tree, err := r.DB.GetTreeAtCommit(ctx, latestCommit.ID)
+		tree, err := r.DB.GetTreeAtCommit(ctx, headCommitID)
 		if err != nil {
 			return fmt.Errorf("failed to get tree: %w", err)
 		}
@@ -701,16 +717,16 @@ func runImport(cmd *cobra.Command, args []string) error {
 	if isRemote {
 		fmt.Printf("\n%s Imported %s commits to remote '%s'\n",
 			styles.Green("Success!"),
-			ui.FormatCount(len(commitEntries)),
+			ui.FormatCount(totalCommits),
 			remoteName)
 	} else {
 		fmt.Printf("\n%s Imported %s commits from git repository\n",
 			styles.Green("Success!"),
-			ui.FormatCount(len(commitEntries)))
+			ui.FormatCount(totalCommits))
 	}
 	fmt.Printf("HEAD is now at %s %s\n",
-		styles.Hash(latestCommit.ID, true),
-		firstLine(latestCommit.Message))
+		styles.Hash(headCommitID, true),
+		firstLine(headCommitMsg))
 
 	return nil
 }
@@ -720,8 +736,9 @@ func runImport(cmd *cobra.Command, args []string) error {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // exportToFile runs git fast-export and writes the stream to a temp file.
+// tmpDir specifies where to create the temp file (e.g. the .pgit directory).
 // Returns the temp file path, total bytes written, and error.
-func exportToFile(gitPath, branch string) (string, int64, error) {
+func exportToFile(gitPath, branch, tmpDir string) (string, int64, error) {
 	cmd := exec.Command("git", "fast-export", "--reencode=yes", "--show-original-ids", branch)
 	cmd.Dir = gitPath
 
@@ -734,7 +751,7 @@ func exportToFile(gitPath, branch string) (string, int64, error) {
 		return "", 0, err
 	}
 
-	tmpFile, err := os.CreateTemp("", "pgit-import-*.fastexport")
+	tmpFile, err := os.CreateTemp(tmpDir, "pgit-import-*.fastexport")
 	if err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -1144,14 +1161,15 @@ func prepareCommits(
 //   - ancestors: binary lifting table where ancestors[k] = seq of the 2^k-th ancestor
 //
 // The binary lifting table enables O(log N) ancestry lookups for any depth N.
-func buildCommitGraph(commits []*db.Commit) []*db.CommitGraphEntry {
+func buildCommitGraph(commits []*db.Commit) []db.CommitGraphEntry {
 	// Map commit ID → index in the commits slice (0-indexed)
 	idToIdx := make(map[string]int, len(commits))
 	for i, c := range commits {
 		idToIdx[c.ID] = i
 	}
 
-	entries := make([]*db.CommitGraphEntry, len(commits))
+	// Flat slice — avoids 1.3M individual heap allocations for Linux kernel.
+	entries := make([]db.CommitGraphEntry, len(commits))
 
 	for i, c := range commits {
 		seq := int32(i + 1) // 1-indexed
@@ -1184,7 +1202,7 @@ func buildCommitGraph(commits []*db.Commit) []*db.CommitGraphEntry {
 				// To find the 2^k-th ancestor, we jump from the 2^(k-1)-th ancestor
 				// by another 2^(k-1) steps.
 				prevAncestorSeq := ancestors[k-1]
-				prevAncestorEntry := entries[prevAncestorSeq-1] // seq is 1-indexed, slice is 0-indexed
+				prevAncestorEntry := &entries[prevAncestorSeq-1] // seq is 1-indexed, slice is 0-indexed
 				if k-1 < len(prevAncestorEntry.Ancestors) {
 					ancestors[k] = prevAncestorEntry.Ancestors[k-1]
 				} else {
@@ -1195,7 +1213,7 @@ func buildCommitGraph(commits []*db.Commit) []*db.CommitGraphEntry {
 			}
 		}
 
-		entries[i] = &db.CommitGraphEntry{
+		entries[i] = db.CommitGraphEntry{
 			Seq:       seq,
 			ID:        c.ID,
 			Depth:     depth,
@@ -1271,12 +1289,11 @@ func (uf *unionFind) union(x, y int) {
 //   - pathToGroup: map[path] → group index (0-based, contiguous)
 //   - groupCount: total number of distinct groups
 func computePathGroups(
-	tmpFile *os.File,
 	pathOpsMap map[string][]pathOp,
 	blobIndex map[int]*blobEntry,
 ) (map[string]int, int) {
-	// Hash of empty content — excluded from grouping
-	emptyHash := string(util.HashBytesBlake3([]byte{}))
+	// Git SHA-1 of empty blob — excluded from grouping
+	const emptyHash = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 
 	// Assign each path a numeric index
 	pathList := make([]string, 0, len(pathOpsMap))
@@ -1286,18 +1303,14 @@ func computePathGroups(
 		pathList = append(pathList, path)
 	}
 
-	// Compute content hash for each blob mark (deduplicated — each mark only once)
+	// Use git's original SHA-1 as content identity for each blob mark.
+	// OriginalID is parsed from the "original-oid" line in fast-export,
+	// which is already a content hash — no need to re-read and re-hash.
 	markHash := make(map[int]string, len(blobIndex))
 	for mark, be := range blobIndex {
-		content := make([]byte, be.Size)
-		if be.Size > 0 {
-			_, err := tmpFile.ReadAt(content, be.Offset)
-			if err != nil {
-				continue // skip unreadable blobs
-			}
+		if be.OriginalID != "" {
+			markHash[mark] = be.OriginalID
 		}
-		h := string(util.HashBytesBlake3(content))
-		markHash[mark] = h
 	}
 
 	// Build hash → [path indices] map, excluding empty hash and deletes
@@ -1557,68 +1570,78 @@ func importBlobsParallel(
 				gi := gw.Info
 				counter := versionCounters[gi.GroupID]
 
-				// Build blobs for this group (all paths, timestamp-ordered)
-				dbBlobs := make([]*db.Blob, 0, len(gi.Ops))
-				for _, op := range gi.Ops {
-					if op.IsDelete {
-						dbBlobs = append(dbBlobs, &db.Blob{
+				// Stream blobs in chunks of CopyChunkSize to bound memory.
+				// The nextChunk closure reads blob content from the temp file
+				// on demand — only CopyChunkSize blobs are in memory at a time.
+				opIdx := 0
+				nextChunk := func() ([]*db.Blob, error) {
+					if opIdx >= len(gi.Ops) {
+						return nil, nil
+					}
+					end := opIdx + db.CopyChunkSize
+					if end > len(gi.Ops) {
+						end = len(gi.Ops)
+					}
+					ops := gi.Ops[opIdx:end]
+					opIdx = end
+
+					dbBlobs := make([]*db.Blob, 0, len(ops))
+					for _, op := range ops {
+						if op.IsDelete {
+							dbBlobs = append(dbBlobs, &db.Blob{
+								Path:        op.Path,
+								CommitID:    op.CommitID,
+								Content:     []byte{},
+								ContentHash: nil,
+								Mode:        0,
+								IsSymlink:   false,
+								IsBinary:    false,
+							})
+							continue
+						}
+
+						be, ok := blobIndex[op.BlobMark]
+						if !ok {
+							continue
+						}
+
+						content := make([]byte, be.Size)
+						if be.Size > 0 {
+							_, err := tmpFile.ReadAt(content, be.Offset)
+							if err != nil {
+								return nil, fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err)
+							}
+						}
+
+						isBinary := util.DetectBinary(content)
+						contentHash := util.HashBytesBlake3(content)
+
+						blob := &db.Blob{
 							Path:        op.Path,
 							CommitID:    op.CommitID,
-							Content:     []byte{},
-							ContentHash: nil,
-							Mode:        0,
-							IsSymlink:   false,
-							IsBinary:    false,
-						})
-						continue
-					}
-
-					be, ok := blobIndex[op.BlobMark]
-					if !ok {
-						continue
-					}
-
-					content := make([]byte, be.Size)
-					if be.Size > 0 {
-						_, err := tmpFile.ReadAt(content, be.Offset)
-						if err != nil {
-							readErr := fmt.Errorf("failed to read blob content at offset %d: %w", be.Offset, err)
-							firstErr.CompareAndSwap(nil, &readErr)
-							return
+							Content:     content,
+							ContentHash: contentHash,
+							Mode:        op.Mode,
+							IsSymlink:   op.Mode == 0120000,
+							IsBinary:    isBinary,
 						}
+
+						if blob.IsSymlink {
+							target := string(content)
+							blob.SymlinkTarget = &target
+						}
+
+						dbBlobs = append(dbBlobs, blob)
 					}
-
-					isBinary := util.DetectBinary(content)
-					contentHash := util.HashBytesBlake3(content)
-
-					blob := &db.Blob{
-						Path:        op.Path,
-						CommitID:    op.CommitID,
-						Content:     content,
-						ContentHash: contentHash,
-						Mode:        op.Mode,
-						IsSymlink:   op.Mode == 0120000,
-						IsBinary:    isBinary,
-					}
-
-					if blob.IsSymlink {
-						target := string(content)
-						blob.SymlinkTarget = &target
-					}
-
-					dbBlobs = append(dbBlobs, blob)
+					return dbBlobs, nil
 				}
 
-				// Insert all versions in one transaction.
-				// CreateBlobsForGroup handles COPY in chunks within the transaction.
-				if len(dbBlobs) > 0 {
-					if err := database.CreateBlobsForGroup(ctx, dbBlobs, gi.GroupID, counter, pathRegistration, func(n int) {
-						count := imported.Add(int64(n))
-						progress.Update(int(count))
-					}); err != nil {
-						firstErr.CompareAndSwap(nil, &err)
-						return
-					}
+				if err := database.CreateBlobsForGroup(ctx, nextChunk, gi.GroupID, counter, pathRegistration, func(n int) {
+					count := imported.Add(int64(n))
+					progress.Update(int(count))
+				}); err != nil {
+					firstErr.CompareAndSwap(nil, &err)
+					return
 				}
 			}
 		}()
