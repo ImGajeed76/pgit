@@ -399,8 +399,9 @@ func (db *DB) CreateFileRefsIndexes(ctx context.Context) error {
 }
 
 // DropAllIndexes drops all secondary indexes across all pgit tables.
-// Call this before bulk import to maximize insert throughput, then call
-// CreateAllIndexes after import to rebuild them efficiently in one pass.
+// This is a general-purpose utility; the import pipeline uses the more
+// targeted DropBlobPhaseIndexes/CreateBlobPhaseIndexes to avoid dropping
+// commits indexes (which are expensive to rebuild from cold xpatch cache).
 // Primary keys are kept (required for COPY conflict detection and xpatch).
 func (db *DB) DropAllIndexes(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
@@ -420,6 +421,29 @@ func (db *DB) CreateAllIndexes(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return db.CreateCommitsIndexes(ctx) })
 	g.Go(func() error { return db.CreateCommitGraphIndexes(ctx) })
+	g.Go(func() error { return db.CreatePathsIndexes(ctx) })
+	g.Go(func() error { return db.CreateFileRefsIndexes(ctx) })
+	return g.Wait()
+}
+
+// DropBlobPhaseIndexes drops secondary indexes on tables written during blob
+// import (file_refs and paths). Commits indexes are NOT dropped because:
+//  1. The blob phase doesn't write to pgit_commits
+//  2. Commits data is hot in xpatch's LRU cache right after commit import
+//  3. Rebuilding commits indexes from cold cache is extremely expensive
+//     (requires full delta chain decompression for every row)
+func (db *DB) DropBlobPhaseIndexes(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return db.DropPathsIndexes(ctx) })
+	g.Go(func() error { return db.DropFileRefsIndexes(ctx) })
+	return g.Wait()
+}
+
+// CreateBlobPhaseIndexes creates secondary indexes on tables written during
+// blob import (file_refs and paths). These are normal heap tables, so index
+// creation is fast sequential I/O with no delta decompression.
+func (db *DB) CreateBlobPhaseIndexes(ctx context.Context) error {
+	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return db.CreatePathsIndexes(ctx) })
 	g.Go(func() error { return db.CreateFileRefsIndexes(ctx) })
 	return g.Wait()

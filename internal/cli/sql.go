@@ -73,59 +73,69 @@ type columnInfo struct {
 var pgitSchema = []schemaInfo{
 	{
 		Name:        "pgit_commits",
-		Description: "Stores commit metadata (author, message, timestamp, parent relationship)",
+		Description: "Stores commit metadata (author, message, timestamp, parent relationship). USING xpatch (delta-compressed).",
 		Columns: []columnInfo{
 			{"id", "TEXT PRIMARY KEY", "ULID commit identifier (time-sortable)"},
 			{"parent_id", "TEXT", "Parent commit ID (NULL for root commit)"},
-			{"tree_hash", "TEXT", "Hash identifying the file tree state"},
-			{"message", "TEXT", "Commit message"},
-			{"author_name", "TEXT", "Author's name"},
-			{"author_email", "TEXT", "Author's email address"},
-			{"authored_at", "TIMESTAMPTZ", "Author timestamp"},
-			{"committer_name", "TEXT", "Committer's name"},
-			{"committer_email", "TEXT", "Committer's email address"},
-			{"committed_at", "TIMESTAMPTZ", "Committer timestamp"},
+			{"tree_hash", "TEXT NOT NULL", "Hash identifying the file tree state"},
+			{"message", "TEXT NOT NULL", "Commit message"},
+			{"author_name", "TEXT NOT NULL", "Author's name"},
+			{"author_email", "TEXT NOT NULL", "Author's email address"},
+			{"authored_at", "TIMESTAMPTZ NOT NULL", "Author timestamp"},
+			{"committer_name", "TEXT NOT NULL", "Committer's name"},
+			{"committer_email", "TEXT NOT NULL", "Committer's email address"},
+			{"committed_at", "TIMESTAMPTZ NOT NULL", "Committer timestamp"},
+		},
+	},
+	{
+		Name:        "pgit_commit_graph",
+		Description: "Commit DAG with binary lifting ancestor pointers for O(log N) HEAD~N resolution. Heap table (not xpatch).",
+		Columns: []columnInfo{
+			{"seq", "SERIAL PRIMARY KEY", "Auto-increment sequence number"},
+			{"id", "TEXT NOT NULL UNIQUE", "Commit ID (references pgit_commits.id)"},
+			{"depth", "INTEGER NOT NULL", "Depth in the commit DAG (root = 0)"},
+			{"ancestors", "INTEGER[]", "Binary lifting ancestor seq numbers (2^0, 2^1, 2^2, ...)"},
 		},
 	},
 	{
 		Name:        "pgit_paths",
 		Description: "File paths with shared delta compression groups (N:1 path-to-group mapping)",
 		Columns: []columnInfo{
-			{"path_id", "INTEGER PRIMARY KEY", "Unique path identifier (auto-generated)"},
+			{"path_id", "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY", "Unique path identifier (auto-generated)"},
 			{"group_id", "INTEGER NOT NULL", "Delta compression group ID (multiple paths can share one group)"},
-			{"path", "TEXT UNIQUE", "File path relative to repository root"},
+			{"path", "TEXT NOT NULL UNIQUE", "File path relative to repository root"},
 		},
 	},
 	{
 		Name:        "pgit_file_refs",
-		Description: "Links commits to file versions (which files exist in which commits)",
+		Description: "Links commits to file versions (which files exist in which commits). PRIMARY KEY (path_id, commit_id).",
 		Columns: []columnInfo{
-			{"path_id", "INTEGER", "Reference to pgit_paths.path_id (part of PK)"},
-			{"commit_id", "TEXT", "Reference to pgit_commits.id (part of PK)"},
-			{"version_id", "INTEGER", "Version number within the delta compression group"},
+			{"path_id", "INTEGER NOT NULL", "Reference to pgit_paths.path_id (part of PK)"},
+			{"commit_id", "TEXT NOT NULL", "Reference to pgit_commits.id (part of PK)"},
+			{"version_id", "INTEGER NOT NULL", "Version number within the delta compression group"},
 			{"content_hash", "BYTEA", "BLAKE3 hash of file content (NULL = deleted)"},
-			{"mode", "INTEGER", "Unix file mode (permissions)"},
-			{"is_symlink", "BOOLEAN", "Whether this is a symlink"},
+			{"mode", "INTEGER NOT NULL DEFAULT 33188", "Unix file mode (default 0100644)"},
+			{"is_symlink", "BOOLEAN NOT NULL DEFAULT FALSE", "Whether this is a symlink"},
 			{"symlink_target", "TEXT", "Symlink target path (if symlink)"},
-			{"is_binary", "BOOLEAN", "Whether the file content is binary"},
+			{"is_binary", "BOOLEAN NOT NULL DEFAULT FALSE", "Whether the file content is binary"},
 		},
 	},
 	{
 		Name:        "pgit_text_content",
-		Description: "Text file content, delta-compressed by pg-xpatch (keyed by group_id, not path_id)",
+		Description: "Text file content, delta-compressed by pg-xpatch. PRIMARY KEY (group_id, version_id). USING xpatch.",
 		Columns: []columnInfo{
-			{"group_id", "INTEGER", "Delta compression group ID (part of PK, from pgit_paths.group_id)"},
-			{"version_id", "INTEGER", "Version number within the group (part of PK)"},
-			{"content", "TEXT", "Text file content (auto delta-compressed)"},
+			{"group_id", "INTEGER NOT NULL", "Delta compression group ID (part of PK, from pgit_paths.group_id)"},
+			{"version_id", "INTEGER NOT NULL", "Version number within the group (part of PK)"},
+			{"content", "TEXT NOT NULL DEFAULT ''", "Text file content (auto delta-compressed)"},
 		},
 	},
 	{
 		Name:        "pgit_binary_content",
-		Description: "Binary file content, delta-compressed by pg-xpatch (keyed by group_id, not path_id)",
+		Description: "Binary file content, delta-compressed by pg-xpatch. PRIMARY KEY (group_id, version_id). USING xpatch.",
 		Columns: []columnInfo{
-			{"group_id", "INTEGER", "Delta compression group ID (part of PK, from pgit_paths.group_id)"},
-			{"version_id", "INTEGER", "Version number within the group (part of PK)"},
-			{"content", "BYTEA", "Binary file content (auto delta-compressed)"},
+			{"group_id", "INTEGER NOT NULL", "Delta compression group ID (part of PK, from pgit_paths.group_id)"},
+			{"version_id", "INTEGER NOT NULL", "Version number within the group (part of PK)"},
+			{"content", "BYTEA NOT NULL DEFAULT ''::bytea", "Binary file content (auto delta-compressed)"},
 		},
 	},
 	{
@@ -133,7 +143,7 @@ var pgitSchema = []schemaInfo{
 		Description: "Named references (branches, tags) pointing to commits",
 		Columns: []columnInfo{
 			{"name", "TEXT PRIMARY KEY", "Reference name (e.g., 'HEAD', 'main')"},
-			{"commit_id", "TEXT", "Reference to pgit_commits.id"},
+			{"commit_id", "TEXT NOT NULL", "Reference to pgit_commits.id"},
 		},
 	},
 	{
@@ -141,7 +151,7 @@ var pgitSchema = []schemaInfo{
 		Description: "Repository metadata and configuration",
 		Columns: []columnInfo{
 			{"key", "TEXT PRIMARY KEY", "Metadata key"},
-			{"value", "TEXT", "Metadata value"},
+			{"value", "TEXT NOT NULL", "Metadata value"},
 		},
 	},
 	{
@@ -150,7 +160,7 @@ var pgitSchema = []schemaInfo{
 		Columns: []columnInfo{
 			{"remote_name", "TEXT PRIMARY KEY", "Remote repository name"},
 			{"last_commit_id", "TEXT", "Last synchronized commit ID"},
-			{"synced_at", "TIMESTAMPTZ", "Last sync timestamp"},
+			{"synced_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()", "Last sync timestamp"},
 		},
 	},
 }
@@ -280,7 +290,7 @@ func runSQLSchema(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	return fmt.Errorf("unknown table: %s\n\nAvailable tables: pgit_commits, pgit_paths, pgit_file_refs, pgit_text_content, pgit_binary_content, pgit_refs, pgit_metadata, pgit_sync_state", args[0])
+	return fmt.Errorf("unknown table: %s\n\nAvailable tables: pgit_commits, pgit_commit_graph, pgit_paths, pgit_file_refs, pgit_text_content, pgit_binary_content, pgit_refs, pgit_metadata, pgit_sync_state", args[0])
 }
 
 func newSQLTablesCmd() *cobra.Command {

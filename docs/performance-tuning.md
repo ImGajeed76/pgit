@@ -156,4 +156,4 @@ Key cache metrics:
 
 | Setting | Default | Rule of thumb |
 |---------|---------|---------------|
-| `import.workers` | 3 | cores (max 16) |
+| `import.workers` | 3 | cores |

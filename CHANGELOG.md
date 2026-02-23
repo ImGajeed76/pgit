@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.2] - 2026-02-23
+
+### Changed
+
+- **Blob import only drops file_refs and paths indexes**: New `DropBlobPhaseIndexes`/`CreateBlobPhaseIndexes` replace the previous `DropAllIndexes`/`CreateAllIndexes` calls during blob import. Commits and commit_graph indexes are no longer dropped because the blob phase doesn't write to `pgit_commits`, and rebuilding those indexes from cold xpatch cache requires full delta chain decompression — adding hours at Linux kernel scale. The general-purpose `DropAllIndexes`/`CreateAllIndexes` methods are preserved for other callers.
+
+### Fixed
+
+- **Correct xpatch GUC defaults in docs**: `docs/xpatch-query-patterns.md` now matches actual `pg_xpatch.c` defaults — `cache_max_entry_kb` corrected from 4096 to 256, `encode_threads` from 4 to 0 (disabled), `insert_cache_slots` from 64 to 16.
+- **Remove stale "max 16" from tuning guide**: `docs/performance-tuning.md` worker rule-of-thumb changed from "cores (max 16)" to "cores", matching the v4.1.1 cap removal.
+- **Fix `pgit sql schema` output**: Add missing `pgit_commit_graph` table, add `NOT NULL`/`DEFAULT` constraints to all columns matching actual DDL, document composite primary keys, `GENERATED ALWAYS AS IDENTITY`, and `USING xpatch` storage method. Fix error message to list all 9 tables.
+
 ## [4.1.1] - 2026-02-22
 
 ### Fixed
@@ -266,7 +278,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shell completions (bash, zsh, fish, PowerShell)
 - GoReleaser: multi-platform binaries, Homebrew, deb/rpm/apk packages
 
-[Unreleased]: https://github.com/ImGajeed76/pgit/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/ImGajeed76/pgit/compare/v4.1.2...HEAD
+[4.1.2]: https://github.com/ImGajeed76/pgit/compare/v4.1.1...v4.1.2
+[4.1.1]: https://github.com/ImGajeed76/pgit/compare/v4.1.0...v4.1.1
+[4.1.0]: https://github.com/ImGajeed76/pgit/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/ImGajeed76/pgit/compare/v3.3.2...v4.0.0
 [3.3.2]: https://github.com/ImGajeed76/pgit/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/ImGajeed76/pgit/compare/v3.3.0...v3.3.1

@@ -640,12 +640,14 @@ func runImport(cmd *cobra.Command, args []string) error {
 		ui.FormatCount(totalFileOps), ui.FormatCount(len(pathOps)), ui.FormatCount(groupCount))
 
 	if totalFileOps > 0 {
-		// Drop ALL secondary indexes before bulk import.
-		// Random ULID-based commit_id insertions cause massive B-tree
-		// degradation at scale. Rebuilding after is O(n log n)
-		// in one pass vs O(n * log n) random page lookups during insert.
+		// Drop only file_refs and paths indexes before blob import.
+		// Commits indexes are NOT dropped: the blob phase doesn't write to
+		// pgit_commits, and rebuilding commits indexes after blobs fill the
+		// xpatch cache is extremely expensive (full delta decompression from
+		// cold storage). By keeping commits indexes intact, we avoid a
+		// multi-hour rebuild at Linux kernel scale.
 		fmt.Print("Dropping indexes for bulk import...")
-		if err := r.DB.DropAllIndexes(ctx); err != nil {
+		if err := r.DB.DropBlobPhaseIndexes(ctx); err != nil {
 			fmt.Printf(" warning: %v\n", err)
 		} else {
 			fmt.Println(" done")
@@ -655,7 +657,7 @@ func runImport(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			// Still try to recreate indexes even on error
 			fmt.Print("\nRebuilding indexes...")
-			if idxErr := r.DB.CreateAllIndexes(ctx); idxErr != nil {
+			if idxErr := r.DB.CreateBlobPhaseIndexes(ctx); idxErr != nil {
 				fmt.Printf(" warning: %v\n", idxErr)
 			} else {
 				fmt.Println(" done")
@@ -663,10 +665,10 @@ func runImport(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		// Rebuild all indexes after bulk import
+		// Rebuild file_refs and paths indexes after blob import
 		fmt.Print("Rebuilding indexes...")
 		rebuildStart := time.Now()
-		if err := r.DB.CreateAllIndexes(ctx); err != nil {
+		if err := r.DB.CreateBlobPhaseIndexes(ctx); err != nil {
 			return fmt.Errorf("failed to rebuild indexes: %w", err)
 		}
 		fmt.Printf(" done (%s)\n", time.Since(rebuildStart).Round(time.Second))
