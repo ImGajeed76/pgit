@@ -247,6 +247,9 @@ func StartContainer(runtime Runtime, port int) error {
 		if globalCfg.Container.XpatchCacheMaxEntryKB > 0 {
 			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_max_entry_kb=%d", globalCfg.Container.XpatchCacheMaxEntryKB))
 		}
+		if globalCfg.Container.XpatchCacheSlotSizeKB > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_slot_size_kb=%d", globalCfg.Container.XpatchCacheSlotSizeKB))
+		}
 		if globalCfg.Container.XpatchCachePartitions > 0 {
 			args = append(args, "-c", fmt.Sprintf("pg_xpatch.cache_partitions=%d", globalCfg.Container.XpatchCachePartitions))
 		}
@@ -263,6 +266,12 @@ func StartContainer(runtime Runtime, port int) error {
 		}
 		if globalCfg.Container.XpatchSeqTidCacheSizeMB > 0 {
 			args = append(args, "-c", fmt.Sprintf("pg_xpatch.seq_tid_cache_size_mb=%d", globalCfg.Container.XpatchSeqTidCacheSizeMB))
+		}
+		if globalCfg.Container.XpatchMaxDeltaColumns > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.max_delta_columns=%d", globalCfg.Container.XpatchMaxDeltaColumns))
+		}
+		if globalCfg.Container.XpatchWarmCacheWorkers > 0 {
+			args = append(args, "-c", fmt.Sprintf("pg_xpatch.warm_cache_workers=%d", globalCfg.Container.XpatchWarmCacheWorkers))
 		}
 	}
 

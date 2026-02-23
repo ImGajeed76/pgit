@@ -145,12 +145,15 @@ Key cache metrics:
 | `xpatch_cache_size_mb` | 256 | 10-15% of RAM |
 | `xpatch_cache_max_entries` | 65536 | cache_size_mb * 64 |
 | `xpatch_cache_max_entry_kb` | 256 | 1024-16384 (allow large files) |
+| `xpatch_cache_slot_size_kb` | 4 | 4 (rarely needs changing) |
 | `xpatch_cache_partitions` | 32 | cores |
 | `xpatch_encode_threads` | 0 | cores (for imports) |
 | `xpatch_insert_cache_slots` | 16 | 16 + cache_size_mb / 128 |
 | `xpatch_group_cache_size_mb` | 16 | cache_size_mb / 64 |
 | `xpatch_tid_cache_size_mb` | 16 | cache_size_mb / 32 |
 | `xpatch_seq_tid_cache_size_mb` | 16 | cache_size_mb / 32 |
+| `xpatch_max_delta_columns` | 32 | 32 (rarely needs changing) |
+| `xpatch_warm_cache_workers` | 4 | cores (for cache warming) |
 
 ### Import settings
 

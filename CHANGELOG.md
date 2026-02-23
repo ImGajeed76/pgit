@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.3] - 2026-02-23
+
+### Added
+
+- **3 new pg-xpatch GUCs**: `container.xpatch_cache_slot_size_kb`, `container.xpatch_max_delta_columns`, and `container.xpatch_warm_cache_workers` — aligning pgit with pg-xpatch v0.7.0's full GUC set. Configurable via `pgit config --global` and passed to the container at startup.
+
+### Changed
+
+- Remove hardcoded `max` constraints from xpatch GUC validation (`cache_partitions`, `encode_threads`). The extension enforces its own limits server-side; duplicating them in pgit risks going stale when limits change upstream.
+
 ## [4.1.2] - 2026-02-23
 
 ### Changed
@@ -278,7 +288,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shell completions (bash, zsh, fish, PowerShell)
 - GoReleaser: multi-platform binaries, Homebrew, deb/rpm/apk packages
 
-[Unreleased]: https://github.com/ImGajeed76/pgit/compare/v4.1.2...HEAD
+[Unreleased]: https://github.com/ImGajeed76/pgit/compare/v4.1.3...HEAD
+[4.1.3]: https://github.com/ImGajeed76/pgit/compare/v4.1.2...v4.1.3
 [4.1.2]: https://github.com/ImGajeed76/pgit/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/ImGajeed76/pgit/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/ImGajeed76/pgit/compare/v4.0.0...v4.1.0

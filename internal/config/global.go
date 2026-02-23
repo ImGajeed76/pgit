@@ -47,12 +47,15 @@ type ContainerConfig struct {
 	XpatchCacheSizeMB       int `toml:"xpatch_cache_size_mb" config:"container.xpatch_cache_size_mb" default:"256" min:"1" desc:"xpatch content cache size in MB"`
 	XpatchCacheMaxEntries   int `toml:"xpatch_cache_max_entries" config:"container.xpatch_cache_max_entries" default:"65536" min:"1000" desc:"xpatch max cache entries"`
 	XpatchCacheMaxEntryKB   int `toml:"xpatch_cache_max_entry_kb" config:"container.xpatch_cache_max_entry_kb" default:"256" min:"16" desc:"xpatch max single cache entry size in KB"`
-	XpatchCachePartitions   int `toml:"xpatch_cache_partitions" config:"container.xpatch_cache_partitions" default:"32" min:"1" max:"256" desc:"xpatch cache lock partitions"`
-	XpatchEncodeThreads     int `toml:"xpatch_encode_threads" config:"container.xpatch_encode_threads" default:"0" min:"0" max:"64" desc:"xpatch parallel delta encoding threads (0=sequential)"`
+	XpatchCacheSlotSizeKB   int `toml:"xpatch_cache_slot_size_kb" config:"container.xpatch_cache_slot_size_kb" default:"4" min:"1" desc:"xpatch cache content slot size in KB"`
+	XpatchCachePartitions   int `toml:"xpatch_cache_partitions" config:"container.xpatch_cache_partitions" default:"32" min:"1" desc:"xpatch cache lock partitions"`
+	XpatchEncodeThreads     int `toml:"xpatch_encode_threads" config:"container.xpatch_encode_threads" default:"0" min:"0" desc:"xpatch parallel delta encoding threads (0=sequential)"`
 	XpatchInsertCacheSlots  int `toml:"xpatch_insert_cache_slots" config:"container.xpatch_insert_cache_slots" default:"16" min:"1" desc:"xpatch insert cache FIFO slots"`
 	XpatchGroupCacheSizeMB  int `toml:"xpatch_group_cache_size_mb" config:"container.xpatch_group_cache_size_mb" default:"16" min:"1" desc:"xpatch group max-seq cache in MB"`
 	XpatchTidCacheSizeMB    int `toml:"xpatch_tid_cache_size_mb" config:"container.xpatch_tid_cache_size_mb" default:"16" min:"1" desc:"xpatch TID seq cache in MB"`
 	XpatchSeqTidCacheSizeMB int `toml:"xpatch_seq_tid_cache_size_mb" config:"container.xpatch_seq_tid_cache_size_mb" default:"16" min:"1" desc:"xpatch seq-to-TID cache in MB"`
+	XpatchMaxDeltaColumns   int `toml:"xpatch_max_delta_columns" config:"container.xpatch_max_delta_columns" default:"32" min:"1" desc:"xpatch max delta-compressed columns per table"`
+	XpatchWarmCacheWorkers  int `toml:"xpatch_warm_cache_workers" config:"container.xpatch_warm_cache_workers" default:"4" min:"1" desc:"xpatch default workers for warm_cache_parallel()"`
 }
 
 // ImportConfig contains default import settings
@@ -88,12 +91,15 @@ func DefaultGlobalConfig() *GlobalConfig {
 			XpatchCacheSizeMB:       256,
 			XpatchCacheMaxEntries:   65536,
 			XpatchCacheMaxEntryKB:   256,
+			XpatchCacheSlotSizeKB:   4,
 			XpatchCachePartitions:   32,
 			XpatchEncodeThreads:     0,
 			XpatchInsertCacheSlots:  16,
 			XpatchGroupCacheSizeMB:  16,
 			XpatchTidCacheSizeMB:    16,
 			XpatchSeqTidCacheSizeMB: 16,
+			XpatchMaxDeltaColumns:   32,
+			XpatchWarmCacheWorkers:  4,
 		},
 		Import: ImportConfig{
 			Workers: workers,
@@ -186,6 +192,9 @@ func LoadGlobal() (*GlobalConfig, error) {
 	if cfg.Container.XpatchCacheMaxEntryKB == 0 {
 		cfg.Container.XpatchCacheMaxEntryKB = defaults.Container.XpatchCacheMaxEntryKB
 	}
+	if cfg.Container.XpatchCacheSlotSizeKB == 0 {
+		cfg.Container.XpatchCacheSlotSizeKB = defaults.Container.XpatchCacheSlotSizeKB
+	}
 	if cfg.Container.XpatchCachePartitions == 0 {
 		cfg.Container.XpatchCachePartitions = defaults.Container.XpatchCachePartitions
 	}
@@ -202,6 +211,12 @@ func LoadGlobal() (*GlobalConfig, error) {
 	}
 	if cfg.Container.XpatchSeqTidCacheSizeMB == 0 {
 		cfg.Container.XpatchSeqTidCacheSizeMB = defaults.Container.XpatchSeqTidCacheSizeMB
+	}
+	if cfg.Container.XpatchMaxDeltaColumns == 0 {
+		cfg.Container.XpatchMaxDeltaColumns = defaults.Container.XpatchMaxDeltaColumns
+	}
+	if cfg.Container.XpatchWarmCacheWorkers == 0 {
+		cfg.Container.XpatchWarmCacheWorkers = defaults.Container.XpatchWarmCacheWorkers
 	}
 	if cfg.Import.Workers == 0 {
 		cfg.Import.Workers = defaults.Import.Workers

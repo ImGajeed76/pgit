@@ -212,12 +212,15 @@ WHERE group_id = $1 AND version_id = $2
 | `pg_xpatch.cache_size_mb` | 256 | Total shared cache size (requires restart) |
 | `pg_xpatch.cache_max_entries` | 65536 | Max entries in cache |
 | `pg_xpatch.cache_max_entry_kb` | 256 | Max size per cached entry |
+| `pg_xpatch.cache_slot_size_kb` | 4 | Size of each content slot in cache |
 | `pg_xpatch.cache_partitions` | 32 | Cache lock partitions (concurrency) |
 | `pg_xpatch.encode_threads` | 0 | Parallel delta encoding threads (0 = disabled) |
 | `pg_xpatch.insert_cache_slots` | 16 | FIFO slots for insert path cache |
 | `pg_xpatch.group_cache_size_mb` | 16 | Group max-seq cache |
 | `pg_xpatch.tid_cache_size_mb` | 16 | TID seq cache |
 | `pg_xpatch.seq_tid_cache_size_mb` | 16 | Seq-to-TID cache |
+| `pg_xpatch.max_delta_columns` | 32 | Max delta-compressed columns per table |
+| `pg_xpatch.warm_cache_workers` | 4 | Default workers for `warm_cache_parallel()` |
 
 These are configured via `pgit config --global container.xpatch_*` and applied
 at container startup. Changes require `pgit local destroy && pgit local start`.
