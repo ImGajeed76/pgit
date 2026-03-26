@@ -1,5 +1,7 @@
 # pgit
 
+[![Featured on - Hacker News](https://img.shields.io/badge/Featured%20on-Hacker%20News-orange?logo=ycombinator&logoColor=white)](https://news.ycombinator.com/item?id=47409222)
+
 A Git-like version control CLI backed by PostgreSQL with [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression.
 
 > **Note:** pgit is primarily a demo for [pg-xpatch](https://github.com/imgajeed76/pg-xpatch) delta compression. It's not intended to replace git—but it *is* genuinely useful for importing a repo and running SQL analytics on your commit history.
