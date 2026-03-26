@@ -75,13 +75,14 @@ var pgitSchema = []schemaInfo{
 		Name:        "pgit_commits",
 		Description: "Stores commit metadata (author, message, timestamp, parent relationship). USING xpatch (delta-compressed).",
 		Columns: []columnInfo{
-			{"id", "TEXT PRIMARY KEY", "ULID commit identifier (time-sortable)"},
+			{"id", "TEXT PRIMARY KEY", "ULID commit identifier (encodes author timestamp)"},
+			{"seq", "INTEGER NOT NULL", "Insertion order (xpatch order_by column)"},
 			{"parent_id", "TEXT", "Parent commit ID (NULL for root commit)"},
 			{"tree_hash", "TEXT NOT NULL", "Hash identifying the file tree state"},
 			{"message", "TEXT NOT NULL", "Commit message"},
 			{"author_name", "TEXT NOT NULL", "Author's name"},
 			{"author_email", "TEXT NOT NULL", "Author's email address"},
-			{"authored_at", "TIMESTAMPTZ NOT NULL", "Author timestamp"},
+			{"authored_at", "TIMESTAMPTZ NOT NULL", "Author timestamp (real git date)"},
 			{"committer_name", "TEXT NOT NULL", "Committer's name"},
 			{"committer_email", "TEXT NOT NULL", "Committer's email address"},
 			{"committed_at", "TIMESTAMPTZ NOT NULL", "Committer timestamp"},
@@ -173,7 +174,7 @@ var exampleQueries = []struct {
 	{
 		Title:       "Recent commits",
 		Description: "Show the 10 most recent commits",
-		Query:       "SELECT id, author_name, message, authored_at\nFROM pgit_commits\nORDER BY authored_at DESC\nLIMIT 10;",
+		Query:       "SELECT id, author_name, message, authored_at\nFROM pgit_commits\nORDER BY seq DESC\nLIMIT 10;",
 	},
 	{
 		Title:       "Most changed files",
@@ -203,7 +204,7 @@ var exampleQueries = []struct {
 	{
 		Title:       "Search commit messages",
 		Description: "Find commits by message text (scans full pgit_commits table)",
-		Query:       "SELECT id, author_name, message, authored_at\nFROM pgit_commits\nWHERE message ILIKE '%fix%' OR message ILIKE '%bug%'\nORDER BY authored_at DESC\nLIMIT 20;",
+		Query:       "SELECT id, author_name, message, authored_at\nFROM pgit_commits\nWHERE message ILIKE '%fix%' OR message ILIKE '%bug%'\nORDER BY seq DESC\nLIMIT 20;",
 	},
 	{
 		Title:       "Files by extension",

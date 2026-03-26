@@ -9,13 +9,18 @@ import (
 )
 
 // SchemaVersion is the current schema version.
-// Version 4 introduces:
+// Version 5 introduces:
+// - seq INTEGER NOT NULL column on pgit_commits for deterministic xpatch ordering
+// - xpatch order_by changed from 'authored_at' to 'seq' (fixes non-monotonic timestamps)
+// - All analyze queries use ORDER BY seq ASC for optimal delta chain access
+//
+// Version 4 introduced:
 // - N:1 path-to-group mapping (multiple paths can share one delta group)
 // - path_id as PK in pgit_paths and pgit_file_refs
 // - group_id remains for delta compression grouping in content tables
 // - compress_depth increased to 10 for better deduplication
 // - Removed reset and resolve commands (v4 is append-only)
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 // InitSchema creates the pgit schema in the database
 func (db *DB) InitSchema(ctx context.Context) error {
@@ -101,10 +106,11 @@ func (db *DB) createMetadataTable(ctx context.Context) error {
 }
 
 func (db *DB) createCommitsTable(ctx context.Context) error {
-	// Create table with committer fields and renamed authored_at
+	// Create table with committer fields and seq for xpatch ordering
 	sql := `
 	CREATE TABLE IF NOT EXISTS pgit_commits (
 		id              TEXT PRIMARY KEY,
+		seq             INTEGER NOT NULL,
 		parent_id       TEXT,
 		tree_hash       TEXT NOT NULL,
 		message         TEXT NOT NULL,
@@ -123,7 +129,7 @@ func (db *DB) createCommitsTable(ctx context.Context) error {
 	// Configure xpatch
 	configSQL := `
 	SELECT xpatch.configure('pgit_commits',
-		order_by => 'authored_at',
+		order_by => 'seq',
 		delta_columns => ARRAY['message', 'author_name', 'author_email',
 		                       'committer_name', 'committer_email'],
 		keyframe_every => 100,

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] - 2026-03-26
+
+### Changed
+
+- **Schema version 5**: Added `seq INTEGER NOT NULL` column to `pgit_commits` for deterministic xpatch ordering. The xpatch `order_by` is now `seq` instead of `authored_at`, fixing incorrect delta chain ordering when author timestamps are non-monotonic (e.g. rebases, cherry-picks, clock skew). **Requires re-import** (`pgit import --force`).
+- **Analyze queries use `ORDER BY seq ASC`**: Authors, activity, and bus-factor analyses now scan the delta chain in optimal order via `seq` instead of `authored_at`.
+- **`--timeout` flag for all analyze subcommands**: Replaces the hardcoded 5-minute timeout (e.g. `pgit analyze churn --timeout 30m`).
+- **`pgit local status` shows actual container image**: Inspects the running container instead of showing the hardcoded default image name.
+- **Dynamic help text alignment**: `pgit config --global --help` now auto-aligns columns based on the longest key.
+- **Updated example queries**: README and `pgit sql examples` use `ORDER BY seq DESC` for optimal xpatch performance.
+- **Updated comments and docs**: Removed misleading claims about ULID lexicographic order equaling chronological order.
+
+### Fixed
+
+- **`pgit commit` includes `seq` column**: Native commits now compute `MAX(seq)+1` to maintain correct xpatch ordering. Without this fix, `pgit commit` would fail with a NOT NULL violation on the new schema.
+
 ## [4.1.3] - 2026-02-23
 
 ### Added

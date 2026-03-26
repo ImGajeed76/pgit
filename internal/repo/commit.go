@@ -167,9 +167,14 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 	// Compute tree hash
 	treeHash := util.ComputeTreeHash(treeEntries)
 
+	// Get next seq value for xpatch ordering
+	var maxSeq int
+	_ = r.DB.QueryRow(ctx, "SELECT COALESCE(MAX(seq), 0) FROM pgit_commits").Scan(&maxSeq)
+
 	// Create commit (committer = author for native pgit commits)
 	commit := &db.Commit{
 		ID:             commitID,
+		Seq:            maxSeq + 1,
 		ParentID:       parentID,
 		TreeHash:       treeHash,
 		Message:        opts.Message,
@@ -192,9 +197,9 @@ func (r *Repository) Commit(ctx context.Context, opts CommitOptions) (*db.Commit
 	err = r.DB.WithTx(ctx, func(tx pgx.Tx) error {
 		// Create commit first
 		_, err := tx.Exec(ctx, `
-			INSERT INTO pgit_commits (id, parent_id, tree_hash, message, author_name, author_email, authored_at, committer_name, committer_email, committed_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-			commit.ID, commit.ParentID, commit.TreeHash, commit.Message,
+			INSERT INTO pgit_commits (id, seq, parent_id, tree_hash, message, author_name, author_email, authored_at, committer_name, committer_email, committed_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			commit.ID, commit.Seq, commit.ParentID, commit.TreeHash, commit.Message,
 			commit.AuthorName, commit.AuthorEmail, commit.AuthoredAt,
 			commit.CommitterName, commit.CommitterEmail, commit.CommittedAt)
 		if err != nil {

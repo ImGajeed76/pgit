@@ -68,6 +68,7 @@ type analyzeFlags struct {
 	remote   string
 	sortBy   string
 	reverse  bool
+	timeout  time.Duration
 }
 
 // addAnalyzeFlags adds the shared flags to a cobra.Command.
@@ -80,6 +81,7 @@ func addAnalyzeFlags(cmd *cobra.Command) {
 	cmd.Flags().String("remote", "", "Run analysis against a remote database (e.g. 'origin')")
 	cmd.Flags().String("sort", "", "Sort by column name")
 	cmd.Flags().Bool("reverse", false, "Reverse the sort order")
+	cmd.Flags().Duration("timeout", 5*time.Minute, "Maximum time for the analysis (e.g. 5m, 30m, 2h)")
 }
 
 // parseAnalyzeFlags reads the shared flags from a cobra.Command.
@@ -92,6 +94,10 @@ func parseAnalyzeFlags(cmd *cobra.Command) analyzeFlags {
 	remote, _ := cmd.Flags().GetString("remote")
 	sortBy, _ := cmd.Flags().GetString("sort")
 	reverse, _ := cmd.Flags().GetBool("reverse")
+	timeout, _ := cmd.Flags().GetDuration("timeout")
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
 	return analyzeFlags{
 		limit:    limit,
 		pathGlob: pathGlob,
@@ -101,6 +107,7 @@ func parseAnalyzeFlags(cmd *cobra.Command) analyzeFlags {
 		remote:   remote,
 		sortBy:   sortBy,
 		reverse:  reverse,
+		timeout:  timeout,
 	}
 }
 
@@ -243,7 +250,7 @@ This query runs entirely on heap tables (no xpatch decompression).`,
 func runAnalyzeChurn(cmd *cobra.Command, args []string) error {
 	flags := parseAnalyzeFlags(cmd)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), flags.timeout)
 	defer cancel()
 
 	r, err := connectRepo(ctx, flags.remote)
@@ -335,7 +342,7 @@ func runAnalyzeCoupling(cmd *cobra.Command, args []string) error {
 	minCount, _ := cmd.Flags().GetInt("min")
 	maxFiles, _ := cmd.Flags().GetInt("max-files")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), flags.timeout)
 	defer cancel()
 
 	r, err := connectRepo(ctx, flags.remote)
@@ -491,7 +498,7 @@ func runAnalyzeHotspots(cmd *cobra.Command, args []string) error {
 		depth = 1
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), flags.timeout)
 	defer cancel()
 
 	r, err := connectRepo(ctx, flags.remote)
@@ -619,7 +626,7 @@ is the optimal access pattern for xpatch delta-compressed tables.`,
 func runAnalyzeAuthors(cmd *cobra.Command, args []string) error {
 	flags := parseAnalyzeFlags(cmd)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), flags.timeout)
 	defer cancel()
 
 	r, err := connectRepo(ctx, flags.remote)
@@ -632,12 +639,12 @@ func runAnalyzeAuthors(cmd *cobra.Command, args []string) error {
 	spinner.Start()
 
 	// Front-to-back sequential scan — optimal xpatch access pattern.
-	// ORDER BY authored_at ASC decompresses the delta chain in natural order,
+	// ORDER BY seq ASC decompresses the delta chain in natural order,
 	// each row reusing the previous row's cached decompression result.
 	rows, err := r.DB.Query(ctx, `
 		SELECT author_name, author_email, authored_at
 		FROM pgit_commits
-		ORDER BY authored_at ASC
+		ORDER BY seq ASC
 	`)
 	if err != nil {
 		spinner.Stop()
@@ -743,7 +750,7 @@ func runAnalyzeActivity(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid period %q: must be week, month, quarter, or year", period)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), flags.timeout)
 	defer cancel()
 
 	r, err := connectRepo(ctx, flags.remote)
@@ -759,7 +766,7 @@ func runAnalyzeActivity(cmd *cobra.Command, args []string) error {
 	rows, err := r.DB.Query(ctx, `
 		SELECT authored_at
 		FROM pgit_commits
-		ORDER BY authored_at ASC
+		ORDER BY seq ASC
 	`)
 	if err != nil {
 		spinner.Stop()
@@ -949,7 +956,7 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 	flags := parseAnalyzeFlags(cmd)
 	maxAuthors, _ := cmd.Flags().GetInt("max-authors")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), flags.timeout)
 	defer cancel()
 
 	r, err := connectRepo(ctx, flags.remote)
@@ -962,13 +969,13 @@ func runAnalyzeBusFactor(cmd *cobra.Command, args []string) error {
 	spinner.Start()
 
 	// Step 1: Build commit_id -> author_name map from pgit_commits.
-	// Front-to-back sequential scan (ORDER BY authored_at ASC) is the
+	// Front-to-back sequential scan (ORDER BY seq ASC) is the
 	// optimal xpatch access pattern — each row reuses the previous
 	// row's cached decompression result.
 	commitRows, err := r.DB.Query(ctx, `
 		SELECT id, author_name
 		FROM pgit_commits
-		ORDER BY authored_at ASC
+		ORDER BY seq ASC
 	`)
 	if err != nil {
 		spinner.Stop()

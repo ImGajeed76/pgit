@@ -343,6 +343,19 @@ func GenerateHelpText() string {
 		{"user", "User identity (used as default for new repositories)"},
 	}
 
+	// Find the longest key across all categories for consistent alignment
+	maxKeyLen := 0
+	for _, cat := range categories {
+		if fields, ok := byCategory[cat.key]; ok {
+			for _, f := range fields {
+				if len(f.Key) > maxKeyLen {
+					maxKeyLen = len(f.Key)
+				}
+			}
+		}
+	}
+	padFmt := fmt.Sprintf("    %%-%ds %%s%%s\n", maxKeyLen+1)
+
 	for _, cat := range categories {
 		fields, ok := byCategory[cat.key]
 		if !ok || len(fields) == 0 {
@@ -355,8 +368,7 @@ func GenerateHelpText() string {
 			if f.Default != "" {
 				defaultStr = fmt.Sprintf(" (default: %s)", f.Default)
 			}
-			// Pad key to align descriptions
-			sb.WriteString(fmt.Sprintf("    %-35s %s%s\n", f.Key, f.Desc, defaultStr))
+			sb.WriteString(fmt.Sprintf(padFmt, f.Key, f.Desc, defaultStr))
 		}
 		sb.WriteString("\n")
 	}

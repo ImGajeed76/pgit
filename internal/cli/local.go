@@ -129,7 +129,7 @@ func runLocalStatus(cmd *cobra.Command, args []string) error {
 		port, _ := container.GetContainerPort(runtime)
 		fmt.Printf("Status: %s\n", styles.Successf("running"))
 		fmt.Printf("Port: %d\n", port)
-		fmt.Printf("Image: %s\n", container.DefaultImage)
+		fmt.Printf("Image: %s\n", container.GetContainerImage(runtime))
 	} else {
 		fmt.Printf("Status: %s\n", styles.Warningf("stopped"))
 	}

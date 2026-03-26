@@ -1103,14 +1103,8 @@ func prepareCommits(
 	markToULID := make(map[int]string, len(commitEntries))
 	pgitCommits := make([]*db.Commit, 0, len(commitEntries))
 
-	var lastTime time.Time
-
-	for _, ce := range commitEntries {
+	for i, ce := range commitEntries {
 		authorTime := time.Unix(ce.AuthorTimestamp, 0)
-		if !authorTime.After(lastTime) {
-			authorTime = lastTime.Add(time.Millisecond)
-		}
-		lastTime = authorTime
 
 		ulid := util.NewULIDWithTime(authorTime)
 		markToULID[ce.Mark] = ulid
@@ -1129,6 +1123,7 @@ func prepareCommits(
 
 		pgitCommits = append(pgitCommits, &db.Commit{
 			ID:             ulid,
+			Seq:            i + 1, // 1-indexed, matches insertion order
 			ParentID:       parentID,
 			TreeHash:       ce.OriginalID[:min(8, len(ce.OriginalID))],
 			Message:        util.ToValidUTF8(string(message)),

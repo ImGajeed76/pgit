@@ -598,6 +598,21 @@ func MigrateToNamedVolume(runtime Runtime, progressFn func(stage string)) error 
 	return nil
 }
 
+// GetContainerImage returns the image name of the running container
+func GetContainerImage(runtime Runtime) string {
+	if runtime == RuntimeNone {
+		return ""
+	}
+
+	cmd := exec.Command(string(runtime), "inspect", ContainerName,
+		"--format", "{{.Config.Image}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return DefaultImage
+	}
+	return strings.TrimSpace(string(output))
+}
+
 // GetContainerImageDigest returns the image digest (sha256) of the running container
 func GetContainerImageDigest(runtime Runtime) string {
 	if runtime == RuntimeNone {

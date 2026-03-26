@@ -15,7 +15,7 @@ var (
 )
 
 // NewULID generates a new ULID string.
-// ULIDs are time-sortable unique identifiers.
+// ULIDs are unique identifiers that encode a timestamp.
 func NewULID() string {
 	entropyLock.Lock()
 	defer entropyLock.Unlock()

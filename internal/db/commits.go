@@ -11,6 +11,7 @@ import (
 // Commit represents a commit in the database
 type Commit struct {
 	ID             string
+	Seq            int
 	ParentID       *string
 	TreeHash       string
 	Message        string
@@ -25,10 +26,10 @@ type Commit struct {
 // CreateCommit inserts a new commit into the database
 func (db *DB) CreateCommit(ctx context.Context, c *Commit) error {
 	sql := `
-	INSERT INTO pgit_commits (id, parent_id, tree_hash, message, author_name, author_email, authored_at, committer_name, committer_email, committed_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+	INSERT INTO pgit_commits (id, seq, parent_id, tree_hash, message, author_name, author_email, authored_at, committer_name, committer_email, committed_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
 
-	return db.Exec(ctx, sql, c.ID, c.ParentID, c.TreeHash, c.Message,
+	return db.Exec(ctx, sql, c.ID, c.Seq, c.ParentID, c.TreeHash, c.Message,
 		c.AuthorName, c.AuthorEmail, c.AuthoredAt,
 		c.CommitterName, c.CommitterEmail, c.CommittedAt)
 }
@@ -43,7 +44,7 @@ func (db *DB) CreateCommitsBatch(ctx context.Context, commits []*Commit) error {
 	rows := make([][]interface{}, len(commits))
 	for i, c := range commits {
 		rows[i] = []interface{}{
-			c.ID, c.ParentID, c.TreeHash, c.Message,
+			c.ID, c.Seq, c.ParentID, c.TreeHash, c.Message,
 			c.AuthorName, c.AuthorEmail, c.AuthoredAt,
 			c.CommitterName, c.CommitterEmail, c.CommittedAt,
 		}
@@ -52,7 +53,7 @@ func (db *DB) CreateCommitsBatch(ctx context.Context, commits []*Commit) error {
 	_, err := db.pool.CopyFrom(
 		ctx,
 		pgx.Identifier{"pgit_commits"},
-		[]string{"id", "parent_id", "tree_hash", "message",
+		[]string{"id", "seq", "parent_id", "tree_hash", "message",
 			"author_name", "author_email", "authored_at",
 			"committer_name", "committer_email", "committed_at"},
 		pgx.CopyFromRows(rows),
@@ -69,7 +70,7 @@ func (db *DB) CreateCommitsBatchTx(ctx context.Context, tx pgx.Tx, commits []*Co
 	rows := make([][]interface{}, len(commits))
 	for i, c := range commits {
 		rows[i] = []interface{}{
-			c.ID, c.ParentID, c.TreeHash, c.Message,
+			c.ID, c.Seq, c.ParentID, c.TreeHash, c.Message,
 			c.AuthorName, c.AuthorEmail, c.AuthoredAt,
 			c.CommitterName, c.CommitterEmail, c.CommittedAt,
 		}
@@ -78,7 +79,7 @@ func (db *DB) CreateCommitsBatchTx(ctx context.Context, tx pgx.Tx, commits []*Co
 	_, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"pgit_commits"},
-		[]string{"id", "parent_id", "tree_hash", "message",
+		[]string{"id", "seq", "parent_id", "tree_hash", "message",
 			"author_name", "author_email", "authored_at",
 			"committer_name", "committer_email", "committed_at"},
 		pgx.CopyFromRows(rows),
@@ -133,8 +134,8 @@ func (db *DB) GetHeadCommit(ctx context.Context) (*Commit, error) {
 	return c, nil
 }
 
-// GetCommitLog retrieves commits starting from HEAD in reverse chronological order.
-// Uses a range query on ULID-ordered IDs instead of a recursive CTE,
+// GetCommitLog retrieves commits starting from HEAD in reverse order.
+// Uses a range query on ULID IDs instead of a recursive CTE,
 // which is much faster on xpatch tables (sequential scan vs random PK lookups).
 func (db *DB) GetCommitLog(ctx context.Context, limit int) ([]*Commit, error) {
 	// Get HEAD from pgit_refs (normal table, instant)
@@ -148,9 +149,9 @@ func (db *DB) GetCommitLog(ctx context.Context, limit int) ([]*Commit, error) {
 	return db.GetCommitLogFrom(ctx, headID, limit)
 }
 
-// GetCommitLogFrom retrieves commits in reverse chronological order starting from a commit.
-// Since commit IDs are ULIDs (lexicographically = chronologically ordered),
-// we use a simple range query instead of walking parent_id chains.
+// GetCommitLogFrom retrieves commits in reverse order starting from a commit.
+// Since commit IDs are ULIDs assigned in import order, a range query on id
+// approximates chronological order without walking parent_id chains.
 func (db *DB) GetCommitLogFrom(ctx context.Context, commitID string, limit int) ([]*Commit, error) {
 	sql := `
 	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
@@ -182,7 +183,7 @@ func (db *DB) GetCommitLogFrom(ctx context.Context, commitID string, limit int) 
 	return commits, rows.Err()
 }
 
-// GetAllCommits retrieves all commits ordered by ID (ULID = time order)
+// GetAllCommits retrieves all commits ordered by ID
 func (db *DB) GetAllCommits(ctx context.Context) ([]*Commit, error) {
 	sql := `
 	SELECT id, parent_id, tree_hash, message, author_name, author_email, authored_at,
@@ -302,7 +303,7 @@ func (db *DB) CommitExists(ctx context.Context, id string) (bool, error) {
 	return exists, err
 }
 
-// GetLatestCommitID returns the ID of the latest commit (by ULID order)
+// GetLatestCommitID returns the ID of the latest commit (by ID order)
 func (db *DB) GetLatestCommitID(ctx context.Context) (string, error) {
 	var id string
 	err := db.QueryRow(ctx, "SELECT id FROM pgit_commits ORDER BY id DESC LIMIT 1").Scan(&id)
@@ -312,7 +313,7 @@ func (db *DB) GetLatestCommitID(ctx context.Context) (string, error) {
 	return id, err
 }
 
-// GetAllCommitIDsOrdered returns all commit IDs in ascending ULID order.
+// GetAllCommitIDsOrdered returns all commit IDs in ascending ID order.
 // Used for rebuilding markToULID mapping during import resume.
 func (db *DB) GetAllCommitIDsOrdered(ctx context.Context) ([]string, error) {
 	rows, err := db.Query(ctx, "SELECT id FROM pgit_commits ORDER BY id ASC")
