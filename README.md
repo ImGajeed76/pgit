@@ -121,7 +121,7 @@ ORDER BY file_count DESC
 LIMIT 15;
 ```
 
-See `pgit sql examples` for more, or check [docs/xpatch-query-patterns.md](docs/xpatch-query-patterns.md) for query optimization tips.
+See `pgit sql examples` for more, or check the [querying with SQL guide](docs/querying-with-sql.md) for query optimization tips.
 
 ## Installation
 
@@ -157,7 +157,7 @@ sudo apk add --allow-untrusted pgit_*_linux_amd64.apk
 - **Docker** or **Podman** - Required for the local database container
 - **PostgreSQL with pg-xpatch** - Optional, only needed for remote operations (push/pull/clone)
 
-Default container settings are conservative. For faster imports and queries, see the [performance tuning guide](docs/performance-tuning.md).
+Default container settings are conservative. For faster imports and queries, see the [configuration and tuning guide](docs/configuration-and-tuning.md).
 
 <details>
 <summary><strong>Why Docker instead of embedded PostgreSQL?</strong></summary>

@@ -1,0 +1,35 @@
+sitemap:
+  - title: Introduction
+    children:
+      - title: What pgit is
+        url: ./overview.md
+      - title: Installing pgit
+        url: ./installation.md
+      - title: Quickstart
+        url: ./quickstart.md
+  - title: Concepts
+    children:
+      - title: How it works
+        url: ./how-it-works.md
+      - title: Compression vs git
+        url: ./compression.md
+  - title: Guides
+    children:
+      - title: Importing a repository
+        url: ./importing-a-repo.md
+      - title: Analyzing history
+        url: ./analyzing-history.md
+      - title: Querying with SQL and search
+        url: ./querying-with-sql.md
+      - title: Remotes, push, pull, clone
+        url: ./remotes.md
+      - title: Managing the local container
+        url: ./local-container.md
+      - title: Configuration and tuning
+        url: ./configuration-and-tuning.md
+  - title: Reference
+    children:
+      - title: Command reference
+        url: ./commands.md
+      - title: Database schema
+        url: ./database-schema.md
